@@ -14,3 +14,6 @@ subagent-template.txt
 
 # loop.sh single-instance guard
 .loop.pid
+
+# Future agent-writable Manus runtime state
+runtime/manus/
