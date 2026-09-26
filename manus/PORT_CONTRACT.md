@@ -56,6 +56,23 @@ validated = validate_intent(raw_json, already_applied_intent_ids={"..."})
 
 On success, the function returns the parsed JSON object. It does **not** write files, invoke commands, contact services, create Git objects, or take trading actions. On failure, it raises `IntentValidationError` and returns no partially accepted intent.
 
+## PAPER cycle guardian
+
+`python -m manus.paper_cycle_guardian` is the operator-owned, data-only bridge between an operator-controlled fixture and an untrusted Manus intent. It supports exactly two **stdout-only** operations:
+
+```text
+python -m manus.paper_cycle_guardian prepare --fixture <trusted-fixture.json>
+python -m manus.paper_cycle_guardian validate-intent --fixture <trusted-fixture.json> --intent <intent.json> [--already-applied <intent-ids.json>]
+```
+
+Patch 2 intentionally supports an **offline fixture** only; it does not invoke `core/scan.py`, network APIs, broker code, or any execution path. The fixture uses the public `core/scan.py` candidate fields (`market_id`, `question`, `outcomes`, `outcome_prices`, `end_date`, and optional `description`). `fixture.generated_at` and each `end_date` must be ISO-8601 timestamps with an explicit UTC offset; whole seconds, fractional seconds, `Z`, and offsets such as `+00:00` are accepted. They normalize deterministically to UTC `Z` form (`YYYY-MM-DDTHH:MM:SS[.fraction]Z`) before packet and candidate identifiers are derived. `prepare` emits a deterministic PAPER packet with `packet_version`, `packet_id`, `generated_at`, `mode`, and sorted candidates. Each candidate receives a deterministic guardian-generated `candidate_id` derived from its trusted emitted data.
+
+External market `question`, `description`, and outcome labels are **untrusted quoted data**, never instructions. The guardian permits printable Unicode and canonically normalizes CRLF / CR to LF and TAB to a space; it rejects NUL and other inappropriate C0/C1 control characters while retaining strict field length limits. It does not interpret market text as shell, Python, Git, file paths, commands, credentials, or execution requests, and it never executes that text.
+
+`packet_id` and `candidate_id` are deterministic identifiers, **not cryptographic authentication**. A party that changes a packet can recompute its hashes. Therefore `validate-intent` accepts no packet input: it loads the original operator-controlled fixture, calls `prepare_packet()` internally, calls `validate_intent`, and binds the intent’s candidate id, market id, and outcome against that freshly reconstructed packet. Trusted fixture provenance is an operator/runtime responsibility; fixtures must not be stored in an agent-writable location. Manus receives the prepared packet for research but cannot supply the authoritative packet used during validation.
+
+The guardian reads only explicitly supplied input paths and prints successful JSON to stdout. It has no `--output` option and performs **no filesystem writes**. An operator may redirect stdout outside the guardian if a file is needed. A successful result is data only: it neither writes a forecast or ledger entry nor persists duplicate ids, executes rationale/proposals, or creates a paper position. The CLI rejects options that suggest real, live-trading, execution, ordering, IBKR, or Pearl behavior.
+
 ## Example valid paper intent
 
 ```json
