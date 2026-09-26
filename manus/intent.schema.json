@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tkkwong/phil/manus/intent.schema.json",
+  "title": "Manus Paper Intent",
+  "description": "A data-only, paper-only forecast intent. Semantic safety checks are enforced by intent_validator.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "intent_id",
+    "candidate_id",
+    "market_id",
+    "outcome",
+    "estimated_probability",
+    "category",
+    "rationale",
+    "edge_class",
+    "mode",
+    "forecast_disposition",
+    "strategy_proposals"
+  ],
+  "properties": {
+    "intent_id": {
+      "type": "string",
+      "description": "Canonical lowercase UUIDv4.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "market_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "outcome": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "estimated_probability": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "exclusiveMaximum": 1
+    },
+    "category": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "edge_class": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "mode": {
+      "type": "string",
+      "const": "PAPER"
+    },
+    "forecast_disposition": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "strategy_proposals": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "proposal_id",
+          "summary"
+        ],
+        "properties": {
+          "proposal_id": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 64,
+            "pattern": "^proposal-[a-z0-9][a-z0-9-]{0,54}$"
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      }
+    }
+  }
+}
