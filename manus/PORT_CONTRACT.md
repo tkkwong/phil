@@ -168,3 +168,44 @@ The protected row assigns `edge_class = "manus-paper-only"`; it is not selected 
 Before Gamma/CLOB I/O, the protected function rejects any earlier ledger row with the same `source_intent_id` **or** the same derived `source_forecast_id`, regardless of settlement status. This makes a successful write followed by caller failure safely retry-detectable.
 
 For provenance-bearing guarded rows, the ledger append uses the same single-writer atomic design as the forecast bridge: it preserves original ledger bytes in a same-directory temporary file, appends one complete JSONL row, flushes and fsyncs, closes the temporary file, and only then performs `os.replace()`. An ordinary exception before replacement leaves the original ledger byte-for-byte unchanged, leaves no first-write ledger file, and cleans up the temporary file where possible. No locking or concurrency mechanism is added: the guarded Manus cycle retains the documented **single-writer** limitation, and the legacy runner must not concurrently place positions during such a cycle.
+
+
+## Patch 5A: research-only Manus transport
+
+Patch 5A adds the operator-owned `python -m manus.research_transport --fixture <trusted-fixture.json> --candidate-id <candidate-id> [--dry-run]` bridge. It automates only the bounded research hand-off:
+
+```text
+trusted frozen fixture
+  -> reconstruct trusted packet and select one candidate
+  -> standalone connector-free Manus API v2 research task
+  -> structured intent extraction
+  -> existing strict fixture-bound validation
+  -> fixed external validated-intent staging
+  -> STOP
+```
+
+It does **not** call `record-forecast`, `record-paper-placement`, `core.forecast`, `core.ledger`, `core.real`, Pearl, IBKR, or any broker. It does not touch forecast or ledger journals, strategy, repository files, Git, or a runtime output path supplied by Manus or the CLI. The first live test remains manually initiated by an operator after review and merge; live Manus tasks consume Manus service credits when eventually run.
+
+### Task isolation
+
+The transport uses the fixed production API base `https://api.manus.ai/v2` and only the narrow v2 task endpoints required for one asynchronous task: `task.create`, `task.listMessages`, `task.detail`, and, after a timeout or waiting state, best-effort `task.stop`. It never calls `task.sendMessage`, `task.confirmAction`, connectors, projects, files, browser, agents, webhooks, or any GitHub/third-party connector endpoint.
+
+`task.create` is created as a private standalone task with `interactive_mode=false`, `hide_in_task_list=true`, stable `agent_profile="standard"`, and an explicit `message.connectors: []`. No `project_id`, `task_references`, attachments, connector IDs, or browser context are supplied. The empty connector array is deliberate: omitting it could inherit account-default connectors. A waiting state fails closed; the runner sends neither a follow-up nor an action confirmation. The structured-output schema is only an extraction shape; the existing local validator remains the security and fixture-binding boundary.
+
+### Manus Skill inheritance limitation
+
+Patch 5A explicitly disables connector inheritance for `task.create` with `message.connectors: []`. It supplies no `project_id`, `task_references`, browser context, attachments, GitHub connector access, or local filesystem access.
+
+Current documented Manus API v2 does **not** provide a per-task switch that guarantees zero enabled Skills. The transport currently omits both `message.enable_skills` and `message.force_skills`; documented v2 behavior is that an omitted or empty `message.enable_skills` array may load the account-default enabled Skills. There is no documented `clear_skills`, `disable_skills`, or `use_default_skills=false` equivalent for `task.create`. Patch 5A therefore does **not** claim complete Manus-cloud capability isolation.
+
+Patch 5A does not rely on Manus Skills for correctness, validation, market identity, candidate binding, execution, credentials, file mutation, or broker access. The authoritative security boundary is local: Manus receives no Phil filesystem authority, no Windows Credential Manager authority, no journal-mutation authority, and no IBKR, Pearl, or broker credentials. Manus output remains data only; the strict fixture-bound validator remains authoritative; and forecast recording and PAPER placement remain separate operator-controlled actions.
+
+For a live research task, the operator should disable unneeded account-default Skills where practical. This is an account-level operational precaution, **not** a per-task API guarantee. If Manus later documents a per-task zero-Skills control, Patch 5A should be updated to use it and to add a regression test.
+
+### Credential and staging boundary
+
+A live Windows run reads only the `phil-manus-api` Generic Credential from Windows Credential Manager, requires its exposed username to be `MANUS_API_KEY`, keeps it in process memory solely for the `x-manus-api-key` HTTPS header, frees the returned credential memory with `CredFree`, and never prints, returns, persists, or accepts an API key. There is no environment, file, registry, package, subprocess, or PowerShell credential fallback. Non-Windows live runs fail closed.
+
+After successful local fixture-bound validation, and only then, the runner stages two canonical JSON files outside the repository at the fixed `%LOCALAPPDATA%\phil-manus\staging\<packet_id>\<intent_id>\` path: `validated-intent.json` and inert `run-meta.json`. `run-meta.json` contains only API version, task/packet/candidate/intent IDs, fixture SHA-256, timestamps, agent profile, and validation version. It contains no API key, headers, cookies, connector data, hidden reasoning, or raw Manus output. A pre-existing intent path rejects without overwrite. Each file is flushed, fsynced, closed, and atomically replaced in a same-directory temporary file; the completed intent directory is published only after both files exist. Ordinary failures clean temporary staging data where possible.
+
+Patch 5A requires `strategy_proposals == []` even though the general intent contract permits inert suggestions. It also accepts only documented forecast disposition labels as research metadata. `--dry-run` validates the fixture, reconstructs and selects the packet candidate, constructs the exact bounded request, verifies fixed staging-root calculation, and prints a safe summary; it reads no credential, calls no API, writes no staging artifact, and mutates no journal.
