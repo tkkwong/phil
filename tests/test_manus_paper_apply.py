@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import io
 import json
+import multiprocessing
 import pathlib
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from unittest.mock import patch
 
 from core import forecast as forecast_core
 from core import ledger as ledger_core
-from manus import paper_apply
+from manus import paper_apply, paper_locks
 from manus.paper_cycle_guardian import VALIDATION_VERSION, prepare_packet
 from manus.research_transport import TRANSPORT_REQUEST_SCHEMA_VERSION
 
@@ -42,6 +43,58 @@ def json_rows(path):
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _concurrent_apply_worker(
+    fixture_path,
+    staging_root,
+    forecast_path,
+    ledger_path,
+    lock_root,
+    hold_forecast,
+    forecast_started,
+    release_forecast,
+    forecast_calls,
+    results,
+):
+    """Spawn target that executes one real guarded non-bet application."""
+    market = {
+        "closed": False,
+        "question": "Offline live market question",
+        "slug": "market-100",
+        "endDate": "2026-10-01T00:00:00Z",
+        "outcomes": json.dumps(["Texas A&M", "Wake Forest"]),
+        "clobTokenIds": json.dumps(["token-texas", "token-wake"]),
+    }
+    original_record_forecast = paper_apply._record_forecast
+
+    def record_forecast(context, path):
+        with pathlib.Path(forecast_calls).open("a", encoding="utf-8") as calls:
+            calls.write("forecast\n")
+        if hold_forecast:
+            forecast_started.set()
+            if not release_forecast.wait(10):
+                raise TimeoutError("test release did not arrive")
+        return original_record_forecast(context, path)
+
+    try:
+        with patch.object(forecast_core.pmapi, "gamma_market", return_value=market), \
+             patch.object(forecast_core.pmapi, "market_tokens", return_value={"Texas A&M": "token-texas", "Wake Forest": "token-wake"}), \
+             patch.object(forecast_core.pmapi, "best_prices", return_value=(0.50, 0.52)), \
+             patch.object(paper_apply, "_record_forecast", side_effect=record_forecast):
+            result = paper_apply.run(
+                fixture_path,
+                INTENT_ID,
+                _staging_root=pathlib.Path(staging_root),
+                _forecast_path=pathlib.Path(forecast_path),
+                _ledger_path=pathlib.Path(ledger_path),
+                _lock_root=pathlib.Path(lock_root),
+                _now=lambda: NOW,
+                _placement_now=NOW,
+            )
+        results.put(("ok", result["application_state"], result["forecast_status"]))
+    except Exception as exc:  # pragma: no cover - diagnostic sent to parent
+        results.put(("error", str(exc)))
 
 
 class PaperApplyTests(unittest.TestCase):
@@ -317,6 +370,74 @@ class PaperApplyTests(unittest.TestCase):
                 directory = self.staging_root / self.packet["packet_id"] / INTENT_ID
                 for child in directory.iterdir(): child.unlink()
                 directory.rmdir()
+
+    def test_two_processes_apply_one_intent_with_one_forecast_mutation(self):
+        self.stage(intent=self.intent(disposition="market-agrees"))
+        context = multiprocessing.get_context("spawn")
+        lock_root = self.root / "fixed-locks"
+        forecast_started = context.Event()
+        release_forecast = context.Event()
+        forecast_calls = self.root / "forecast-calls.txt"
+        results = context.Queue()
+        common = (
+            str(self.fixture_path),
+            str(self.staging_root),
+            str(self.forecast_path),
+            str(self.ledger_path),
+            str(lock_root),
+        )
+        first = context.Process(
+            target=_concurrent_apply_worker,
+            args=common + (True, forecast_started, release_forecast, str(forecast_calls), results),
+        )
+        second = context.Process(
+            target=_concurrent_apply_worker,
+            args=common + (False, forecast_started, release_forecast, str(forecast_calls), results),
+        )
+        first.start()
+        self.assertTrue(forecast_started.wait(10), "first application did not enter forecast mutation")
+        second.start()
+        # The second process cannot enter the guarded forecast action while the
+        # first holds both application and journal-writer locks.
+        self.assertEqual(forecast_calls.read_text(encoding="utf-8").splitlines(), ["forecast"])
+        release_forecast.set()
+        for process in (first, second):
+            process.join(20)
+            if process.is_alive():
+                process.terminate()
+                process.join(10)
+            self.assertEqual(process.exitcode, 0)
+        outcomes = sorted(results.get(timeout=5) for _ in range(2))
+        self.assertEqual(outcomes, [
+            ("ok", "completed-no-placement", "already-completed"),
+            ("ok", "completed-no-placement", "recorded"),
+        ])
+        self.assertEqual(forecast_calls.read_text(encoding="utf-8").splitlines(), ["forecast"])
+        self.assertEqual(len(json_rows(self.forecast_path)), 1)
+        self.assertFalse(self.ledger_path.exists())
+        self.assertEqual(self.receipt()["state"], "completed-no-placement")
+
+    def test_dry_run_remains_lock_free_and_write_free(self):
+        self.stage()
+        lock_root = self.root / "fixed-locks"
+        with paper_locks.acquire_application_lock(INTENT_ID, _lock_root=lock_root):
+            result = self.call(dry_run=True, _lock_root=lock_root)
+        self.assertEqual(result["plan"], "record-forecast-only")
+        self.assertFalse(self.forecast_path.exists())
+        self.assertFalse(self.ledger_path.exists())
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_busy_journal_writer_lock_blocks_receipt_and_guardian_mutation(self):
+        self.stage()
+        lock_root = self.root / "fixed-locks"
+        with paper_locks.acquire_journal_writer_lock(_lock_root=lock_root):
+            with patch.object(paper_apply, "JOURNAL_WRITER_LOCK_WAIT_SECONDS", 0), \
+                 patch.object(paper_apply, "record_candidate_forecast", side_effect=AssertionError("no forecast")):
+                with self.assertRaisesRegex(paper_apply.PaperApplyError, "journal writer is busy"):
+                    self.call(_lock_root=lock_root)
+        self.assertFalse(self.receipt_path().exists())
+        self.assertFalse(self.forecast_path.exists())
+        self.assertFalse(self.ledger_path.exists())
 
     def test_bet_uses_existing_guarded_placement_once(self):
         intent = self.intent(disposition="bet")
