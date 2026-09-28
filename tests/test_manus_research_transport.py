@@ -833,6 +833,136 @@ class ManusResearchTransportTests(unittest.TestCase):
         self.assertTrue(result["validated"])
         self.assertEqual(self.reservation_document()["state"], "completed")
 
+    def test_false_without_reservation_rejects_before_credential_state_or_network(self):
+        credential_calls = []
+        opener = RecordingOpener([])
+        with self.assertRaisesRegex(transport.ResearchTransportError, "not authorized to create"):
+            transport.run(
+                str(self.fixture_path),
+                self.candidate_id,
+                allow_new_task=False,
+                credential_loader=lambda: credential_calls.append(True),
+                opener=opener,
+                staging_root_factory=lambda: self.staging_root,
+                _lock_root_factory=lambda: self.root / "fixed-locks",
+            )
+        self.assertEqual(credential_calls, [])
+        self.assertEqual(opener.requests, [])
+        self.assertFalse(self.reservation_path().exists())
+        self.assertFalse(self.staging_root.exists())
+
+    def test_false_propagates_through_request_lock_recursion_without_escalation(self):
+        original_run = transport.run
+        observed_authorizations = []
+        opener = RecordingOpener([])
+
+        def record_run(*args, **kwargs):
+            observed_authorizations.append(kwargs.get("allow_new_task", "default"))
+            return original_run(*args, **kwargs)
+
+        with patch.object(transport, "run", side_effect=record_run):
+            with self.assertRaisesRegex(transport.ResearchTransportError, "not authorized to create"):
+                transport.run(
+                    str(self.fixture_path),
+                    self.candidate_id,
+                    allow_new_task=False,
+                    credential_loader=lambda: (_ for _ in ()).throw(AssertionError("credential must not load")),
+                    opener=opener,
+                    staging_root_factory=lambda: self.staging_root,
+                    _lock_root_factory=lambda: self.root / "fixed-locks",
+                )
+        self.assertEqual(observed_authorizations, [False, False])
+        self.assertEqual(opener.requests, [])
+        self.assertFalse(self.reservation_path().exists())
+
+    def test_allow_new_task_requires_actual_bool_before_side_effects(self):
+        for invalid in (1, 0, "true", "false", None):
+            with self.subTest(invalid=invalid):
+                credential_calls = []
+                opener = RecordingOpener([])
+                with self.assertRaisesRegex(transport.ResearchTransportError, "must be a bool"):
+                    transport.run(
+                        str(self.fixture_path),
+                        self.candidate_id,
+                        allow_new_task=invalid,
+                        credential_loader=lambda: credential_calls.append(True),
+                        opener=opener,
+                        staging_root_factory=lambda: self.staging_root,
+                    )
+                self.assertEqual(credential_calls, [])
+                self.assertEqual(opener.requests, [])
+                self.assertFalse(self.reservation_path().exists())
+
+    def test_explicit_true_preserves_existing_new_task_creation_path(self):
+        result, opener = self.run_transport(self.successful_messages(), allow_new_task=True)
+        self.assertTrue(result["validated"])
+        self.assertEqual([request.method for request in opener.requests], ["POST", "GET", "GET"])
+        self.assertEqual(self.reservation_document()["state"], "completed")
+
+    def test_default_true_preserves_existing_new_task_creation_path(self):
+        result, opener = self.run_transport(self.successful_messages())
+        self.assertTrue(result["validated"])
+        self.assertEqual([request.method for request in opener.requests], ["POST", "GET", "GET"])
+        self.assertEqual(self.reservation_document()["state"], "completed")
+
+    def test_false_resumes_known_task_without_second_create(self):
+        reservation = self.new_reservation()
+        transport._write_reservation(self.reservation_path(), reservation)
+        reservation = transport._set_reservation_state(self.reservation_path(), reservation, "creating")
+        transport._record_created_task(self.reservation_path(), reservation, "task-1")
+        result, opener = self.run_transport([
+            task_messages("stopped", {"success": True, "value": self.research_result(), "error": None}),
+            task_detail("stopped", False),
+        ], allow_new_task=False)
+        self.assertTrue(result["validated"])
+        self.assertEqual(result["task_origin"], "resumed")
+        self.assertEqual([request.method for request in opener.requests], ["GET", "GET"])
+        self.assertEqual(self.reservation_document()["state"], "completed")
+
+    def test_false_recovers_durable_staging_without_credential_or_network(self):
+        original_set_state = transport._set_reservation_state
+
+        def fail_only_finalization(path, reservation, state):
+            if state == "completed":
+                raise transport.ResearchTransportError("simulated reservation finalization failure")
+            return original_set_state(path, reservation, state)
+
+        with patch("manus.research_transport._set_reservation_state", side_effect=fail_only_finalization):
+            with self.assertRaisesRegex(transport.ResearchTransportError, "validated staging completed"):
+                self.run_transport(self.successful_messages())
+
+        opener = RecordingOpener([])
+        recovered = transport.run(
+            str(self.fixture_path),
+            self.candidate_id,
+            allow_new_task=False,
+            credential_loader=lambda: (_ for _ in ()).throw(AssertionError("credential must not load")),
+            opener=opener,
+            staging_root_factory=lambda: self.staging_root,
+            new_uuid=lambda: TEST_UUID,
+        )
+        self.assertTrue(recovered["validated"])
+        self.assertEqual(recovered["api_endpoint"], "none")
+        self.assertEqual(opener.requests, [])
+        self.assertEqual(self.reservation_document()["state"], "completed")
+
+    def test_false_preserves_ambiguous_creating_without_credential_or_network(self):
+        reservation = self.new_reservation()
+        transport._write_reservation(self.reservation_path(), reservation)
+        transport._set_reservation_state(self.reservation_path(), reservation, "creating")
+        opener = RecordingOpener([])
+        with self.assertRaisesRegex(transport.ResearchTransportError, "operator reconciliation"):
+            transport.run(
+                str(self.fixture_path),
+                self.candidate_id,
+                allow_new_task=False,
+                credential_loader=lambda: (_ for _ in ()).throw(AssertionError("credential must not load")),
+                opener=opener,
+                staging_root_factory=lambda: self.staging_root,
+            )
+        self.assertEqual(opener.requests, [])
+        self.assertEqual(self.reservation_document()["state"], "creating")
+
     def test_creating_without_task_id_fails_closed_without_credential_or_post(self):
         reservation = self.new_reservation()
         transport._write_reservation(self.reservation_path(), reservation)
@@ -1003,6 +1133,40 @@ class ManusResearchTransportTests(unittest.TestCase):
         self.assertNotIn("x-manus-api-key", request_document)
         self.assertNotIn("headers", request_document)
 
+    def test_current_invocation_authorization_does_not_change_request_fingerprint(self):
+        expected = self.request_sha256()
+        original_request_sha256 = transport._request_sha256
+        observed = []
+
+        def record_request_sha256(task_request):
+            value = original_request_sha256(task_request)
+            observed.append(value)
+            return value
+
+        with patch.object(transport, "_request_sha256", side_effect=record_request_sha256):
+            with self.assertRaisesRegex(transport.ResearchTransportError, "not authorized to create"):
+                transport.run(
+                    str(self.fixture_path),
+                    self.candidate_id,
+                    allow_new_task=False,
+                    credential_loader=lambda: (_ for _ in ()).throw(AssertionError("credential must not load")),
+                    opener=RecordingOpener([]),
+                    staging_root_factory=lambda: self.staging_root,
+                )
+            with self.assertRaisesRegex(transport.ResearchTransportError, "credential"):
+                transport.run(
+                    str(self.fixture_path),
+                    self.candidate_id,
+                    allow_new_task=True,
+                    credential_loader=lambda: (_ for _ in ()).throw(RuntimeError("credential unavailable")),
+                    opener=RecordingOpener([]),
+                    staging_root_factory=lambda: self.staging_root,
+                )
+        # Each invocation computes the same canonical request before and after
+        # entering its existing request lock recursion.
+        self.assertEqual(observed, [expected, expected, expected, expected])
+        self.assertEqual(self.request_sha256(), expected)
+
     def test_prompt_schema_or_request_change_changes_request_fingerprint(self):
         original = self.task_request()
         changed_prompt = copy.deepcopy(original)
@@ -1055,6 +1219,10 @@ class ManusResearchTransportTests(unittest.TestCase):
         self.assertEqual(metadata["requested_agent_profile"], "standard")
         self.assertEqual(metadata["resolved_agent_profile"], "manus-1.6")
         self.assertNotIn(SECRET, transport._canonical_json(metadata))
+        self.assertNotIn("allow_new_task", metadata)
+        reservation = self.reservation_document()
+        self.assertNotIn("allow_new_task", reservation)
+        self.assertEqual(set(reservation), transport._RESERVATION_FIELDS)
 
     def test_server_side_prompt_attachment_is_neither_staged_nor_printed(self):
         attachment_url = "https://cloud.manus.example/attachment/sensitive-prompt.txt"
@@ -1082,12 +1250,19 @@ class ManusResearchTransportTests(unittest.TestCase):
         parser = transport.build_parser()
         option_strings = {option for action in parser._actions for option in action.option_strings}
         self.assertEqual(option_strings - {"-h", "--help"}, {"--fixture", "--candidate-id", "--dry-run"})
+        authorization_parameter = inspect.signature(transport.run).parameters["allow_new_task"]
+        self.assertEqual(authorization_parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(authorization_parameter.default, True)
         for forbidden in ("--output", "--api-url", "--prompt", "--connector", "--project", "--skill", "--api-key", "--forecast", "--ledger", "--real", "--ibkr", "--pearl"):
             with self.subTest(forbidden=forbidden):
                 stderr = io.StringIO()
                 with redirect_stderr(stderr), self.assertRaises(SystemExit):
                     transport.main(["--fixture", str(self.fixture_path), "--candidate-id", self.candidate_id, forbidden, "x"])
                 self.assertIn("Forbidden research transport option", stderr.getvalue())
+        for unavailable in ("--allow-new-task", "--task-budget", "--authorize-create"):
+            with self.subTest(unavailable=unavailable), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    transport.main(["--fixture", str(self.fixture_path), "--candidate-id", self.candidate_id, unavailable, "x"])
 
     def test_windows_credential_reader_uses_mocked_credread_and_credfree(self):
         encoded = SECRET.encode("utf-16-le")
