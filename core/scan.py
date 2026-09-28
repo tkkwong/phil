@@ -109,21 +109,14 @@ def keep(m, seen, banned, args):
     }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--hours", type=float, default=168)
-    ap.add_argument("--min-volume-24h", type=float, default=0)
-    ap.add_argument("--limit", type=int, default=400,
-                    help="max markets paged per query")
-    ap.add_argument("--min-total-volume", type=float, default=50000,
-                    help="lifetime-volume floor (gamma volume_num_min) for the "
-                         "DEFAULT query. Results page in endDate order and the "
-                         "near-term universe is thousands of sub-daily markets "
-                         "deep, so without a floor the scan never escapes today "
-                         "regardless of --hours. strategy/discovery.py may set "
-                         "its own per-query floors.")
-    args = ap.parse_args()
-
+def _iter_candidates(*, hours=168, min_volume_24h=0, limit=400, min_total_volume=50000):
+    """Yield normal protected scan candidates in existing deterministic order."""
+    args = argparse.Namespace(
+        hours=hours,
+        min_volume_24h=min_volume_24h,
+        limit=limit,
+        min_total_volume=min_total_volume,
+    )
     banned = [re.compile(p, re.I) for p in PROTECTED["banned_question_patterns"]]
     now = utcnow()
     horizon = now + dt.timedelta(hours=args.hours)
@@ -148,9 +141,42 @@ def main():
                 if rec:
                     got += 1
                     kept += 1
-                    print(json.dumps(rec))
+                    yield rec
         print(f"scan: query {label!r} -> {got} candidates", file=sys.stderr)
     print(f"scan: {kept} candidates total within {args.hours}h", file=sys.stderr)
+
+
+def scan_candidates(*, hours=168, min_volume_24h=0, limit=400, min_total_volume=50000):
+    """Return normal protected scan candidates in existing deterministic order."""
+    return list(_iter_candidates(
+        hours=hours,
+        min_volume_24h=min_volume_24h,
+        limit=limit,
+        min_total_volume=min_total_volume,
+    ))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hours", type=float, default=168)
+    ap.add_argument("--min-volume-24h", type=float, default=0)
+    ap.add_argument("--limit", type=int, default=400,
+                    help="max markets paged per query")
+    ap.add_argument("--min-total-volume", type=float, default=50000,
+                    help="lifetime-volume floor (gamma volume_num_min) for the "
+                         "DEFAULT query. Results page in endDate order and the "
+                         "near-term universe is thousands of sub-daily markets "
+                         "deep, so without a floor the scan never escapes today "
+                         "regardless of --hours. strategy/discovery.py may set "
+                         "its own per-query floors.")
+    args = ap.parse_args()
+    for record in _iter_candidates(
+        hours=args.hours,
+        min_volume_24h=args.min_volume_24h,
+        limit=args.limit,
+        min_total_volume=args.min_total_volume,
+    ):
+        print(json.dumps(record))
 
 
 if __name__ == "__main__":
