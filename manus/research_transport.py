@@ -36,6 +36,7 @@ from manus.paper_cycle_guardian import (
     prepare_packet,
     validate_candidate_intent,
 )
+from manus import paper_locks
 
 
 API_BASE = "https://api.manus.ai/v2"
@@ -99,6 +100,7 @@ _RESERVATION_FIELDS = frozenset(
 _RESERVATION_STATES = frozenset(
     {
         "reserved",
+        "creating",
         "ambiguous-create",
         "created",
         "polling",
@@ -843,7 +845,7 @@ def _record_created_task(path: pathlib.Path, reservation: dict[str, Any], task_i
     """Durably bind a returned task ID before a single poll can occur."""
     if not _safe_server_identifier(task_id):
         raise ResearchTransportError("Manus task creation response is invalid")
-    if reservation.get("state") != "reserved" or reservation.get("task_id") is not None:
+    if reservation.get("state") != "creating" or reservation.get("task_id") is not None:
         raise ResearchTransportError("Pre-create reservation requires operator reconciliation")
     updated = {**reservation, "task_id": task_id, "state": "created"}
     _write_reservation(path, updated)
@@ -1080,6 +1082,9 @@ def run(
     monotonic: Callable[[], float] = time.monotonic,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     new_uuid: Callable[[], uuid.UUID] = uuid.uuid4,
+    _lock_root_factory: Callable[[], pathlib.Path] | None = None,
+    _request_lock_held: bool = False,
+    _held_request_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Perform one bounded research-only run, or return a dry-run audit summary."""
     fixture, candidate, fixture_sha256, packet = _prepare_run(fixture_path, candidate_id)
@@ -1090,6 +1095,48 @@ def run(
 
     task_request = build_task_request(packet["packet_id"], candidate)
     request_sha256 = _request_sha256(task_request)
+    if _request_lock_held and _held_request_sha256 != request_sha256:
+        raise ResearchTransportError("Trusted request changed while acquiring fixed research lock")
+    if not _request_lock_held:
+        # Request lock is first in the global ordering. It spans reservation
+        # read/write, the one non-retryable POST, polling, and staging so a
+        # second process cannot observe an intermediate state and create a
+        # second paid task for the exact same request fingerprint.
+        try:
+            # Production staging is fixed at %LOCALAPPDATA%\phil-manus\staging,
+            # so its sibling locks directory is the fixed trusted root
+            # %LOCALAPPDATA%\phil-manus\locks. The factory is test-only.
+            lock_root = staging_root.parent / "locks" if _lock_root_factory is None else _lock_root_factory()
+            with paper_locks.acquire_request_lock(
+                request_sha256,
+                nonblocking=True,
+                _lock_root=lock_root,
+            ):
+                return run(
+                    fixture_path,
+                    candidate_id,
+                    dry_run=False,
+                    credential_loader=credential_loader,
+                    opener=opener,
+                    staging_root_factory=staging_root_factory,
+                    sleep=sleep,
+                    monotonic=monotonic,
+                    now=now,
+                    new_uuid=new_uuid,
+                    _lock_root_factory=_lock_root_factory,
+                    _request_lock_held=True,
+                    _held_request_sha256=request_sha256,
+                )
+        except paper_locks.LockUnavailableError:
+            raise ResearchTransportError(
+                f"Research request already in progress; request_sha256={request_sha256}; "
+                "no credential lookup or task.create was performed"
+            ) from None
+        except paper_locks.LockError:
+            raise ResearchTransportError(
+                "Fixed research request lock is unavailable; task.create was not sent"
+            ) from None
+
     reservation_path = _reservation_path(
         staging_root,
         packet_id=packet["packet_id"],
@@ -1160,6 +1207,17 @@ def run(
         except ResearchTransportError:
             raise ResearchTransportError(
                 "Pre-create reservation failed phase=reservation; task.create was not sent"
+            ) from None
+
+        # A durable creating state is written before the non-retryable POST.
+        # If this process dies after the request may have left the host but
+        # before task_id persistence, a later process sees creating + no task
+        # id and must fail closed rather than risk a duplicate paid task.
+        try:
+            reservation = _set_reservation_state(reservation_path, reservation, "creating")
+        except ResearchTransportError:
+            raise ResearchTransportError(
+                "Pre-create reservation failed phase=creating; task.create was not sent"
             ) from None
 
         # task.create is deliberately called once only. Any uncertain result is
