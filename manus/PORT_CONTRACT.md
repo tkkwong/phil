@@ -230,6 +230,29 @@ After a known task ID exists, only read-only `task.listMessages` and `task.detai
 
 Waiting, task error, timeout, and unknown conditions retain/update the reservation and fail closed. On validated success, complete intent staging is durable before the reservation becomes `completed`; `run-meta.json` retains safe `request_sha256`, `transport_schema_version`, `task_origin`, `task_created_this_invocation`, `requested_agent_profile`, and, where supplied by `task.detail`, `resolved_agent_profile`. `agent_profile` remains a backward-compatible alias for the requested profile only; a service-resolved profile such as `manus-1.6` is recorded separately and never selects routing or security policy. Safe invocation output similarly includes `task_id`, `task_origin` (`created` or `resumed`), and `task_created_this_invocation`, so a resumed reservation never implies a new `task.create` occurred. No raw task messages, server-side attachment objects, or attachment URLs are staged or printed. Patch 5A.2 still stops before forecast recording or PAPER placement.
 
+## Patch 5C: cross-process mutual exclusion
+
+Patch 5C adds a standard-library, OS-held lock layer for the fixed external Manus working area. In production, locks live only under:
+
+```text
+%LOCALAPPDATA%\phil-manus\locks\
+```
+
+No CLI accepts a lock path, lock timeout, lock name, lock-break, or stale-lock override. Lock files contain only best-effort diagnostic metadata (`pid`, host, acquisition time, logical purpose, and logical name). Metadata is **not authority**: ownership is the held OS file lock (`fcntl.flock` on POSIX; `msvcrt.locking` on Windows), and process exit releases it. A malformed, stale, or overwritten metadata file never authorizes a second holder or lock break.
+
+The fixed logical locks are:
+
+| Lock | Scope | Behavior |
+|---|---|---|
+| `cycle` | Reserved fixed future-cycle boundary | Available only to local operator code; Patch 5C adds no scheduler, service, or cycle runner. |
+| `request-<request_sha256>` | One exact canonical credential-free `task.create` request | `research_transport` fails cleanly before credential lookup or POST when held by another process. |
+| `application-<intent_id>` | One canonical staged PAPER intent | `paper_apply` waits only for a fixed 30-second bound, then fails without mutation if still unavailable. |
+| `journal-writer` | Manus receipt reconciliation plus guarded forecast/placement calls | `paper_apply` takes it after the application lock, waits only for the same fixed bound, and leaves legacy writers outside this new contract. |
+
+Global order is `request` for research and `application -> journal-writer` for application. No path takes these locks in reverse order. Locks span the full protected critical sections: reservation read/write plus the single POST/poll/stage lifecycle for research; and receipt read/transitions, journal reconciliation, and guardian forecast/placement calls for application.
+
+Before any non-retryable `task.create`, the candidate-bound reservation is atomically persisted first as `reserved`, then as durable `creating`. If a process dies or loses the response after request initiation but before a `task_id` is recorded, a rerun sees `creating` without a task ID and requires operator reconciliation; it never creates another task. The request lock prevents a concurrent invocation from reading that intermediate state while the original invocation remains alive.
+
 ## Patch 5B: manual staged PAPER application
 
 Patch 5B adds one manual operator bridge:
@@ -302,4 +325,4 @@ Every valid staged intent calls existing `record_candidate_forecast()` through t
 
 Only exact `forecast_disposition == "bet"` can then call existing `record_candidate_paper_placement()` through the guardian. Any non-bet disposition records the forecast, persists `completed-no-placement`, and stops before inspecting placement policy or calling placement. `bet` invokes no new risk logic: the existing protected Patch 4 stake, edge, spread, timing, event, exposure, cycle, cash, token, and real-eligibility controls remain authoritative. A rejection persists `placement-rejected` with zero manufactured ledger row.
 
-Patch 5B is manual and assumes one writer. The legacy runner must not mutate forecast/ledger journals concurrently, and two simultaneous `paper_apply` processes are unsupported. It adds no scheduler, service, loop, task, Git automation, Manus API behavior, Credential Manager use, broker, real execution, Pearl, or IBKR route. The only possible position mutation is the existing guarded simulated PAPER ledger function.
+Patch 5B remains manual. Patch 5C serializes simultaneous `paper_apply` processes for the same intent and their guarded Manus journal path, but it does **not** extend this locking contract to legacy forecast/ledger writers; the legacy runner must not mutate forecast/ledger journals concurrently. Patch 5C adds no scheduler, service, loop, task, Git automation, Manus API behavior, Credential Manager use, broker, real execution, Pearl, or IBKR route. The only possible position mutation remains the existing guarded simulated PAPER ledger function.
