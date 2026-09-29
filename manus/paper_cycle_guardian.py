@@ -1,10 +1,10 @@
 """Operator-owned guardian for Manus PAPER candidate packets and forecasts.
 
-``prepare`` and ``validate-intent`` remain data-only. ``record-forecast``
-records exactly one fixture-bound forecast. ``record-paper-placement`` is the
-only separately authorized PAPER mutation: it requires that existing bound
-forecast and calls the narrow protected paper ledger function. Neither route
-accepts execution parameters, invokes a real-trading route, broker, Pearl,
+``prepare`` and ``validate-intent`` remain data-only. ``record-forecast`` is
+the single explicitly authorized mutation: after fixture-bound validation it
+calls the narrow protected forecast recorder, which performs existing public
+Gamma/CLOB market-data reads and appends at most one forecast row. It never
+places a paper position, invokes a ledger, real-trading route, broker, Pearl,
 or IBKR component, or executes Manus text.
 """
 
@@ -21,14 +21,12 @@ import sys
 from typing import Any, Iterable
 
 from core import forecast as forecast_core
-from core import ledger as ledger_core
 from manus.intent_validator import IntentValidationError, validate_intent
 
 
 PACKET_VERSION = "paper-candidate-packet/v1"
 VALIDATION_VERSION = "paper-guardian-validation/v1"
 FORECAST_RECORDING_VERSION = "paper-guardian-forecast-recording/v1"
-PAPER_PLACEMENT_VERSION = "paper-guardian-paper-placement/v1"
 
 # These are exactly the fields currently emitted by core/scan.py's keep().
 # Prepare accepts the full read-only scan record but emits only its bounded,
@@ -376,95 +374,6 @@ def record_candidate_forecast(
     }
 
 
-def _trusted_source_candidate(fixture: Any, candidate: dict[str, Any]) -> dict[str, Any]:
-    """Return the original fixture candidate after packet binding succeeds.
-
-    ``event_id`` is intentionally absent from the Manus-visible packet. It is
-    recovered only from the same operator-controlled source fixture after the
-    selected packet candidate has already bound market, outcome, and identity.
-    """
-    source_candidates = fixture.get("candidates") if isinstance(fixture, dict) else None
-    if not isinstance(source_candidates, list):
-        raise GuardianValidationError("Fixture candidates are unavailable")
-    matches = [
-        source
-        for source in source_candidates
-        if isinstance(source, dict) and source.get("market_id") == candidate["market_id"]
-    ]
-    if len(matches) != 1:
-        raise GuardianValidationError("Trusted fixture candidate cannot be identified")
-    return matches[0]
-
-
-def record_candidate_paper_placement(
-    fixture: Any,
-    intent_document: str | bytes | bytearray,
-    already_applied_intent_ids: Iterable[str] | None = None,
-    *,
-    _ledger_path: pathlib.Path | None = None,
-    _forecast_path: pathlib.Path | None = None,
-    _protected_config: dict[str, Any] | None = None,
-    _risk_config: dict[str, Any] | None = None,
-    _now: dt.datetime | None = None,
-) -> dict[str, Any]:
-    """Place one guarded PAPER row after a matching persisted bet forecast.
-
-    All fixture and intent binding completes before the forecast lookup,
-    paper-ledger mutation, or public market I/O. The private underscore
-    arguments are test seams only; no production CLI option exposes paths,
-    prices, stake, forecast id, packet id, event id, token id, or risk limits.
-    """
-    packet, intent, candidate = _validate_fixture_bound_intent(
-        fixture, intent_document, already_applied_intent_ids
-    )
-    if intent["forecast_disposition"] != "bet":
-        raise GuardianValidationError("forecast_disposition must be 'bet' for guarded PAPER placement")
-
-    source = _trusted_source_candidate(fixture, candidate)
-    event_id = _require_identifier(source.get("event_id"), "trusted fixture event_id")
-    trusted_outcome = next(
-        outcome for outcome in candidate["outcomes"] if outcome == intent["outcome"]
-    )
-    try:
-        kwargs: dict[str, Any] = {
-            "source_intent_id": intent["intent_id"],
-            "source_packet_id": packet["packet_id"],
-            "event_id": event_id,
-            "market_id": candidate["market_id"],
-            "outcome": trusted_outcome,
-            "est_prob": intent["estimated_probability"],
-            "category": intent["category"],
-            "rationale": intent["rationale"],
-            # The protected core assigns its own non-real-eligible execution
-            # class. This remains research metadata and never selects policy.
-            "research_edge_class": intent["edge_class"],
-        }
-        if _ledger_path is not None:
-            kwargs["_ledger_path"] = _ledger_path
-        if _forecast_path is not None:
-            kwargs["_forecast_path"] = _forecast_path
-        if _protected_config is not None:
-            kwargs["_protected_config"] = _protected_config
-        if _risk_config is not None:
-            kwargs["_risk_config"] = _risk_config
-        if _now is not None:
-            kwargs["_now"] = _now
-        placed = ledger_core.record_manus_paper_placement(**kwargs)
-    except ledger_core.ManusPlacementError as exc:
-        raise GuardianValidationError(str(exc)) from exc
-    except OSError as exc:
-        raise GuardianValidationError("PAPER ledger write failed") from exc
-    except Exception as exc:
-        raise GuardianValidationError("PAPER placement failed") from exc
-    return {
-        "placement_version": PAPER_PLACEMENT_VERSION,
-        "packet_id": packet["packet_id"],
-        "mode": "PAPER",
-        "source_intent_id": intent["intent_id"],
-        "placement": placed,
-    }
-
-
 def _load_applied_ids(path_value: str | None) -> list[str] | None:
     if path_value is None:
         return None
@@ -501,14 +410,6 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--fixture", required=True, help="operator-controlled offline JSON fixture")
     record.add_argument("--intent", required=True, help="untrusted Manus intent JSON")
     record.add_argument("--already-applied", help="optional JSON array of already-applied intent IDs")
-
-    placement = subcommands.add_parser(
-        "record-paper-placement",
-        help="place one guarded PAPER row after an existing bound bet forecast",
-    )
-    placement.add_argument("--fixture", required=True, help="operator-controlled offline JSON fixture")
-    placement.add_argument("--intent", required=True, help="untrusted Manus intent JSON")
-    placement.add_argument("--already-applied", help="optional JSON array of already-applied intent IDs")
     return parser
 
 
@@ -529,10 +430,8 @@ def main(argv: list[str] | None = None) -> int:
             applied_ids = _load_applied_ids(args.already_applied)
             if args.operation == "validate-intent":
                 result = validate_candidate_intent(fixture, intent_text, applied_ids)
-            elif args.operation == "record-forecast":
-                result = record_candidate_forecast(fixture, intent_text, applied_ids)
             else:
-                result = record_candidate_paper_placement(fixture, intent_text, applied_ids)
+                result = record_candidate_forecast(fixture, intent_text, applied_ids)
             print(_canonical_json(result))
     except GuardianValidationError as exc:
         parser.exit(2, f"REJECTED: {exc}\n")
