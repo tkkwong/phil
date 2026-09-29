@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import functools
 import hashlib
 import json
 import os
@@ -36,13 +35,10 @@ from manus.paper_cycle_guardian import (
     validate_candidate_intent,
 )
 from manus.research_transport import TRANSPORT_REQUEST_SCHEMA_VERSION
-from manus import paper_locks
 
 
 APPLICATION_VERSION = "paper-apply/v1"
 _STAGING_CHILDREN = ("phil-manus", "staging")
-APPLICATION_LOCK_WAIT_SECONDS = 30
-JOURNAL_WRITER_LOCK_WAIT_SECONDS = 30
 _RECEIPT_STATES = frozenset(
     {
         "prepared",
@@ -616,52 +612,6 @@ def _terminal_result(context: dict[str, Any], receipt: dict[str, Any]) -> dict[s
     )
 
 
-def _with_paper_application_locks(function):
-    """Serialize one intent receipt and the shared Manus journal-writer path.
-
-    The application lock comes first, then the shared journal-writer lock. The
-    body receives both before it reads or writes an application receipt or
-    reads/mutates forecasts or the PAPER ledger. This intentionally does not
-    lock legacy writers: extending their single-writer contract is outside the
-    guarded Manus route.
-    """
-
-    @functools.wraps(function)
-    def wrapped(fixture_path: str, intent_id: str, *, dry_run: bool = False, **kwargs):
-        if dry_run:
-            return function(fixture_path, intent_id, dry_run=True, **kwargs)
-        canonical_intent_id = _require_canonical_uuid4(intent_id, "intent_id")
-        staging_root_value = kwargs.get("_staging_root")
-        staging_root = _resolve_staging_root() if staging_root_value is None else pathlib.Path(staging_root_value)
-        # Production staging is fixed at %LOCALAPPDATA%\\phil-manus\\staging,
-        # so this derives the fixed sibling %LOCALAPPDATA%\\phil-manus\\locks.
-        # The private override exists only for isolated offline test fixtures.
-        lock_root_value = kwargs.get("_lock_root")
-        lock_root = staging_root.parent / "locks" if lock_root_value is None else pathlib.Path(lock_root_value)
-        try:
-            with paper_locks.acquire_application_lock(
-                canonical_intent_id,
-                nonblocking=False,
-                timeout_seconds=APPLICATION_LOCK_WAIT_SECONDS,
-                _lock_root=lock_root,
-            ):
-                with paper_locks.acquire_journal_writer_lock(
-                    nonblocking=False,
-                    timeout_seconds=JOURNAL_WRITER_LOCK_WAIT_SECONDS,
-                    _lock_root=lock_root,
-                ):
-                    return function(fixture_path, intent_id, dry_run=False, **kwargs)
-        except paper_locks.LockUnavailableError:
-            raise PaperApplyError(
-                "PAPER application is already running or journal writer is busy; no mutation was performed"
-            ) from None
-        except paper_locks.LockError:
-            raise PaperApplyError("Fixed PAPER application lock is unavailable; no mutation was performed") from None
-
-    return wrapped
-
-
-@_with_paper_application_locks
 def run(
     fixture_path: str,
     intent_id: str,
@@ -672,14 +622,11 @@ def run(
     _ledger_path: pathlib.Path | None = None,
     _now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     _placement_now: dt.datetime | None = None,
-    _lock_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Apply one fixed staged intent through existing guarded PAPER functions.
 
     Underscore arguments are test seams only. The production CLI exposes only
-    ``--fixture``, ``--intent-id``, and ``--dry-run``. ``_lock_root`` is an
-    internal test seam; production derives a fixed sibling lock root from the
-    fixed external staging root.
+    ``--fixture``, ``--intent-id``, and ``--dry-run``.
     """
     staging_root = _resolve_staging_root() if _staging_root is None else pathlib.Path(_staging_root)
     context = _load_and_validate_staging(fixture_path, intent_id, staging_root)

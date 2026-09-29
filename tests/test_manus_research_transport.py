@@ -8,7 +8,6 @@ import hashlib
 import inspect
 import io
 import json
-import multiprocessing
 import pathlib
 import tempfile
 import unittest
@@ -62,58 +61,6 @@ class FakeResponse:
 
     def read(self):
         return self._body
-
-
-class BlockingCreateOpener:
-    """Cross-process fake Manus API: hold one POST while a loser tries to run."""
-
-    def __init__(self, counter_path, post_started, release):
-        self.counter_path = pathlib.Path(counter_path)
-        self.post_started = post_started
-        self.release = release
-
-    def __call__(self, request, timeout):
-        if request.method == "POST":
-            with self.counter_path.open("a", encoding="utf-8") as counter:
-                counter.write("task.create\n")
-            self.post_started.set()
-            if not self.release.wait(10):
-                raise TimeoutError("test release did not arrive")
-            return FakeResponse({"ok": True, "task_id": "task-multiprocess"})
-        if "task.listMessages" in request.full_url:
-            return FakeResponse(task_messages("stopped", {
-                "success": True,
-                "value": {
-                    "outcome": "Texas A&M",
-                    "estimated_probability": 0.62,
-                    "category": "sports",
-                    "rationale": "Mocked multiprocess research result.",
-                    "edge_class": "other",
-                    "forecast_disposition": "no-edge",
-                },
-                "error": None,
-            }))
-        if "task.detail" in request.full_url:
-            return FakeResponse(task_detail("stopped", False))
-        raise AssertionError(f"unexpected request {request.full_url}")
-
-
-def _run_blocking_transport_worker(fixture_path, candidate_id, staging_root, lock_root, counter_path, post_started, release, results):
-    """Spawn target that exercises a full mocked transport under its request lock."""
-    try:
-        result = transport.run(
-            fixture_path,
-            candidate_id,
-            credential_loader=lambda: "worker-test-secret",
-            opener=BlockingCreateOpener(counter_path, post_started, release),
-            staging_root_factory=lambda: pathlib.Path(staging_root),
-            sleep=lambda _: None,
-            monotonic=lambda: 0,
-            _lock_root_factory=lambda: pathlib.Path(lock_root),
-        )
-        results.put(("ok", result["task_id"]))
-    except Exception as exc:  # pragma: no cover - diagnostic sent to parent
-        results.put(("error", str(exc)))
 
 
 class RecordingOpener:
@@ -616,7 +563,6 @@ class ManusResearchTransportTests(unittest.TestCase):
     def test_resumed_task_404_not_found_is_not_visibility_retryable(self):
         reservation = self.new_reservation()
         transport._write_reservation(self.reservation_path(), reservation)
-        reservation = transport._set_reservation_state(self.reservation_path(), reservation, "creating")
         transport._record_created_task(self.reservation_path(), reservation, "task-1")
         opener = RecordingOpener([api_error(404, code="not_found")])
         with self.assertRaisesRegex(transport.ResearchTransportError, r"phase=task.listMessages.*status=404"):
@@ -816,7 +762,7 @@ class ManusResearchTransportTests(unittest.TestCase):
                 return
             self.assertTrue(self.reservation_path().exists())
             reservation = self.reservation_document()
-            self.assertEqual(reservation["state"], "creating")
+            self.assertEqual(reservation["state"], "reserved")
             self.assertIsNone(reservation["task_id"])
             self.assertEqual(reservation["request_sha256"], self.request_sha256())
             self.assertEqual(reservation["transport_schema_version"], transport.TRANSPORT_REQUEST_SCHEMA_VERSION)
@@ -833,66 +779,6 @@ class ManusResearchTransportTests(unittest.TestCase):
         self.assertTrue(result["validated"])
         self.assertEqual(self.reservation_document()["state"], "completed")
 
-    def test_creating_without_task_id_fails_closed_without_credential_or_post(self):
-        reservation = self.new_reservation()
-        transport._write_reservation(self.reservation_path(), reservation)
-        transport._set_reservation_state(self.reservation_path(), reservation, "creating")
-        opener = RecordingOpener([])
-        with self.assertRaisesRegex(transport.ResearchTransportError, "operator reconciliation"):
-            transport.run(
-                str(self.fixture_path),
-                self.candidate_id,
-                credential_loader=lambda: (_ for _ in ()).throw(AssertionError("no credential")),
-                opener=opener,
-                staging_root_factory=lambda: self.staging_root,
-            )
-        self.assertEqual(opener.requests, [])
-        self.assertEqual(self.reservation_document()["state"], "creating")
-
-    def test_simultaneous_exact_request_creates_at_most_one_task(self):
-        context = multiprocessing.get_context("spawn")
-        lock_root = self.root / "fixed-locks"
-        counter_path = self.root / "create-count.txt"
-        post_started = context.Event()
-        release = context.Event()
-        results = context.Queue()
-        worker = context.Process(
-            target=_run_blocking_transport_worker,
-            args=(
-                str(self.fixture_path),
-                self.candidate_id,
-                str(self.staging_root),
-                str(lock_root),
-                str(counter_path),
-                post_started,
-                release,
-                results,
-            ),
-        )
-        worker.start()
-        self.assertTrue(post_started.wait(10), "first process did not reach task.create")
-        loser = RecordingOpener([])
-        with self.assertRaisesRegex(transport.ResearchTransportError, "already in progress"):
-            transport.run(
-                str(self.fixture_path),
-                self.candidate_id,
-                credential_loader=lambda: (_ for _ in ()).throw(AssertionError("loser read credential")),
-                opener=loser,
-                staging_root_factory=lambda: self.staging_root,
-                _lock_root_factory=lambda: lock_root,
-            )
-        self.assertEqual(loser.requests, [])
-        self.assertEqual(counter_path.read_text(encoding="utf-8").splitlines(), ["task.create"])
-        release.set()
-        worker.join(20)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(10)
-        self.assertEqual(worker.exitcode, 0)
-        self.assertEqual(results.get(timeout=5), ("ok", "task-multiprocess"))
-        self.assertEqual(counter_path.read_text(encoding="utf-8").splitlines(), ["task.create"])
-        self.assertEqual(self.reservation_document()["state"], "completed")
-
     def test_successful_flow_transitions_reservation_to_completed(self):
         original_write = transport._write_reservation
         states = []
@@ -904,7 +790,7 @@ class ManusResearchTransportTests(unittest.TestCase):
         with patch("manus.research_transport._write_reservation", side_effect=record_state):
             result, _ = self.run_transport(self.successful_messages())
         self.assertTrue(result["validated"])
-        self.assertEqual(states, ["reserved", "creating", "created", "polling", "completed"])
+        self.assertEqual(states, ["reserved", "created", "polling", "completed"])
         self.assertEqual(self.reservation_document()["state"], "completed")
 
     def test_reservation_write_failure_prevents_task_create(self):
@@ -955,7 +841,7 @@ class ManusResearchTransportTests(unittest.TestCase):
                     opener=opener, staging_root_factory=lambda: self.staging_root,
                 )
         self.assertEqual([request.method for request in opener.requests], ["POST"])
-        self.assertEqual(self.reservation_document()["state"], "creating")
+        self.assertEqual(self.reservation_document()["state"], "reserved")
         self.assertIsNone(self.reservation_document()["task_id"])
         rerun_opener = RecordingOpener([])
         with self.assertRaisesRegex(transport.ResearchTransportError, "operator reconciliation"):
@@ -969,7 +855,6 @@ class ManusResearchTransportTests(unittest.TestCase):
     def test_existing_task_id_reservation_resumes_exact_task_without_create(self):
         reservation = self.new_reservation()
         transport._write_reservation(self.reservation_path(), reservation)
-        reservation = transport._set_reservation_state(self.reservation_path(), reservation, "creating")
         transport._record_created_task(self.reservation_path(), reservation, "task-1")
         result, opener = self.run_transport([
             task_messages("stopped", {"success": True, "value": self.research_result(), "error": None}),
