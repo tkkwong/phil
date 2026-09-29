@@ -1075,7 +1075,6 @@ def run(
     candidate_id: str,
     *,
     dry_run: bool = False,
-    allow_new_task: bool = True,
     credential_loader: Callable[[], str] = _read_windows_api_key,
     opener: Callable[..., Any] = urllib.request.urlopen,
     staging_root_factory: Callable[[], pathlib.Path] = _resolve_staging_root,
@@ -1087,13 +1086,7 @@ def run(
     _request_lock_held: bool = False,
     _held_request_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Perform one bounded research-only run, or return a dry-run audit summary.
-
-    ``allow_new_task`` is local authorization for this invocation only. It is
-    deliberately neither part of the request identity nor durable state.
-    """
-    if type(allow_new_task) is not bool:
-        raise ResearchTransportError("allow_new_task must be a bool")
+    """Perform one bounded research-only run, or return a dry-run audit summary."""
     fixture, candidate, fixture_sha256, packet = _prepare_run(fixture_path, candidate_id)
     staging_root = staging_root_factory()
     summary = _safe_summary(packet["packet_id"], candidate, staging_root)
@@ -1123,7 +1116,6 @@ def run(
                     fixture_path,
                     candidate_id,
                     dry_run=False,
-                    allow_new_task=allow_new_task,
                     credential_loader=credential_loader,
                     opener=opener,
                     staging_root_factory=staging_root_factory,
@@ -1169,14 +1161,6 @@ def run(
         raise ResearchTransportError(
             f"Pre-create reservation state={reservation['state']}; reservation_key={reservation_key}; "
             "task creation requires operator reconciliation; no new task created"
-        )
-    # This gate is inside the held request lock and after the authoritative
-    # reservation validation. An existing valid known-task resume/recovery path
-    # remains usable, but a no-reservation invocation cannot gain new-task
-    # authority from any earlier process or durable transport artifact.
-    if reservation is None and not allow_new_task:
-        raise ResearchTransportError(
-            "Current invocation is not authorized to create a new Manus task"
         )
     task_origin = "resumed" if reservation is not None else "created"
     if reservation is not None:
