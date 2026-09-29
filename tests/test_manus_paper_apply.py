@@ -8,7 +8,6 @@ import inspect
 import io
 import json
 import multiprocessing
-import os
 import pathlib
 import tempfile
 import unittest
@@ -367,16 +366,7 @@ class PaperApplyTests(unittest.TestCase):
         self.stage()
         redirected = self.root / "redirected-receipts"
         redirected.mkdir()
-        try:
-            (self.staging_root / "apply").symlink_to(redirected, target_is_directory=True)
-        except OSError as exc:
-            # A normal, non-elevated Windows account may lack the specific
-            # CreateSymbolicLink privilege. Do not skip other setup failures;
-            # Windows environments that can create symlinks still execute the
-            # production rejection assertion below.
-            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
-                self.skipTest("Windows account lacks CreateSymbolicLink privilege (WinError 1314)")
-            raise
+        (self.staging_root / "apply").symlink_to(redirected, target_is_directory=True)
         with self.assertRaisesRegex(paper_apply.PaperApplyError, "Fixed staged intent directory"):
             self.call(dry_run=True)
 
