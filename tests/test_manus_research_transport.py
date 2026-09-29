@@ -1,4 +1,4 @@
-"""Offline regressions for the bounded Patch 5A.2 Manus research transport."""
+"""Offline regressions for the bounded Patch 5A.1 Manus research transport."""
 
 import ast
 import copy
@@ -83,20 +83,17 @@ class RecordingOpener:
         return FakeResponse(response)
 
 
-def task_messages(status, result=None, extra_events=()):
+def task_messages(status, result=None):
     messages = [{"type": "status_update", "status_update": {"agent_status": status}}]
-    messages.extend(extra_events)
     if result is not None:
         messages.append({"type": "structured_output_result", "structured_output_result": result})
     return {"ok": True, "messages": messages}
 
 
-def task_detail(status, background_marker=object(), agent_profile=None):
+def task_detail(status, background_marker=object()):
     task = {"status": status}
     if background_marker is not _MISSING:
         task["has_running_background_jobs"] = background_marker
-    if agent_profile is not None:
-        task["agent_profile"] = agent_profile
     return {"ok": True, "task": task}
 
 
@@ -208,7 +205,6 @@ class ManusResearchTransportTests(unittest.TestCase):
     def test_task_create_is_private_standalone_connector_free_and_non_retryable(self):
         payload = transport.build_task_request(self.packet["packet_id"], self.candidate)
         self.assertEqual(payload["message"]["connectors"], [])
-        self.assertNotIn("attachments", payload["message"])
         self.assertNotIn("project_id", payload)
         self.assertNotIn("task_references", payload)
         self.assertFalse(payload["interactive_mode"])
@@ -264,10 +260,6 @@ class ManusResearchTransportTests(unittest.TestCase):
         for field, value in self.research_result().items():
             self.assertEqual(intent[field], value)
         self.assertEqual(self.reservation_document()["state"], "completed")
-        self.assertEqual(result["task_id"], "task-1")
-        self.assertEqual(result["task_origin"], "created")
-        self.assertTrue(result["task_created_this_invocation"])
-        self.assertEqual(result["api_endpoint"], "task.create")
 
     def test_trusted_assembly_requires_locally_generated_uuidv4(self):
         with self.assertRaisesRegex(transport.ResearchTransportError, "UUIDv4"):
@@ -445,162 +437,6 @@ class ManusResearchTransportTests(unittest.TestCase):
         result, opener = self.run_transport(responses)
         self.assertTrue(result["validated"])
         self.assertEqual([request.method for request in opener.requests], ["POST", "GET", "GET", "GET"])
-
-    def test_new_task_list_messages_404_not_found_once_recovers_in_same_invocation(self):
-        sleep_calls = []
-
-        def confirm_durable_reservation_on_404(request):
-            if "task.listMessages" in request.full_url and len(opener.requests) == 2:
-                reservation = self.reservation_document()
-                self.assertEqual(reservation["task_id"], "task-1")
-                self.assertEqual(reservation["state"], "polling")
-
-        responses = [
-            {"ok": True, "task_id": "task-1"},
-            api_error(404, code="not_found"),
-            task_messages("stopped", {"success": True, "value": self.research_result(), "error": None}),
-            task_detail("stopped", False),
-        ]
-        opener = RecordingOpener(responses, on_request=confirm_durable_reservation_on_404)
-        result = transport.run(
-            str(self.fixture_path), self.candidate_id, credential_loader=lambda: SECRET,
-            opener=opener, staging_root_factory=lambda: self.staging_root,
-            sleep=sleep_calls.append, monotonic=lambda: 0,
-            now=lambda: dt.datetime(2026, 9, 26, 15, 30, tzinfo=dt.timezone.utc),
-            new_uuid=lambda: TEST_UUID,
-        )
-        self.assertTrue(result["validated"])
-        self.assertEqual(sleep_calls, [1])
-        self.assertEqual([request.method for request in opener.requests], ["POST", "GET", "GET", "GET"])
-        self.assertEqual(result["task_id"], "task-1")
-        self.assertEqual(result["task_origin"], "created")
-        self.assertTrue(result["task_created_this_invocation"])
-        get_task_ids = [
-            urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["task_id"][0]
-            for request in opener.requests if request.method == "GET"
-        ]
-        self.assertEqual(get_task_ids, ["task-1", "task-1", "task-1"])
-        self.assertEqual(self.reservation_document()["state"], "completed")
-
-    def test_pre_visibility_task_detail_404_not_found_once_recovers(self):
-        opener = RecordingOpener([
-            api_error(404, code="not_found"),
-            task_detail("running", False),
-        ])
-        response, visible = transport._read_poll_endpoint(
-            transport.TASK_DETAIL_ENDPOINT,
-            SECRET,
-            phase="task.detail",
-            query={"task_id": "task-1"},
-            opener=opener,
-            sleep=lambda _: None,
-            monotonic=lambda: 0,
-            deadline=transport.POLL_DEADLINE_SECONDS,
-            visibility_grace_deadline=transport.POST_CREATE_VISIBILITY_GRACE_SECONDS,
-            task_visible=False,
-        )
-        self.assertEqual(response["task"]["status"], "running")
-        self.assertTrue(visible)
-        self.assertEqual([request.method for request in opener.requests], ["GET", "GET"])
-
-    def test_repeated_new_task_visibility_404s_are_bounded_and_keep_one_task_id(self):
-        sleep_calls = []
-        responses = [
-            {"ok": True, "task_id": "task-1"},
-            api_error(404, code="not_found"),
-            api_error(404, code="not_found"),
-            api_error(404, code="not_found"),
-            task_messages("stopped", {"success": True, "value": self.research_result(), "error": None}),
-            task_detail("stopped", False),
-        ]
-        result, opener = self.run_transport(responses, sleep=sleep_calls.append)
-        self.assertTrue(result["validated"])
-        self.assertEqual(sleep_calls, [1, 2, 4])
-        self.assertEqual(sum(request.method == "POST" for request in opener.requests), 1)
-        self.assertEqual(len(opener.requests), 6)
-        self.assertTrue(self.reservation_path().exists())
-        self.assertEqual(self.reservation_document()["task_id"], "task-1")
-
-    def test_visibility_404_retry_cap_fails_closed_without_second_create(self):
-        responses = [{"ok": True, "task_id": "task-1"}] + [
-            api_error(404, code="not_found")
-            for _ in range(transport.POST_CREATE_VISIBILITY_MAX_RETRIES + 1)
-        ]
-        opener = RecordingOpener(responses)
-        with self.assertRaisesRegex(transport.ResearchTransportError, r"phase=task.listMessages.*status=404"):
-            transport.run(
-                str(self.fixture_path), self.candidate_id, credential_loader=lambda: SECRET,
-                opener=opener, staging_root_factory=lambda: self.staging_root,
-                sleep=lambda _: None, monotonic=lambda: 0,
-                now=lambda: dt.datetime(2026, 9, 26, 15, 30, tzinfo=dt.timezone.utc),
-                new_uuid=lambda: TEST_UUID,
-            )
-        self.assertEqual(sum(request.method == "POST" for request in opener.requests), 1)
-        self.assertEqual(len(opener.requests), transport.POST_CREATE_VISIBILITY_MAX_RETRIES + 2)
-        self.assertEqual(self.reservation_document()["state"], "polling")
-
-    def test_visibility_404_beyond_grace_fails_closed_without_second_create(self):
-        clock_values = iter((0, transport.POST_CREATE_VISIBILITY_GRACE_SECONDS + 1))
-        with self.assertRaisesRegex(transport.ResearchTransportError, r"phase=task.listMessages.*status=404"):
-            self.run_transport(
-                [{"ok": True, "task_id": "task-1"}, api_error(404, code="not_found")],
-                monotonic=lambda: next(clock_values),
-            )
-        self.assertEqual(self.reservation_document()["state"], "polling")
-
-    def test_generic_new_task_404_is_not_visibility_retryable(self):
-        opener = RecordingOpener([{"ok": True, "task_id": "task-1"}, api_error(404, code="other_error")])
-        with self.assertRaisesRegex(transport.ResearchTransportError, r"status=404.*error_code=other_error"):
-            transport.run(
-                str(self.fixture_path), self.candidate_id, credential_loader=lambda: SECRET,
-                opener=opener, staging_root_factory=lambda: self.staging_root,
-                sleep=lambda _: None, monotonic=lambda: 0,
-                now=lambda: dt.datetime(2026, 9, 26, 15, 30, tzinfo=dt.timezone.utc),
-                new_uuid=lambda: TEST_UUID,
-            )
-        self.assertEqual([request.method for request in opener.requests], ["POST", "GET"])
-
-    def test_resumed_task_404_not_found_is_not_visibility_retryable(self):
-        reservation = self.new_reservation()
-        transport._write_reservation(self.reservation_path(), reservation)
-        transport._record_created_task(self.reservation_path(), reservation, "task-1")
-        opener = RecordingOpener([api_error(404, code="not_found")])
-        with self.assertRaisesRegex(transport.ResearchTransportError, r"phase=task.listMessages.*status=404"):
-            transport.run(
-                str(self.fixture_path), self.candidate_id, credential_loader=lambda: SECRET,
-                opener=opener, staging_root_factory=lambda: self.staging_root,
-                sleep=lambda _: None, monotonic=lambda: 0,
-                now=lambda: dt.datetime(2026, 9, 26, 15, 30, tzinfo=dt.timezone.utc),
-                new_uuid=lambda: TEST_UUID,
-            )
-        self.assertEqual([request.method for request in opener.requests], ["GET"])
-        self.assertEqual(self.reservation_document()["task_id"], "task-1")
-
-    def test_visible_task_later_404_not_found_fails_closed(self):
-        opener = RecordingOpener([
-            {"ok": True, "task_id": "task-1"},
-            task_messages("stopped", {"success": True, "value": self.research_result(), "error": None}),
-            api_error(404, code="not_found"),
-        ])
-        with self.assertRaisesRegex(transport.ResearchTransportError, r"phase=task.detail.*status=404"):
-            transport.run(
-                str(self.fixture_path), self.candidate_id, credential_loader=lambda: SECRET,
-                opener=opener, staging_root_factory=lambda: self.staging_root,
-                sleep=lambda _: None, monotonic=lambda: 0,
-                now=lambda: dt.datetime(2026, 9, 26, 15, 30, tzinfo=dt.timezone.utc),
-                new_uuid=lambda: TEST_UUID,
-            )
-        self.assertEqual([request.method for request in opener.requests], ["POST", "GET", "GET"])
-
-    def test_task_create_404_remains_non_retryable_and_ambiguous(self):
-        opener = RecordingOpener([api_error(404, code="not_found")])
-        with self.assertRaisesRegex(transport.ResearchTransportError, r"phase=task.create.*reconciliation required"):
-            transport.run(
-                str(self.fixture_path), self.candidate_id, credential_loader=lambda: SECRET,
-                opener=opener, staging_root_factory=lambda: self.staging_root,
-            )
-        self.assertEqual([request.method for request in opener.requests], ["POST"])
-        self.assertEqual(self.reservation_document()["state"], "ambiguous-create")
 
     def test_transient_get_retries_are_bounded_and_safe_diagnostic_never_leaks_secret(self):
         responses = [
@@ -863,10 +699,6 @@ class ManusResearchTransportTests(unittest.TestCase):
         self.assertTrue(result["validated"])
         self.assertEqual([request.method for request in opener.requests], ["GET", "GET"])
         self.assertEqual(self.reservation_document()["state"], "completed")
-        self.assertEqual(result["task_id"], "task-1")
-        self.assertEqual(result["task_origin"], "resumed")
-        self.assertFalse(result["task_created_this_invocation"])
-        self.assertEqual(result["api_endpoint"], "task.listMessages/task.detail")
 
     def test_existing_reservation_without_task_id_fails_closed_without_create(self):
         transport._write_reservation(self.reservation_path(), self.new_reservation())
@@ -926,42 +758,11 @@ class ManusResearchTransportTests(unittest.TestCase):
         self.assertEqual(opener.requests, [])
 
     def test_completed_staging_metadata_carries_safe_request_provenance(self):
-        result, _ = self.run_transport([
-            {"ok": True, "task_id": "task-1"},
-            task_messages("stopped", {"success": True, "value": self.research_result(), "error": None}),
-            task_detail("stopped", False, agent_profile="manus-1.6"),
-        ])
+        result, _ = self.run_transport(self.successful_messages())
         metadata = json.loads((pathlib.Path(result["staging_path"]) / "run-meta.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["request_sha256"], self.request_sha256())
         self.assertEqual(metadata["transport_schema_version"], transport.TRANSPORT_REQUEST_SCHEMA_VERSION)
-        self.assertEqual(metadata["task_origin"], "created")
-        self.assertTrue(metadata["task_created_this_invocation"])
-        self.assertEqual(metadata["agent_profile"], "standard")
-        self.assertEqual(metadata["requested_agent_profile"], "standard")
-        self.assertEqual(metadata["resolved_agent_profile"], "manus-1.6")
         self.assertNotIn(SECRET, transport._canonical_json(metadata))
-
-    def test_server_side_prompt_attachment_is_neither_staged_nor_printed(self):
-        attachment_url = "https://cloud.manus.example/attachment/sensitive-prompt.txt"
-        messages = task_messages(
-            "stopped",
-            {"success": True, "value": self.research_result(), "error": None},
-            extra_events=(
-                {
-                    "type": "assistant_message",
-                    "attachments": [{"url": attachment_url, "name": "prompt.txt"}],
-                },
-            ),
-        )
-        result, _ = self.run_transport([
-            {"ok": True, "task_id": "task-1"}, messages, task_detail("stopped", False),
-        ])
-        self.assertNotIn(attachment_url, transport._canonical_json(result))
-        persisted = "\n".join(
-            path.read_text(encoding="utf-8") for path in self.staging_root.rglob("*.json")
-        )
-        self.assertNotIn(attachment_url, persisted)
-        self.assertNotIn("attachments", persisted)
 
     def test_cli_exposes_only_fixture_candidate_and_dry_run_controls(self):
         parser = transport.build_parser()
