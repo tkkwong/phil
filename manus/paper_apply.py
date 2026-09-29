@@ -6,9 +6,8 @@ accepts journal/staging paths from a caller, or implements forecast/placement
 policy.  Forecast and simulated PAPER ledger mutations go only through the
 existing fixture-bound guardian functions.
 
-The bridge serializes concurrent ``paper_apply`` processes for one intent and
-the guarded Manus journal path. Legacy writers remain outside that lock
-contract and must not run concurrently against the same journals.
+The bridge is deliberately single-writer: do not run it concurrently with the
+legacy runner or another paper_apply process against the same journals.
 """
 
 from __future__ import annotations
