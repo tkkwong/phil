@@ -1,11 +1,10 @@
-"""Operator-owned guardian for Manus PAPER candidate packets and forecasts.
+"""Operator-owned, data-only guardian for Manus PAPER candidate packets.
 
-``prepare`` and ``validate-intent`` remain data-only. ``record-forecast`` is
-the single explicitly authorized mutation: after fixture-bound validation it
-calls the narrow protected forecast recorder, which performs existing public
-Gamma/CLOB market-data reads and appends at most one forecast row. It never
-places a paper position, invokes a ledger, real-trading route, broker, Pearl,
-or IBKR component, or executes Manus text.
+The guardian deliberately has no core imports, network calls, credential access,
+filesystem writes, or execution path. It turns an operator-controlled offline
+fixture following ``core/scan.py``'s public record shape into a packet for
+Manus, then reconstructs that packet from the same fixture before validating an
+untrusted Manus intent.
 """
 
 from __future__ import annotations
@@ -20,13 +19,11 @@ import re
 import sys
 from typing import Any, Iterable
 
-from core import forecast as forecast_core
 from manus.intent_validator import IntentValidationError, validate_intent
 
 
 PACKET_VERSION = "paper-candidate-packet/v1"
 VALIDATION_VERSION = "paper-guardian-validation/v1"
-FORECAST_RECORDING_VERSION = "paper-guardian-forecast-recording/v1"
 
 # These are exactly the fields currently emitted by core/scan.py's keep().
 # Prepare accepts the full read-only scan record but emits only its bounded,
@@ -56,22 +53,11 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _ISO_UTC_TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
 )
-_FORBIDDEN_CLI_MARKERS = (
-    "real",
-    "live-trading",
-    "execute",
-    "order",
-    "ibkr",
-    "pearl",
-    "ledger",
-    "journal",
-    "supersede",
-    "confirm-extreme",
-)
+_FORBIDDEN_CLI_MARKERS = ("real", "live-trading", "execute", "order", "ibkr", "pearl")
 
 
 class GuardianValidationError(ValueError):
-    """Raised when fixture, intent, or guarded forecast data is invalid or unsafe."""
+    """Raised when fixture or fixture-bound intent data is malformed or unsafe."""
 
 
 def _canonical_json(value: Any) -> str:
@@ -105,7 +91,7 @@ def _parse_json_document(document: str, label: str) -> Any:
 
 
 def _load_json_path(path_value: str, label: str) -> Any:
-    """Read one explicit operator-supplied input path; no arbitrary output path exists."""
+    """Read one explicit operator-supplied input path; this guardian never writes."""
     try:
         return _parse_json_document(pathlib.Path(path_value).read_text(encoding="utf-8"), label)
     except OSError as exc:
@@ -280,12 +266,17 @@ def prepare_packet(fixture: Any) -> dict[str, Any]:
     }
 
 
-def _validate_fixture_bound_intent(
+def validate_candidate_intent(
     fixture: Any,
     intent_document: str | bytes | bytearray,
     already_applied_intent_ids: Iterable[str] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Validate an intent and bind it to a freshly reconstructed fixture packet."""
+) -> dict[str, Any]:
+    """Validate an untrusted intent against a freshly reconstructed trusted packet.
+
+    The fixture, rather than a packet supplied by Manus, is the validation
+    authority. This function is data-only: it does not write files, persist ids,
+    create forecasts or ledger entries, execute text, or invoke external code.
+    """
     packet = prepare_packet(fixture)
     try:
         intent = validate_intent(intent_document, already_applied_intent_ids)
@@ -300,77 +291,12 @@ def _validate_fixture_bound_intent(
         raise GuardianValidationError("intent market_id does not exactly match its candidate")
     if intent["outcome"] not in candidate["outcomes"]:
         raise GuardianValidationError("intent outcome does not exactly match a trusted outcome")
-    return packet, intent, candidate
 
-
-def validate_candidate_intent(
-    fixture: Any,
-    intent_document: str | bytes | bytearray,
-    already_applied_intent_ids: Iterable[str] | None = None,
-) -> dict[str, Any]:
-    """Validate a fixture-bound intent without performing any mutation or network I/O."""
-    packet, intent, _ = _validate_fixture_bound_intent(
-        fixture, intent_document, already_applied_intent_ids
-    )
     return {
         "validation_version": VALIDATION_VERSION,
         "packet_id": packet["packet_id"],
         "mode": "PAPER",
         "intent": intent,
-    }
-
-
-def record_candidate_forecast(
-    fixture: Any,
-    intent_document: str | bytes | bytearray,
-    already_applied_intent_ids: Iterable[str] | None = None,
-    *,
-    _forecast_path: pathlib.Path | None = None,
-) -> dict[str, Any]:
-    """Record exactly one fixture-bound PAPER forecast through protected core.
-
-    All fixture and intent validation completes before public market I/O. The
-    only input that can influence the protected forecast call comes from the
-    trusted candidate or validated intent. Strategy proposals are deliberately
-    discarded; rationale is passed only as the ordinary data-only forecast note.
-    ``_forecast_path`` is an internal test seam and has no production CLI flag.
-    """
-    packet, intent, candidate = _validate_fixture_bound_intent(
-        fixture, intent_document, already_applied_intent_ids
-    )
-    trusted_outcome = next(
-        outcome for outcome in candidate["outcomes"] if outcome == intent["outcome"]
-    )
-    try:
-        kwargs: dict[str, Any] = {
-            "market_id": candidate["market_id"],
-            "outcome": trusted_outcome,
-            "est_prob": intent["estimated_probability"],
-            "category": intent["category"],
-            "skip_reason": intent["forecast_disposition"],
-            "note": intent["rationale"],
-            "source_intent_id": intent["intent_id"],
-            # The Manus route is permanently non-superseding and cannot
-            # auto-confirm a protected extreme-disagreement guard.
-            "supersede": False,
-            "confirm_extreme": False,
-        }
-        if _forecast_path is not None:
-            kwargs["forecast_path"] = _forecast_path
-        recorded = forecast_core.record_forecast(**kwargs)
-    except forecast_core.ForecastRecordError as exc:
-        raise GuardianValidationError(str(exc)) from exc
-    except OSError as exc:
-        raise GuardianValidationError("Forecast write failed") from exc
-    except Exception as exc:
-        raise GuardianValidationError("Forecast recording failed") from exc
-
-    return {
-        "recording_version": FORECAST_RECORDING_VERSION,
-        "packet_id": packet["packet_id"],
-        "mode": "PAPER",
-        "source_intent_id": intent["intent_id"],
-        "forecast": recorded,
     }
 
 
@@ -391,7 +317,7 @@ def _reject_forbidden_cli_options(arguments: list[str], parser: argparse.Argumen
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Guarded Manus PAPER cycle interface")
+    parser = argparse.ArgumentParser(description="Data-only PAPER cycle guardian")
     subcommands = parser.add_subparsers(dest="operation", required=True)
 
     prepare = subcommands.add_parser("prepare", help="prepare a PAPER candidate packet from a trusted fixture")
@@ -403,13 +329,6 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--fixture", required=True, help="operator-controlled offline JSON fixture")
     validate.add_argument("--intent", required=True, help="untrusted Manus intent JSON")
     validate.add_argument("--already-applied", help="optional JSON array of already-applied intent IDs")
-
-    record = subcommands.add_parser(
-        "record-forecast", help="record one validated, fixture-bound PAPER forecast"
-    )
-    record.add_argument("--fixture", required=True, help="operator-controlled offline JSON fixture")
-    record.add_argument("--intent", required=True, help="untrusted Manus intent JSON")
-    record.add_argument("--already-applied", help="optional JSON array of already-applied intent IDs")
     return parser
 
 
@@ -427,11 +346,9 @@ def main(argv: list[str] | None = None) -> int:
                 intent_text = pathlib.Path(args.intent).read_text(encoding="utf-8")
             except OSError as exc:
                 raise GuardianValidationError("Unable to read intent") from exc
-            applied_ids = _load_applied_ids(args.already_applied)
-            if args.operation == "validate-intent":
-                result = validate_candidate_intent(fixture, intent_text, applied_ids)
-            else:
-                result = record_candidate_forecast(fixture, intent_text, applied_ids)
+            result = validate_candidate_intent(
+                fixture, intent_text, _load_applied_ids(args.already_applied)
+            )
             print(_canonical_json(result))
     except GuardianValidationError as exc:
         parser.exit(2, f"REJECTED: {exc}\n")
