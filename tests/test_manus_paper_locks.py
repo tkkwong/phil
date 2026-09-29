@@ -25,15 +25,6 @@ def _exit_while_holding_cycle_lock(root: str, ready) -> None:
     os._exit(0)
 
 
-def _attempt_cycle_lock(root: str, result) -> None:
-    """Report a second process's nonblocking ownership attempt."""
-    try:
-        with paper_locks.acquire_cycle_lock(nonblocking=True, _lock_root=pathlib.Path(root)):
-            result.put("acquired")
-    except paper_locks.LockUnavailableError:
-        result.put("unavailable")
-
-
 class PaperLockTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -84,24 +75,13 @@ class PaperLockTests(unittest.TestCase):
             pass
 
     def test_malformed_or_stale_metadata_cannot_bypass_os_lock(self):
+        process, release = self._start_holder()
         path = self.root / "cycle.lock"
-        path.parent.mkdir(parents=True)
         path.write_text("malformed stale metadata\n", encoding="utf-8")
-        # The pre-existing metadata is never parsed as ownership authority: a
-        # normal acquisition succeeds despite it. Do not overwrite a live lock
-        # file here; Windows msvcrt intentionally locks byte zero exclusively.
-        with paper_locks.acquire_cycle_lock(nonblocking=True, _lock_root=self.root):
-            result = self.context.Queue()
-            process = self.context.Process(target=_attempt_cycle_lock, args=(str(self.root), result))
-            process.start()
-            process.join(10)
-            if process.is_alive():
-                process.terminate()
-                process.join(10)
-            self.assertEqual(process.exitcode, 0)
-            self.assertEqual(result.get(timeout=5), "unavailable")
-        # Release permits a fresh holder; stale metadata cannot retain or break
-        # authority after the OS-held lock is gone.
+        with self.assertRaises(paper_locks.LockUnavailableError):
+            paper_locks.acquire_cycle_lock(nonblocking=True, _lock_root=self.root)
+        release.set()
+        process.join(10)
         self.assertEqual(process.exitcode, 0)
         with paper_locks.acquire_cycle_lock(nonblocking=True, _lock_root=self.root):
             pass
