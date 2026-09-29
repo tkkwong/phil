@@ -33,21 +33,3 @@ Return **only** the caller-provided structured schema containing exactly these s
 - `forecast_disposition` — exactly one provided research disposition: `bet`, `no-edge`, `market-agrees`, `ambiguous-resolution`, `architecture-mismatch`, `outside-view-veto`, or `unvalidated-method`.
 
 Do **not** return `intent_id`, `candidate_id`, `market_id`, `mode`, `strategy_proposals`, packet or event identifiers, token IDs, prices, stake, execution controls, credentials, filesystem paths, or action requests. The caller owns all authority-bearing bookkeeping fields locally and will reject invalid research fields without repairing them.
-
-## Complete manual PAPER cycle
-
-The controlled operator workflow is deliberately split into bounded manual stages:
-
-```text
-trusted frozen fixture
-  -> research transport
-  -> fixed validated staging
-  -> manual paper_apply
-  -> guarded forecast recording
-  -> optional guarded simulated PAPER placement
-  -> STOP
-```
-
-The research transport stops after fixed validated staging. It does **not** record a forecast or create a position. `paper_apply` is a separate operator-invoked local bridge that consumes only that fixed staging, revalidates it against the original trusted fixture, and then calls the existing guarded forecast/placement functions. It does **not** call Manus, receive new research output, access credentials, schedule work, or provide any real-trading route.
-
-Every valid disposition records a forecast. Only exact `forecast_disposition == "bet"` is eligible for the separate existing guarded simulated PAPER placement path. Any other disposition records the forecast and stops with zero ledger mutation. A `bet` remains subject to all protected live market, edge, spread, timing, exposure, cycle, bankroll, and event checks; it may be rejected without creating a simulated position.

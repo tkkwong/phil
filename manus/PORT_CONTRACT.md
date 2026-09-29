@@ -169,6 +169,7 @@ Before Gamma/CLOB I/O, the protected function rejects any earlier ledger row wit
 
 For provenance-bearing guarded rows, the ledger append uses the same single-writer atomic design as the forecast bridge: it preserves original ledger bytes in a same-directory temporary file, appends one complete JSONL row, flushes and fsyncs, closes the temporary file, and only then performs `os.replace()`. An ordinary exception before replacement leaves the original ledger byte-for-byte unchanged, leaves no first-write ledger file, and cleans up the temporary file where possible. No locking or concurrency mechanism is added: the guarded Manus cycle retains the documented **single-writer** limitation, and the legacy runner must not concurrently place positions during such a cycle.
 
+
 ## Patch 5A: research-only Manus transport
 
 Patch 5A adds the operator-owned `python -m manus.research_transport --fixture <trusted-fixture.json> --candidate-id <candidate-id> [--dry-run]` bridge. It automates only the bounded research hand-off:
@@ -216,7 +217,7 @@ Patch 5A.1 changes the Manus structured-output contract from a complete intent t
 
 Only protected local code creates the complete intent after a successful meaningful structured result. It generates a new canonical lowercase UUIDv4 `intent_id` using the Python standard library, injects the exact trusted `candidate_id` and `market_id`, sets `mode` to literal `PAPER`, and sets `strategy_proposals` to literal `[]`. It then passes that assembled document unchanged through the existing strict fixture-bound validator. Manus never supplies or influences those authority-bearing fields. A locally invalid research field rejects with no staged intent and no raw Manus result persisted.
 
-Before **any** `task.create` request, the transport reconstructs the trusted packet, selects the candidate, constructs the exact credential-free payload, computes `request_sha256` from its canonical JSON serialization, and atomically creates a candidate-bound pre-create reservation at `%LOCALAPPDATA%\phil-manus\staging\pending\<deterministic-trusted-key>.json`. The key is derived only from trusted `packet_id`, `candidate_id`, `market_id`, and `fixture_sha256`; deliberately omitting the request hash from the filename causes a changed prompt, schema, or request policy to collide and fail closed rather than silently create another paid task.
+Before **any** `task.create` request, the transport reconstructs the trusted packet, selects the candidate, constructs the exact credential-free payload, computes `request_sha256` from its canonical JSON serialization, and atomically creates a candidate-bound pre-create reservation at `%LOCALAPPDATA%\phil-manus\staging\pending\<deterministic-trusted-key>.json`. The key is derived only from trusted `packet_id`, `candidate_id`, `market_id`, and `fixture_sha256`; deliberately omitting the request hash from the filename causes a changed contract for the same frozen candidate to collide and fail closed rather than silently create another paid task.
 
 Each reservation contains only `task_id` (initially `null`), `packet_id`, `candidate_id`, `market_id`, `fixture_sha256`, `request_sha256`, `transport_schema_version`, `created_at`, and a safe state. The fingerprint covers the entire exact `task.create` JSON body: fixed instructions/prompt, quoted selected-candidate data, connector policy, task privacy/settings, agent profile, and structured-output schema. It excludes the API key and all HTTP headers. It never contains the API key, headers, cookies, connectors, raw output, rationale, or hidden reasoning.
 
@@ -229,77 +230,3 @@ Request-hash or transport-version drift for an existing reservation fails closed
 After a known task ID exists, only read-only `task.listMessages` and `task.detail` polling calls receive bounded retries for transient network, timeout, HTTP 408, HTTP 429, or HTTP 5xx failures within the existing overall deadline. Patch 5A.2 adds one narrower protected exception: for a task ID created in the **same invocation**, before either polling endpoint has returned data, a `404` with `error_code=not_found` is retried for at most `POST_CREATE_VISIBILITY_GRACE_SECONDS = 60` seconds (and no more than eight visibility retries), still bounded by the overall polling deadline. This acknowledges only the brief post-create visibility race; it does not make generic 404 responses, old/resumed tasks, unrelated GETs, or `task.create` retryable. The first successful response from either endpoint marks the task visible for that invocation, so a later 404 fails closed.
 
 Waiting, task error, timeout, and unknown conditions retain/update the reservation and fail closed. On validated success, complete intent staging is durable before the reservation becomes `completed`; `run-meta.json` retains safe `request_sha256`, `transport_schema_version`, `task_origin`, `task_created_this_invocation`, `requested_agent_profile`, and, where supplied by `task.detail`, `resolved_agent_profile`. `agent_profile` remains a backward-compatible alias for the requested profile only; a service-resolved profile such as `manus-1.6` is recorded separately and never selects routing or security policy. Safe invocation output similarly includes `task_id`, `task_origin` (`created` or `resumed`), and `task_created_this_invocation`, so a resumed reservation never implies a new `task.create` occurred. No raw task messages, server-side attachment objects, or attachment URLs are staged or printed. Patch 5A.2 still stops before forecast recording or PAPER placement.
-
-## Patch 5B: manual staged PAPER application
-
-Patch 5B adds one manual operator bridge:
-
-```text
-fixed validated staging
-  -> reconstruct original trusted fixture packet
-  -> revalidate staging provenance and intent binding
-  -> existing guarded forecast recording
-  -> exact bet only: existing guarded simulated PAPER placement
-  -> durable external application receipt
-  -> STOP
-```
-
-The production CLI is exactly:
-
-```text
-python -m manus.paper_apply --fixture <trusted-fixture.json> --intent-id <canonical-uuidv4> [--dry-run]
-```
-
-Only the fixture is a caller-supplied path. The bridge derives the staged file locations from the freshly reconstructed packet ID and canonical lowercase UUIDv4 intent ID:
-
-```text
-%LOCALAPPDATA%\phil-manus\staging\<packet_id>\<intent_id>\validated-intent.json
-%LOCALAPPDATA%\phil-manus\staging\<packet_id>\<intent_id>\run-meta.json
-```
-
-The external application receipt has one fixed non-caller-selectable location:
-
-```text
-%LOCALAPPDATA%\phil-manus\staging\apply\<packet_id>\<intent_id>.json
-```
-
-No production option accepts a staged directory, output location, journal path, stake, price, token, event, edge, spread, risk control, forecast ID, placement ID, real/live/broker setting, retry, force, override, shell, or command. Test-only underscore seams may inject external roots or journal locations; they are not CLI inputs.
-
-### Provenance before mutation
-
-Before reading a journal, public market data, or mutating anything, `paper_apply`:
-
-1. reads the exact trusted fixture bytes and computes its SHA-256;
-2. reconstructs the fixture packet using existing `prepare_packet()` logic;
-3. derives the fixed staged paths from that packet ID and the canonical CLI intent ID;
-4. parses `validated-intent.json` and `run-meta.json` with the existing duplicate-key-safe parser;
-5. requires exact packet ID, intent ID, candidate ID, fixture SHA-256, transport schema version, and validation version consistency;
-6. requires literal `mode == "PAPER"`, literal `strategy_proposals == []`, and exact trusted candidate, market, and outcome binding; and
-7. invokes existing strict `validate_candidate_intent()` again.
-
-The current protected `TRANSPORT_REQUEST_SCHEMA_VERSION` and `VALIDATION_VERSION` constants are imported rather than copied. A version mismatch fails closed; this bridge does not silently reinterpret old staging. Staging is evidence, not authority.
-
-`--dry-run` performs all of the preceding validation and emits only a safe plan (`record-forecast-only` or `record-forecast-then-guarded-paper-placement`). It makes no journal read/write, public market call, Manus call, credential lookup, application receipt write, forecast call, or placement call.
-
-### Application receipt and manual recovery
-
-The receipt contains only the application version/state, packet/intent/candidate/market IDs, fixture and exact-intent SHA-256 digests, disposition, known forecast/placement IDs, and timestamps. It never stores credentials, API keys, headers, cookies, raw market/API data, raw Manus messages, or rationale.
-
-The states are `prepared`, `forecast-pending`, `forecast-recorded`, `placement-pending`, `completed-no-placement`, `completed-placement`, `forecast-rejected`, `placement-rejected`, and `error`. `prepared` is atomically persisted before the first journal mutation with a same-directory temporary file, complete canonical JSON, flush, `fsync`, close, and `os.replace`; if that write fails, no forecast call occurs.
-
-The receipt is orchestration state only. Forecast and PAPER ledger journals are authoritative. A rerun reconciles against their immutable provenance before taking any action:
-
-- a forecast recovery requires exactly one `source_intent_id` row whose market, outcome, probability, category, disposition, and rationale exactly match the staged intent;
-- a PAPER placement recovery requires exactly one compatible row whose `source_intent_id`, `source_forecast_id`, `source_packet_id`, market, outcome, probability, category, rationale, and fixed `manus-paper-only` classification bind to that forecast/packet/intent;
-- duplicate or mismatched journal rows fail closed; and
-- a completed receipt performs zero new journal mutations only after its authoritative journal state reconciles exactly.
-
-A crash or receipt-write failure after a forecast/placement mutation leaves a `*-pending` receipt. A rerun recovers the one existing provenance row and only repairs the receipt; it never attempts another forecast or placement. Terminal `forecast-rejected`, `placement-rejected`, and `error` receipts do not automatically retry. A guarded PAPER placement rejection retains its recorded forecast but creates no ledger row and is terminal until a new research cycle or future explicit reconciliation.
-
-### Forecast and placement boundaries
-
-Every valid staged intent calls existing `record_candidate_forecast()` through the guardian. The bridge does not call `core.forecast` directly and does not duplicate forecast semantics or policy. `source_intent_id` remains the protected replay guard.
-
-Only exact `forecast_disposition == "bet"` can then call existing `record_candidate_paper_placement()` through the guardian. Any non-bet disposition records the forecast, persists `completed-no-placement`, and stops before inspecting placement policy or calling placement. `bet` invokes no new risk logic: the existing protected Patch 4 stake, edge, spread, timing, event, exposure, cycle, cash, token, and real-eligibility controls remain authoritative. A rejection persists `placement-rejected` with zero manufactured ledger row.
-
-Patch 5B is manual and assumes one writer. The legacy runner must not mutate forecast/ledger journals concurrently, and two simultaneous `paper_apply` processes are unsupported. It adds no scheduler, service, loop, task, Git automation, Manus API behavior, Credential Manager use, broker, real execution, Pearl, or IBKR route. The only possible position mutation is the existing guarded simulated PAPER ledger function.
