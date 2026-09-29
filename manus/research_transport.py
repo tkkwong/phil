@@ -1,11 +1,10 @@
 """Bounded, research-only transport for one Manus PAPER intent.
 
 This module reconstructs a trusted fixture packet, sends exactly one selected
-candidate as quoted data to a standalone Manus API v2 task, locally assembles
-the authority-bearing intent fields, validates the result through the existing
-fixture-bound guardian, and stages only a validated intent outside the
-repository. It never records a forecast or placement and exposes no output
-path, endpoint, connector, or action controls.
+candidate as quoted data to a standalone Manus API v2 task, validates the
+returned intent with the existing fixture-bound guardian, and stages only a
+validated result outside the repository. It never records a forecast or
+placement and exposes no output-path, endpoint, connector, or action controls.
 """
 
 from __future__ import annotations
@@ -18,14 +17,12 @@ import hashlib
 import json
 import os
 import pathlib
-import re
 import shutil
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from typing import Any, Callable
 
 from manus.paper_cycle_guardian import (
@@ -45,72 +42,32 @@ TASK_DETAIL_ENDPOINT = f"{API_BASE}/task.detail"
 TASK_STOP_ENDPOINT = f"{API_BASE}/task.stop"
 API_VERSION = "v2"
 AGENT_PROFILE = "standard"
-TRANSPORT_REQUEST_SCHEMA_VERSION = "research-transport-v5a2"
 POLL_INTERVAL_SECONDS = 3
 POLL_DEADLINE_SECONDS = 15 * 60
-READ_RETRY_ATTEMPTS = 3
-READ_RETRY_BACKOFF_SECONDS = 1
 CREDENTIAL_TARGET = "phil-manus-api"
 CREDENTIAL_USERNAME = "MANUS_API_KEY"
 _STAGING_CHILDREN = ("phil-manus", "staging")
-_SAFE_REMOTE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# These are research judgments, not local execution, category, event, or risk
-# guards. The existing full intent validator remains the final label validator.
-_RESEARCH_DISPOSITIONS = (
-    "bet",
-    "no-edge",
-    "market-agrees",
-    "ambiguous-resolution",
-    "architecture-mismatch",
-    "outside-view-veto",
-    "unvalidated-method",
-)
-_RESEARCH_FIELDS = frozenset(
+# Existing Phil records document these non-execution research classifications.
+# Patch 5A keeps this explicit transport-level allowlist rather than changing
+# the existing guardian's broader label contract.
+_DOCUMENTED_DISPOSITIONS = frozenset(
     {
-        "outcome",
-        "estimated_probability",
-        "category",
-        "rationale",
-        "edge_class",
-        "forecast_disposition",
+        "already-positioned",
+        "ambiguous-resolution",
+        "architecture-mismatch",
+        "bet",
+        "category-bar",
+        "market-agrees",
+        "no-edge",
+        "one-per-event",
+        "operator-smoke-test",
+        "outside-view-veto",
+        "process-shape-bar",
+        "unvalidated-method",
+        "wide-spread-veto",
     }
 )
-_RESERVATION_FIELDS = frozenset(
-    {
-        "task_id",
-        "packet_id",
-        "candidate_id",
-        "market_id",
-        "fixture_sha256",
-        "request_sha256",
-        "transport_schema_version",
-        "created_at",
-        "state",
-    }
-)
-_RESERVATION_STATES = frozenset(
-    {
-        "reserved",
-        "ambiguous-create",
-        "created",
-        "polling",
-        "waiting",
-        "timeout",
-        "unknown",
-        "task-error",
-        "rejected-local-validation",
-        "completed",
-    }
-)
-_TERMINAL_RESERVATION_STATES = frozenset(
-    {"task-error", "rejected-local-validation", "completed"}
-)
-# Compatibility aliases are intentionally private. They keep existing callers
-# from treating a reservation as a new public transport control surface.
-_RECEIPT_FIELDS = _RESERVATION_FIELDS
 _FORBIDDEN_OPTION_TERMS = frozenset(
     {
         "output",
@@ -162,76 +119,29 @@ class ResearchTransportError(RuntimeError):
     """Raised for a fail-closed research transport rejection."""
 
 
-class _ApiRequestError(ResearchTransportError):
-    """A safely diagnosable API failure with no raw response text."""
-
-    def __init__(
-        self,
-        phase: str,
-        *,
-        status: int | None = None,
-        request_id: str | None = None,
-        error_code: str | None = None,
-    ) -> None:
-        self.phase = phase
-        self.status = status
-        self.request_id = request_id
-        self.error_code = error_code
-        details = [f"phase={phase}"]
-        if status is not None:
-            details.append(f"status={status}")
-        if request_id is not None:
-            details.append(f"request_id={request_id}")
-        if error_code is not None:
-            details.append(f"error_code={error_code}")
-        super().__init__("Manus API request failed " + " ".join(details))
-
-    @property
-    def transient(self) -> bool:
-        return self.status is None or self.status == 408 or self.status == 429 or self.status >= 500
-
-
-class _PollTerminalError(ResearchTransportError):
-    """A safe terminal task state that must retain its known receipt."""
-
-    def __init__(self, phase: str, receipt_state: str) -> None:
-        self.phase = phase
-        self.receipt_state = receipt_state
-        super().__init__(f"Manus task terminal state phase={phase} state={receipt_state}")
-
-
-def _research_schema(candidate: dict[str, Any]) -> dict[str, Any]:
-    """Return the supported v2 extraction schema for research judgments only."""
-    outcomes = candidate.get("outcomes")
-    if not isinstance(outcomes, list) or not outcomes or not all(isinstance(item, str) for item in outcomes):
-        raise ResearchTransportError("Trusted candidate outcomes are unavailable")
+def _transport_schema() -> dict[str, Any]:
+    """Return the supported v2 extraction shape; local validation is stricter."""
+    proposal = {
+        "type": "object",
+        "properties": {
+            "proposal_id": {"type": "string"},
+            "summary": {"type": "string"},
+        },
+        "required": ["proposal_id", "summary"],
+        "additionalProperties": False,
+    }
     fields = {
-        "outcome": {
-            "type": "string",
-            "enum": outcomes,
-            "description": "One exact outcome label from the selected trusted candidate.",
-        },
-        "estimated_probability": {
-            "type": "number",
-            "description": "Independent probability for the exact selected outcome, strictly between zero and one.",
-        },
-        "category": {
-            "type": "string",
-            "description": "A lowercase Phil category label such as crypto-threshold; never prose or title case.",
-        },
-        "rationale": {
-            "type": "string",
-            "description": "Concise public-web research rationale and material uncertainty; data only, not an action request.",
-        },
-        "edge_class": {
-            "type": "string",
-            "description": "A lowercase Phil edge-class label; never prose or title case.",
-        },
-        "forecast_disposition": {
-            "type": "string",
-            "enum": list(_RESEARCH_DISPOSITIONS),
-            "description": "Research disposition only; it grants no execution authority.",
-        },
+        "intent_id": {"type": "string"},
+        "candidate_id": {"type": "string"},
+        "market_id": {"type": "string"},
+        "outcome": {"type": "string"},
+        "estimated_probability": {"type": "number"},
+        "category": {"type": "string"},
+        "rationale": {"type": "string"},
+        "edge_class": {"type": "string"},
+        "mode": {"type": "string"},
+        "forecast_disposition": {"type": "string"},
+        "strategy_proposals": {"type": "array", "items": proposal},
     }
     return {
         "type": "object",
@@ -245,7 +155,7 @@ def _fixed_research_instructions() -> str:
     """Load the operator-owned fixed instruction document bundled with this module."""
     try:
         text = pathlib.Path(__file__).with_name("MANUS_PAPER_CYCLE.md").read_text(encoding="utf-8")
-    except OSError:
+    except OSError as exc:
         raise ResearchTransportError("Protected research instructions are unavailable") from None
     if not text.strip():
         raise ResearchTransportError("Protected research instructions are unavailable")
@@ -304,7 +214,7 @@ def build_task_request(packet_id: str, candidate: dict[str, Any]) -> dict[str, A
         "share_visibility": "private",
         "hide_in_task_list": True,
         "agent_profile": AGENT_PROFILE,
-        "structured_output_schema": _research_schema(candidate),
+        "structured_output_schema": _transport_schema(),
     }
 
 
@@ -371,37 +281,16 @@ def _read_windows_api_key(
         raise ResearchTransportError("Manus API credential is unavailable") from None
 
 
-def _safe_server_identifier(value: Any) -> str | None:
-    if isinstance(value, str) and _SAFE_REMOTE_IDENTIFIER_RE.fullmatch(value):
-        return value
-    return None
-
-
-def _safe_error_details(raw: bytes) -> tuple[str | None, str | None]:
-    """Extract only bounded request and code identifiers from an API error envelope."""
-    try:
-        document = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, None
-    if not isinstance(document, dict):
-        return None, None
-    request_id = _safe_server_identifier(document.get("request_id"))
-    error = document.get("error")
-    error_code = _safe_server_identifier(error.get("code")) if isinstance(error, dict) else None
-    return request_id, error_code
-
-
 def _request_json(
     endpoint: str,
     api_key: str,
     *,
-    phase: str,
     method: str = "GET",
     payload: dict[str, Any] | None = None,
     query: dict[str, Any] | None = None,
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> dict[str, Any]:
-    """Issue one bounded HTTPS request without leaking raw server content."""
+    """Issue one bounded HTTPS request without including server text in errors."""
     if query:
         endpoint = f"{endpoint}?{urllib.parse.urlencode(query)}"
     body = None
@@ -414,100 +303,49 @@ def _request_json(
         with opener(request, timeout=30) as response:
             status = response.getcode()
             raw = response.read()
-    except urllib.error.HTTPError as exc:
-        try:
-            raw = exc.read()
-        except OSError:
-            raw = b""
-        request_id, error_code = _safe_error_details(raw)
-        raise _ApiRequestError(
-            phase,
-            status=exc.code,
-            request_id=request_id,
-            error_code=error_code,
-        ) from None
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise _ApiRequestError(phase) from None
-    if not isinstance(status, int) or not 200 <= status < 300:
-        request_id, error_code = _safe_error_details(raw)
-        raise _ApiRequestError(phase, status=status if isinstance(status, int) else None, request_id=request_id, error_code=error_code)
+        raise ResearchTransportError("Manus API request failed") from None
+    if not 200 <= status < 300:
+        raise ResearchTransportError("Manus API request failed")
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise _ApiRequestError(phase, status=status) from None
+        raise ResearchTransportError("Manus API returned an invalid response") from None
     if not isinstance(value, dict):
-        raise _ApiRequestError(phase, status=status)
+        raise ResearchTransportError("Manus API returned an invalid response")
     if value.get("ok") is not True:
-        request_id = _safe_server_identifier(value.get("request_id"))
-        error = value.get("error")
-        error_code = _safe_server_identifier(error.get("code")) if isinstance(error, dict) else None
-        raise _ApiRequestError(phase, status=status, request_id=request_id, error_code=error_code)
+        raise ResearchTransportError("Manus API rejected the request")
     return value
-
-
-def _read_with_retry(
-    endpoint: str,
-    api_key: str,
-    *,
-    phase: str,
-    query: dict[str, Any],
-    opener: Callable[..., Any],
-    sleep: Callable[[float], None],
-    monotonic: Callable[[], float],
-    deadline: float,
-) -> dict[str, Any]:
-    """Retry only transient, read-only polling calls within the fixed deadline."""
-    for attempt in range(READ_RETRY_ATTEMPTS):
-        try:
-            return _request_json(endpoint, api_key, phase=phase, query=query, opener=opener)
-        except _ApiRequestError as exc:
-            if not exc.transient or attempt + 1 >= READ_RETRY_ATTEMPTS:
-                raise
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise
-            delay = min(READ_RETRY_BACKOFF_SECONDS * (2**attempt), remaining)
-            sleep(delay)
-    raise AssertionError("unreachable read retry exhaustion")
 
 
 def _stop_once(task_id: str, api_key: str, opener: Callable[..., Any]) -> None:
     """Best-effort cleanup only for an already-known task; never raises."""
     try:
-        _request_json(
-            TASK_STOP_ENDPOINT,
-            api_key,
-            phase="task.stop",
-            method="POST",
-            payload={"task_id": task_id},
-            opener=opener,
-        )
-    except _ApiRequestError:
+        _request_json(TASK_STOP_ENDPOINT, api_key, method="POST", payload={"task_id": task_id}, opener=opener)
+    except ResearchTransportError:
         pass
 
 
 def _latest_status(messages: list[Any]) -> str | None:
-    """Return the latest status from an ascending task-event response."""
-    status: str | None = None
+    """Return the newest status from a descending task-event response."""
     for event in messages:
         if not isinstance(event, dict) or event.get("type") != "status_update":
             continue
         update = event.get("status_update")
         if isinstance(update, dict) and isinstance(update.get("agent_status"), str):
-            status = update["agent_status"]
-    return status
+            return update["agent_status"]
+    return None
 
 
 def _structured_result(messages: list[Any]) -> dict[str, Any] | None:
-    """Return the latest structured extraction event from an ascending response."""
-    result: dict[str, Any] | None = None
+    """Return the newest extracted result from a descending task-event response."""
     for event in messages:
         if not isinstance(event, dict) or event.get("type") != "structured_output_result":
             continue
         candidate = event.get("structured_output_result")
         if isinstance(candidate, dict):
-            result = candidate
-    return result
+            return candidate
+    return None
 
 
 def _poll_for_result(
@@ -518,64 +356,58 @@ def _poll_for_result(
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
 ) -> dict[str, Any]:
-    """Poll a receipted task only; GET retries never create another task."""
+    """Poll only known task endpoints until a conservative terminal result exists."""
     deadline = monotonic() + POLL_DEADLINE_SECONDS
     while True:
-        messages_response = _read_with_retry(
+        messages_response = _request_json(
             TASK_MESSAGES_ENDPOINT,
             api_key,
-            phase="task.listMessages",
-            query={"task_id": task_id, "order": "asc", "limit": 200},
+            query={"task_id": task_id, "order": "desc", "limit": 200},
             opener=opener,
-            sleep=sleep,
-            monotonic=monotonic,
-            deadline=deadline,
         )
         messages = messages_response.get("messages")
         if not isinstance(messages, list):
-            raise _PollTerminalError("task.listMessages", "unknown")
+            raise ResearchTransportError("Manus task messages are invalid")
         message_status = _latest_status(messages)
         if message_status == "waiting":
             _stop_once(task_id, api_key, opener)
-            raise _PollTerminalError("task.listMessages", "waiting")
+            raise ResearchTransportError("Manus task requested input or an action")
         if message_status == "error":
-            raise _PollTerminalError("task.listMessages", "task-error")
+            raise ResearchTransportError("Manus task failed")
 
-        detail_response = _read_with_retry(
+        detail_response = _request_json(
             TASK_DETAIL_ENDPOINT,
             api_key,
-            phase="task.detail",
             query={"task_id": task_id},
             opener=opener,
-            sleep=sleep,
-            monotonic=monotonic,
-            deadline=deadline,
         )
         task = detail_response.get("task")
         if not isinstance(task, dict):
-            raise _PollTerminalError("task.detail", "unknown")
+            raise ResearchTransportError("Manus task details are invalid")
         task_status = task.get("status")
         if task_status == "waiting":
             _stop_once(task_id, api_key, opener)
-            raise _PollTerminalError("task.detail", "waiting")
+            raise ResearchTransportError("Manus task requested input or an action")
         if task_status == "error":
-            raise _PollTerminalError("task.detail", "task-error")
+            raise ResearchTransportError("Manus task failed")
         if task_status == "stopped":
             if task.get("has_running_background_jobs") is False:
                 result = _structured_result(messages)
-                if result is None or result.get("success") is not True:
-                    raise _PollTerminalError("structured-output", "task-error")
+                if result is None:
+                    raise ResearchTransportError("Manus task stopped without structured output")
+                if result.get("success") is not True:
+                    raise ResearchTransportError("Manus structured output extraction failed")
                 value = result.get("value")
                 if not isinstance(value, dict):
-                    raise _PollTerminalError("structured-output", "task-error")
+                    raise ResearchTransportError("Manus structured output is invalid")
                 return value
         elif task_status != "running":
-            raise _PollTerminalError("task.detail", "unknown")
+            raise ResearchTransportError("Manus task entered an unsupported state")
 
         remaining = deadline - monotonic()
         if remaining <= 0:
             _stop_once(task_id, api_key, opener)
-            raise _PollTerminalError("task.detail", "timeout")
+            raise ResearchTransportError("Manus task did not complete before the protected deadline")
         sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
 
@@ -605,207 +437,6 @@ def _atomic_json_file(directory: pathlib.Path, filename: str, document: str) -> 
         raise
 
 
-def _safe_path_component(identifier: str) -> str:
-    if _SAFE_PATH_COMPONENT_RE.fullmatch(identifier):
-        return identifier
-    return hashlib.sha256(identifier.encode("utf-8")).hexdigest()
-
-
-def _request_sha256(task_request: dict[str, Any]) -> str:
-    """Hash the exact credential-free task.create payload canonically."""
-    return hashlib.sha256(_canonical_json(task_request).encode("utf-8")).hexdigest()
-
-
-def _reservation_path(
-    staging_root: pathlib.Path,
-    *,
-    packet_id: str,
-    candidate_id: str,
-    market_id: str,
-    fixture_sha256: str,
-) -> pathlib.Path:
-    """Return the fixed candidate-bound reservation path outside the repository.
-
-    The filename deliberately excludes the request fingerprint. This makes a
-    changed prompt, schema, or request policy collide with the prior
-    reservation so the transport can reject drift instead of creating a second
-    paid task under a different request contract.
-    """
-    identity = {
-        "candidate_id": candidate_id,
-        "fixture_sha256": fixture_sha256,
-        "market_id": market_id,
-        "packet_id": packet_id,
-    }
-    key = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
-    return staging_root / "pending" / f"{key}.json"
-
-
-def _ensure_reservation_directory(path: pathlib.Path) -> None:
-    directory = path.parent
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        if not directory.is_dir() or directory.is_symlink():
-            raise OSError("invalid reservation directory")
-    except OSError:
-        raise ResearchTransportError("Pre-create reservation staging is unavailable") from None
-
-
-def _validate_reservation(
-    reservation: dict[str, Any],
-    *,
-    packet_id: str,
-    candidate_id: str,
-    market_id: str,
-    fixture_sha256: str,
-    request_sha256: str,
-) -> dict[str, Any]:
-    if set(reservation) != _RESERVATION_FIELDS:
-        raise ResearchTransportError("Pre-create reservation is malformed")
-    if (
-        reservation.get("packet_id") != packet_id
-        or reservation.get("candidate_id") != candidate_id
-        or reservation.get("market_id") != market_id
-        or reservation.get("fixture_sha256") != fixture_sha256
-    ):
-        raise ResearchTransportError("Pre-create reservation does not match the trusted fixture and candidate")
-    if reservation.get("transport_schema_version") != TRANSPORT_REQUEST_SCHEMA_VERSION:
-        raise ResearchTransportError("Pre-create reservation version drift requires operator reconciliation")
-    if reservation.get("request_sha256") != request_sha256:
-        raise ResearchTransportError("Pre-create reservation request drift requires operator reconciliation")
-    task_id = reservation.get("task_id")
-    created_at = reservation.get("created_at")
-    state = reservation.get("state")
-    if task_id is not None and not _safe_server_identifier(task_id):
-        raise ResearchTransportError("Pre-create reservation is malformed")
-    if (
-        not isinstance(created_at, str)
-        or not created_at
-        or not _SHA256_RE.fullmatch(fixture_sha256)
-        or not _SHA256_RE.fullmatch(request_sha256)
-        or state not in _RESERVATION_STATES
-    ):
-        raise ResearchTransportError("Pre-create reservation is malformed")
-    if state in {"created", "polling", "waiting", "timeout", "unknown", "task-error", "rejected-local-validation", "completed"} and task_id is None:
-        raise ResearchTransportError("Pre-create reservation is malformed")
-    return reservation
-
-
-def _read_reservation(
-    path: pathlib.Path,
-    *,
-    packet_id: str,
-    candidate_id: str,
-    market_id: str,
-    fixture_sha256: str,
-    request_sha256: str,
-) -> dict[str, Any] | None:
-    if not path.exists() and not path.is_symlink():
-        return None
-    if path.is_symlink():
-        raise ResearchTransportError("Pre-create reservation is unavailable")
-    try:
-        document = _parse_json_document(path.read_text(encoding="utf-8"), "pre-create reservation")
-    except (OSError, UnicodeDecodeError, GuardianValidationError):
-        raise ResearchTransportError("Pre-create reservation is malformed") from None
-    if not isinstance(document, dict):
-        raise ResearchTransportError("Pre-create reservation is malformed")
-    return _validate_reservation(
-        document,
-        packet_id=packet_id,
-        candidate_id=candidate_id,
-        market_id=market_id,
-        fixture_sha256=fixture_sha256,
-        request_sha256=request_sha256,
-    )
-
-
-def _write_reservation(path: pathlib.Path, reservation: dict[str, Any]) -> None:
-    _ensure_reservation_directory(path)
-    try:
-        _atomic_json_file(path.parent, path.name, _canonical_json(reservation))
-    except (OSError, ValueError):
-        raise ResearchTransportError("Pre-create reservation staging is unavailable") from None
-
-
-def _set_reservation_state(path: pathlib.Path, reservation: dict[str, Any], state: str) -> dict[str, Any]:
-    if state not in _RESERVATION_STATES:
-        raise ValueError("unsupported reservation state")
-    updated = {**reservation, "state": state}
-    _write_reservation(path, updated)
-    return updated
-
-
-def _new_reservation(
-    *,
-    packet_id: str,
-    candidate_id: str,
-    market_id: str,
-    fixture_sha256: str,
-    request_sha256: str,
-    now: Callable[[], dt.datetime],
-) -> dict[str, Any]:
-    return {
-        "task_id": None,
-        "packet_id": packet_id,
-        "candidate_id": candidate_id,
-        "market_id": market_id,
-        "fixture_sha256": fixture_sha256,
-        "request_sha256": request_sha256,
-        "transport_schema_version": TRANSPORT_REQUEST_SCHEMA_VERSION,
-        "created_at": _utc_timestamp(now),
-        "state": "reserved",
-    }
-
-
-def _record_created_task(path: pathlib.Path, reservation: dict[str, Any], task_id: Any) -> dict[str, Any]:
-    """Durably bind a returned task ID before a single poll can occur."""
-    if not _safe_server_identifier(task_id):
-        raise ResearchTransportError("Manus task creation response is invalid")
-    if reservation.get("state") != "reserved" or reservation.get("task_id") is not None:
-        raise ResearchTransportError("Pre-create reservation requires operator reconciliation")
-    updated = {**reservation, "task_id": task_id, "state": "created"}
-    _write_reservation(path, updated)
-    return updated
-
-
-def _validate_research_result_shape(result: dict[str, Any]) -> dict[str, Any]:
-    if set(result) != _RESEARCH_FIELDS:
-        raise ResearchTransportError("Manus output failed local processing phase=structured-output")
-    return result
-
-
-def _assemble_trusted_intent(
-    *,
-    fixture: dict[str, Any],
-    candidate: dict[str, Any],
-    research_result: dict[str, Any],
-    new_uuid: Callable[[], uuid.UUID],
-) -> dict[str, Any]:
-    """Combine trusted authority fields with untouched agent research judgments."""
-    research = _validate_research_result_shape(research_result)
-    if research["outcome"] not in candidate["outcomes"]:
-        raise ResearchTransportError("Manus output failed local processing phase=structured-output")
-    if research["forecast_disposition"] not in _RESEARCH_DISPOSITIONS:
-        raise ResearchTransportError("Manus output failed local processing phase=structured-output")
-    generated_id = new_uuid()
-    if not isinstance(generated_id, uuid.UUID) or generated_id.version != 4:
-        raise ResearchTransportError("Local UUIDv4 generation failed")
-    intent = {
-        "intent_id": str(generated_id),
-        "candidate_id": candidate["candidate_id"],
-        "market_id": candidate["market_id"],
-        "mode": "PAPER",
-        "strategy_proposals": [],
-        **research,
-    }
-    try:
-        validated = validate_candidate_intent(fixture, _canonical_json(intent))
-    except (GuardianValidationError, TypeError, ValueError):
-        raise ResearchTransportError("Manus output failed local validation phase=local-validation") from None
-    return validated["intent"]
-
-
 def _stage_validated_intent(
     *,
     staging_root: pathlib.Path,
@@ -813,7 +444,6 @@ def _stage_validated_intent(
     intent: dict[str, Any],
     task_id: str,
     fixture_sha256: str,
-    request_sha256: str,
     now: Callable[[], dt.datetime],
 ) -> pathlib.Path:
     """Atomically publish a complete validated intent directory or nothing at all."""
@@ -840,8 +470,6 @@ def _stage_validated_intent(
         "candidate_id": intent["candidate_id"],
         "intent_id": intent_id,
         "fixture_sha256": fixture_sha256,
-        "request_sha256": request_sha256,
-        "transport_schema_version": TRANSPORT_REQUEST_SCHEMA_VERSION,
         "created_at": _utc_timestamp(now),
         "completion_timestamp": _utc_timestamp(now),
         "agent_profile": AGENT_PROFILE,
@@ -863,72 +491,13 @@ def _stage_validated_intent(
     return final_directory
 
 
-def _recover_durable_staging(
-    *,
-    staging_root: pathlib.Path,
-    packet_id: str,
-    fixture: dict[str, Any],
-    receipt: dict[str, Any],
-) -> tuple[pathlib.Path, dict[str, Any]] | None:
-    """Find one locally validated completed staging entry for a pending receipt.
-
-    This handles only the narrow crash window after durable intent-directory
-    publication and before durable receipt finalization. It never trusts raw
-    Manus output: both the local metadata and the staged intent must match the
-    receipt and pass the existing fixture-bound validator.
-    """
-    packet_directory = staging_root / _safe_path_component(packet_id)
-    if not packet_directory.exists():
-        return None
-    if not packet_directory.is_dir() or packet_directory.is_symlink():
-        raise ResearchTransportError("Validated intent staging is unavailable")
-    matches: list[tuple[pathlib.Path, dict[str, Any]]] = []
-    try:
-        entries = list(packet_directory.iterdir())
-    except OSError:
-        raise ResearchTransportError("Validated intent staging is unavailable") from None
-    for directory in entries:
-        if not directory.is_dir() or directory.is_symlink() or directory.name.startswith("."):
-            continue
-        metadata_path = directory / "run-meta.json"
-        intent_path = directory / "validated-intent.json"
-        if not metadata_path.is_file() or metadata_path.is_symlink() or not intent_path.is_file() or intent_path.is_symlink():
-            continue
-        try:
-            metadata = _parse_json_document(metadata_path.read_text(encoding="utf-8"), "run metadata")
-            intent_document = intent_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError, GuardianValidationError):
-            raise ResearchTransportError("Validated intent staging is unavailable") from None
-        if not isinstance(metadata, dict):
-            raise ResearchTransportError("Validated intent staging is unavailable")
-        if (
-            metadata.get("task_id") != receipt["task_id"]
-            or metadata.get("packet_id") != receipt["packet_id"]
-            or metadata.get("candidate_id") != receipt["candidate_id"]
-            or metadata.get("fixture_sha256") != receipt["fixture_sha256"]
-            or metadata.get("request_sha256") != receipt["request_sha256"]
-            or metadata.get("transport_schema_version") != receipt["transport_schema_version"]
-        ):
-            continue
-        try:
-            validated = validate_candidate_intent(fixture, intent_document)["intent"]
-        except (GuardianValidationError, TypeError, ValueError):
-            raise ResearchTransportError("Validated intent staging is unavailable") from None
-        if validated["intent_id"] != metadata.get("intent_id"):
-            raise ResearchTransportError("Validated intent staging is unavailable")
-        matches.append((directory, validated))
-    if len(matches) > 1:
-        raise ResearchTransportError("Duplicate validated intent staging for pending receipt")
-    return matches[0] if matches else None
-
-
-def _prepare_run(fixture_path: str, candidate_id: str) -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any]]:
+def _prepare_run(fixture_path: str, candidate_id: str) -> tuple[dict[str, Any], dict[str, Any], str]:
     fixture, fixture_sha256 = _load_fixture(fixture_path)
     try:
         packet = prepare_packet(fixture)
     except GuardianValidationError:
         raise ResearchTransportError("Trusted fixture is unavailable or invalid") from None
-    return fixture, _select_candidate(packet, candidate_id), fixture_sha256, packet
+    return fixture, _select_candidate(packet, candidate_id), fixture_sha256
 
 
 def _safe_summary(packet_id: str, candidate: dict[str, Any], staging_root: pathlib.Path) -> dict[str, Any]:
@@ -948,20 +517,6 @@ def _safe_summary(packet_id: str, candidate: dict[str, Any], staging_root: pathl
     }
 
 
-def _poll_diagnostic(
-    error: _ApiRequestError | _PollTerminalError,
-    task_id: str,
-    reservation_key: str,
-) -> ResearchTransportError:
-    if isinstance(error, _ApiRequestError):
-        return ResearchTransportError(
-            f"Manus polling failed {error}; task_id={task_id}; reservation_key={reservation_key}; reservation retained"
-        )
-    return ResearchTransportError(
-        f"Manus polling failed phase={error.phase}; task_id={task_id}; reservation_key={reservation_key}; reservation retained"
-    )
-
-
 def run(
     fixture_path: str,
     candidate_id: str,
@@ -973,63 +528,17 @@ def run(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
-    new_uuid: Callable[[], uuid.UUID] = uuid.uuid4,
 ) -> dict[str, Any]:
     """Perform one bounded research-only run, or return a dry-run audit summary."""
-    fixture, candidate, fixture_sha256, packet = _prepare_run(fixture_path, candidate_id)
+    fixture, candidate, fixture_sha256 = _prepare_run(fixture_path, candidate_id)
+    try:
+        packet = prepare_packet(fixture)
+    except GuardianValidationError:
+        raise ResearchTransportError("Trusted fixture is unavailable or invalid") from None
     staging_root = staging_root_factory()
     summary = _safe_summary(packet["packet_id"], candidate, staging_root)
     if dry_run:
         return summary
-
-    task_request = build_task_request(packet["packet_id"], candidate)
-    request_sha256 = _request_sha256(task_request)
-    reservation_path = _reservation_path(
-        staging_root,
-        packet_id=packet["packet_id"],
-        candidate_id=candidate["candidate_id"],
-        market_id=candidate["market_id"],
-        fixture_sha256=fixture_sha256,
-    )
-    reservation_key = reservation_path.stem
-    reservation = _read_reservation(
-        reservation_path,
-        packet_id=packet["packet_id"],
-        candidate_id=candidate["candidate_id"],
-        market_id=candidate["market_id"],
-        fixture_sha256=fixture_sha256,
-        request_sha256=request_sha256,
-    )
-    if reservation is not None and reservation["state"] in _TERMINAL_RESERVATION_STATES:
-        raise ResearchTransportError(
-            f"Pre-create reservation terminal state={reservation['state']}; task_id={reservation['task_id']}; no new task created"
-        )
-    if reservation is not None and reservation["task_id"] is None:
-        raise ResearchTransportError(
-            f"Pre-create reservation state={reservation['state']}; reservation_key={reservation_key}; "
-            "task creation requires operator reconciliation; no new task created"
-        )
-    if reservation is not None:
-        recovered = _recover_durable_staging(
-            staging_root=staging_root,
-            packet_id=packet["packet_id"],
-            fixture=fixture,
-            receipt=reservation,
-        )
-        if recovered is not None:
-            final_directory, intent = recovered
-            try:
-                _set_reservation_state(reservation_path, reservation, "completed")
-            except ResearchTransportError:
-                raise ResearchTransportError(
-                    f"Manus reservation failed phase=staging; task_id={reservation['task_id']}; validated staging completed"
-                ) from None
-            return {
-                **summary,
-                "intent_id": intent["intent_id"],
-                "staging_path": str(final_directory),
-                "validated": True,
-            }
 
     try:
         api_key = credential_loader()
@@ -1038,130 +547,40 @@ def run(
     if not isinstance(api_key, str) or not api_key or not api_key.strip():
         raise ResearchTransportError("Manus API credential is unavailable")
 
-    if reservation is None:
-        reservation = _new_reservation(
-            packet_id=packet["packet_id"],
-            candidate_id=candidate["candidate_id"],
-            market_id=candidate["market_id"],
-            fixture_sha256=fixture_sha256,
-            request_sha256=request_sha256,
-            now=now,
-        )
-        try:
-            _write_reservation(reservation_path, reservation)
-        except ResearchTransportError:
-            raise ResearchTransportError(
-                "Pre-create reservation failed phase=reservation; task.create was not sent"
-            ) from None
-
-        # task.create is deliberately called once only. Any uncertain result is
-        # retained in the durable reservation and requires reconciliation.
-        try:
-            create_response = _request_json(
-                TASK_CREATE_ENDPOINT,
-                api_key,
-                phase="task.create",
-                method="POST",
-                payload=task_request,
-                opener=opener,
-            )
-        except _ApiRequestError as exc:
-            try:
-                _set_reservation_state(reservation_path, reservation, "ambiguous-create")
-            except ResearchTransportError:
-                pass
-            raise ResearchTransportError(
-                f"Manus task.create outcome is ambiguous {exc}; request_sha256={request_sha256}; "
-                f"reservation_key={reservation_key}; operator reconciliation required"
-            ) from None
-        task_id = create_response.get("task_id")
-        try:
-            reservation = _record_created_task(reservation_path, reservation, task_id)
-        except ResearchTransportError as exc:
-            safe_task_id = _safe_server_identifier(task_id)
-            if safe_task_id is None:
-                try:
-                    _set_reservation_state(reservation_path, reservation, "ambiguous-create")
-                except ResearchTransportError:
-                    pass
-                raise ResearchTransportError(
-                    f"Manus task.create response requires operator reconciliation; request_sha256={request_sha256}; "
-                    f"reservation_key={reservation_key}"
-                ) from exc
-            raise ResearchTransportError(
-                f"Manus reservation update failed phase=reservation; task_id={safe_task_id}; "
-                f"reservation_key={reservation_key}; do not poll; operator reconciliation required"
-            ) from None
-
-    task_id = reservation["task_id"]
-    if not isinstance(task_id, str):
-        raise ResearchTransportError("Pre-create reservation requires operator reconciliation")
+    # task.create is deliberately called once only: ambiguous failure must be
+    # reconciled by the operator rather than converted into a duplicate task.
+    create_response = _request_json(
+        TASK_CREATE_ENDPOINT,
+        api_key,
+        method="POST",
+        payload=build_task_request(packet["packet_id"], candidate),
+        opener=opener,
+    )
+    task_id = create_response.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise ResearchTransportError("Manus task creation response is invalid")
+    value = _poll_for_result(task_id, api_key, opener=opener, sleep=sleep, monotonic=monotonic)
     try:
-        reservation = _set_reservation_state(reservation_path, reservation, "polling")
-    except ResearchTransportError:
-        raise ResearchTransportError(
-            f"Manus reservation update failed phase=reservation; task_id={task_id}; "
-            f"reservation_key={reservation_key}; do not poll; operator reconciliation required"
-        ) from None
+        intent_document = _canonical_json(value)
+        validated = validate_candidate_intent(fixture, intent_document)
+    except (GuardianValidationError, TypeError, ValueError):
+        raise ResearchTransportError("Manus output failed local fixture-bound validation") from None
+    intent = validated["intent"]
+    if intent["candidate_id"] != candidate_id:
+        raise ResearchTransportError("Manus output selected a different candidate")
+    if intent["strategy_proposals"] != []:
+        raise ResearchTransportError("Patch 5A requires empty strategy_proposals")
+    if intent["forecast_disposition"] not in _DOCUMENTED_DISPOSITIONS:
+        raise ResearchTransportError("Manus output has an undocumented forecast disposition")
 
-    try:
-        research_result = _poll_for_result(
-            task_id,
-            api_key,
-            opener=opener,
-            sleep=sleep,
-            monotonic=monotonic,
-        )
-    except _PollTerminalError as exc:
-        try:
-            _set_reservation_state(reservation_path, reservation, exc.receipt_state)
-        except ResearchTransportError:
-            raise ResearchTransportError(
-                f"Manus reservation failed phase=reservation; task_id={task_id}; reservation retained"
-            ) from None
-        raise _poll_diagnostic(exc, task_id, reservation_key) from None
-    except _ApiRequestError as exc:
-        raise _poll_diagnostic(exc, task_id, reservation_key) from None
-
-    try:
-        intent = _assemble_trusted_intent(
-            fixture=fixture,
-            candidate=candidate,
-            research_result=research_result,
-            new_uuid=new_uuid,
-        )
-    except ResearchTransportError as exc:
-        try:
-            _set_reservation_state(reservation_path, reservation, "rejected-local-validation")
-        except ResearchTransportError:
-            raise ResearchTransportError(
-                f"Manus reservation failed phase=reservation; task_id={task_id}; reservation retained"
-            ) from None
-        raise ResearchTransportError(
-            f"{exc}; phase=local-validation; task_id={task_id}; reservation retained"
-        ) from exc
-
-    try:
-        final_directory = _stage_validated_intent(
-            staging_root=staging_root,
-            packet_id=packet["packet_id"],
-            intent=intent,
-            task_id=task_id,
-            fixture_sha256=fixture_sha256,
-            request_sha256=request_sha256,
-            now=now,
-        )
-    except ResearchTransportError as exc:
-        raise ResearchTransportError(
-            f"Manus staging failed phase=staging; task_id={task_id}; reservation retained"
-        ) from exc
-
-    try:
-        _set_reservation_state(reservation_path, reservation, "completed")
-    except ResearchTransportError:
-        raise ResearchTransportError(
-            f"Manus reservation failed phase=reservation; task_id={task_id}; validated staging completed"
-        ) from None
+    final_directory = _stage_validated_intent(
+        staging_root=staging_root,
+        packet_id=packet["packet_id"],
+        intent=intent,
+        task_id=task_id,
+        fixture_sha256=fixture_sha256,
+        now=now,
+    )
     return {
         **summary,
         "intent_id": intent["intent_id"],
