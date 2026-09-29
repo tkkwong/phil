@@ -50,11 +50,6 @@ POLL_INTERVAL_SECONDS = 3
 POLL_DEADLINE_SECONDS = 15 * 60
 READ_RETRY_ATTEMPTS = 3
 READ_RETRY_BACKOFF_SECONDS = 1
-# This is deliberately fixed rather than exposed as a CLI control. It applies
-# only to a known task's brief post-create eventual-consistency window.
-POST_CREATE_VISIBILITY_GRACE_SECONDS = 60
-POST_CREATE_VISIBILITY_MAX_RETRIES = 8
-POST_CREATE_VISIBILITY_BACKOFF_MAX_SECONDS = 5
 CREDENTIAL_TARGET = "phil-manus-api"
 CREDENTIAL_USERNAME = "MANUS_API_KEY"
 _STAGING_CHILDREN = ("phil-manus", "staging")
@@ -194,11 +189,6 @@ class _ApiRequestError(ResearchTransportError):
     @property
     def transient(self) -> bool:
         return self.status is None or self.status == 408 or self.status == 429 or self.status >= 500
-
-    @property
-    def post_create_not_found(self) -> bool:
-        """Return true only for the exact API visibility-race response."""
-        return self.status == 404 and self.error_code == "not_found"
 
 
 class _PollTerminalError(ResearchTransportError):
@@ -481,63 +471,6 @@ def _read_with_retry(
     raise AssertionError("unreachable read retry exhaustion")
 
 
-def _read_poll_endpoint(
-    endpoint: str,
-    api_key: str,
-    *,
-    phase: str,
-    query: dict[str, Any],
-    opener: Callable[..., Any],
-    sleep: Callable[[float], None],
-    monotonic: Callable[[], float],
-    deadline: float,
-    visibility_grace_deadline: float | None,
-    task_visible: bool,
-) -> tuple[dict[str, Any], bool]:
-    """Read one allowed polling endpoint with a narrowly bounded 404 grace.
-
-    Generic read retries remain in ``_read_with_retry``. This wrapper only
-    permits ``404 not_found`` for a known task before either endpoint has ever
-    returned data, while both the protected visibility grace and overall poll
-    deadline remain live. It never applies to task.create or other endpoints.
-    """
-    visibility_attempt = 0
-    while True:
-        try:
-            response = _read_with_retry(
-                endpoint,
-                api_key,
-                phase=phase,
-                query=query,
-                opener=opener,
-                sleep=sleep,
-                monotonic=monotonic,
-                deadline=deadline,
-            )
-            return response, True
-        except _ApiRequestError as exc:
-            now = monotonic()
-            if (
-                task_visible
-                or not exc.post_create_not_found
-                or visibility_grace_deadline is None
-                or now >= visibility_grace_deadline
-                or now >= deadline
-                or visibility_attempt >= POST_CREATE_VISIBILITY_MAX_RETRIES
-            ):
-                raise
-            remaining = min(visibility_grace_deadline, deadline) - now
-            if remaining <= 0:
-                raise
-            delay = min(
-                READ_RETRY_BACKOFF_SECONDS * (2**visibility_attempt),
-                POST_CREATE_VISIBILITY_BACKOFF_MAX_SECONDS,
-                remaining,
-            )
-            visibility_attempt += 1
-            sleep(delay)
-
-
 def _stop_once(task_id: str, api_key: str, opener: Callable[..., Any]) -> None:
     """Best-effort cleanup only for an already-known task; never raises."""
     try:
@@ -581,21 +514,14 @@ def _poll_for_result(
     task_id: str,
     api_key: str,
     *,
-    created_this_invocation: bool,
-    resolved_profile: str | None,
     opener: Callable[..., Any],
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
-) -> tuple[dict[str, Any], str | None]:
+) -> dict[str, Any]:
     """Poll a receipted task only; GET retries never create another task."""
-    started_at = monotonic()
-    deadline = started_at + POLL_DEADLINE_SECONDS
-    visibility_grace_deadline = (
-        started_at + POST_CREATE_VISIBILITY_GRACE_SECONDS if created_this_invocation else None
-    )
-    task_visible = False
+    deadline = monotonic() + POLL_DEADLINE_SECONDS
     while True:
-        messages_response, task_visible = _read_poll_endpoint(
+        messages_response = _read_with_retry(
             TASK_MESSAGES_ENDPOINT,
             api_key,
             phase="task.listMessages",
@@ -604,8 +530,6 @@ def _poll_for_result(
             sleep=sleep,
             monotonic=monotonic,
             deadline=deadline,
-            visibility_grace_deadline=visibility_grace_deadline,
-            task_visible=task_visible,
         )
         messages = messages_response.get("messages")
         if not isinstance(messages, list):
@@ -617,7 +541,7 @@ def _poll_for_result(
         if message_status == "error":
             raise _PollTerminalError("task.listMessages", "task-error")
 
-        detail_response, task_visible = _read_poll_endpoint(
+        detail_response = _read_with_retry(
             TASK_DETAIL_ENDPOINT,
             api_key,
             phase="task.detail",
@@ -626,15 +550,10 @@ def _poll_for_result(
             sleep=sleep,
             monotonic=monotonic,
             deadline=deadline,
-            visibility_grace_deadline=visibility_grace_deadline,
-            task_visible=task_visible,
         )
         task = detail_response.get("task")
         if not isinstance(task, dict):
             raise _PollTerminalError("task.detail", "unknown")
-        profile = task.get("agent_profile")
-        if isinstance(profile, str) and _safe_server_identifier(profile):
-            resolved_profile = profile
         task_status = task.get("status")
         if task_status == "waiting":
             _stop_once(task_id, api_key, opener)
@@ -649,7 +568,7 @@ def _poll_for_result(
                 value = result.get("value")
                 if not isinstance(value, dict):
                     raise _PollTerminalError("structured-output", "task-error")
-                return value, resolved_profile
+                return value
         elif task_status != "running":
             raise _PollTerminalError("task.detail", "unknown")
 
@@ -895,9 +814,6 @@ def _stage_validated_intent(
     task_id: str,
     fixture_sha256: str,
     request_sha256: str,
-    task_origin: str,
-    task_created_this_invocation: bool,
-    resolved_agent_profile: str | None,
     now: Callable[[], dt.datetime],
 ) -> pathlib.Path:
     """Atomically publish a complete validated intent directory or nothing at all."""
@@ -928,13 +844,7 @@ def _stage_validated_intent(
         "transport_schema_version": TRANSPORT_REQUEST_SCHEMA_VERSION,
         "created_at": _utc_timestamp(now),
         "completion_timestamp": _utc_timestamp(now),
-        # Backward-compatible alias: this is the requested profile, never an
-        # assertion about the service-resolved runtime profile.
         "agent_profile": AGENT_PROFILE,
-        "requested_agent_profile": AGENT_PROFILE,
-        "resolved_agent_profile": resolved_agent_profile,
-        "task_origin": task_origin,
-        "task_created_this_invocation": task_created_this_invocation,
         "validation_version": VALIDATION_VERSION,
     }
     try:
@@ -1028,29 +938,13 @@ def _safe_summary(packet_id: str, candidate: dict[str, Any], staging_root: pathl
         "market_id": candidate["market_id"],
         "question": candidate["question"],
         "mode": "PAPER",
-        "api_endpoint": "none",
+        "api_endpoint": "task.create",
         "connectors_count": 0,
         "project": "none",
         "task_references_count": 0,
         "share_visibility": "private",
         "structured_output": True,
         "staging_root": str(staging_root),
-    }
-
-
-def _task_audit_fields(task_id: str, task_origin: str, *, recovered_staging: bool = False) -> dict[str, Any]:
-    """Return truthful safe task facts for one live invocation's output."""
-    if task_origin not in {"created", "resumed"}:
-        raise ValueError("unsupported task origin")
-    return {
-        "task_id": task_id,
-        "task_origin": task_origin,
-        "task_created_this_invocation": task_origin == "created",
-        # Retained only as a truthful compatibility field. A resumed staged
-        # result makes no endpoint call in the present invocation.
-        "api_endpoint": (
-            "task.create" if task_origin == "created" else "none" if recovered_staging else "task.listMessages/task.detail"
-        ),
     }
 
 
@@ -1115,7 +1009,6 @@ def run(
             f"Pre-create reservation state={reservation['state']}; reservation_key={reservation_key}; "
             "task creation requires operator reconciliation; no new task created"
         )
-    task_origin = "resumed" if reservation is not None else "created"
     if reservation is not None:
         recovered = _recover_durable_staging(
             staging_root=staging_root,
@@ -1133,7 +1026,6 @@ def run(
                 ) from None
             return {
                 **summary,
-                **_task_audit_fields(reservation["task_id"], task_origin, recovered_staging=True),
                 "intent_id": intent["intent_id"],
                 "staging_path": str(final_directory),
                 "validated": True,
@@ -1213,11 +1105,9 @@ def run(
         ) from None
 
     try:
-        research_result, resolved_agent_profile = _poll_for_result(
+        research_result = _poll_for_result(
             task_id,
             api_key,
-            created_this_invocation=task_origin == "created",
-            resolved_profile=None,
             opener=opener,
             sleep=sleep,
             monotonic=monotonic,
@@ -1259,9 +1149,6 @@ def run(
             task_id=task_id,
             fixture_sha256=fixture_sha256,
             request_sha256=request_sha256,
-            task_origin=task_origin,
-            task_created_this_invocation=task_origin == "created",
-            resolved_agent_profile=resolved_agent_profile,
             now=now,
         )
     except ResearchTransportError as exc:
@@ -1277,7 +1164,6 @@ def run(
         ) from None
     return {
         **summary,
-        **_task_audit_fields(task_id, task_origin),
         "intent_id": intent["intent_id"],
         "staging_path": str(final_directory),
         "validated": True,
