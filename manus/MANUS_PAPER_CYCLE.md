@@ -55,3 +55,56 @@ Every valid disposition records a forecast. Only exact `forecast_disposition == 
 ## Fixed local concurrency boundary
 
 The workflow remains **manual**: this document does not create a scheduler, service, retry loop, unattended runner, or new authority. Local operator invocations use fixed OS-held locks outside the repository. The research transport serializes one exact request fingerprint before any credential lookup or `task.create`; an unresolved pre-create state fails closed rather than creating another task. `paper_apply` serializes one intent and the guarded Manus journal path, so a later local invocation reconciles the first result instead of duplicating a forecast or simulated PAPER placement. Legacy forecast/ledger writers remain outside that lock contract and must not run concurrently with the guarded manual workflow.
+
+
+## Patch 5D: bounded manual PAPER cycle runner
+
+`python -m manus.paper_runner` is a **manual, one-cycle** local orchestrator. It adds no scheduler, daemon, service, recurring loop, unattended runner, or new execution authority.
+
+```text
+cycle lock
+  -> protected core.scan.scan_candidates()
+  -> frozen trusted fixture
+  -> one deterministic eligible candidate at most
+  -> research_transport
+  -> fixed validated staging
+  -> paper_apply
+  -> STOP
+```
+
+The production CLI exposes only:
+
+```text
+python -m manus.paper_runner \
+  [--dry-run] \
+  [--manus-task-budget 0|1] \
+  [--manus-soft-credit-ceiling 1..100]
+```
+
+The task budget defaults to `0`. It is **current-invocation authorization only**:
+
+- budget `0` passes `allow_new_task=False` to `research_transport.run()`;
+- budget `1` passes `allow_new_task=True` and requires an advisory soft credit ceiling;
+- the ceiling is operator metadata, not a provider-enforced credit cap; and
+- no historical cycle, task, reservation, staging, or CLI metadata may authorize later task creation.
+
+If a fresh selected cycle has budget `0` and no resumable research state, the transport rejects new creation. The runner retains that exact selected candidate and frozen fixture in nonterminal `research-pending` state with a safe authorization-required reason. A later manual budget-`1` invocation resumes that same cycle and candidate; a later budget-`0` invocation still cannot create a new task. Known-task polling and validated staging recovery remain available through the existing transport at budget `0` because neither creates a new task.
+
+Persistent runner state is outside the checkout at `%LOCALAPPDATA%\phil-manus\runner\`:
+
+```text
+runner\
+  active-cycle.json
+  cycles\
+    <canonical-uuidv4>\
+      cycle.json
+      fixture.json
+```
+
+The active pointer accepts only a canonical cycle UUID and state identity; it never supplies a path. Cycle state, pointer, and fixture writes use a same-directory temporary file, flush, `fsync`, close, and `os.replace`. A fixture durably committed before its cycle state advances is adopted on recovery after SHA-256 and packet validation; it is never silently rescanned or replaced. A hash/state conflict fails closed.
+
+For non-dry invocations, `paper_runner` holds the fixed outer cycle lock before reading or mutating runner state, scanning, research, staging application, forecast recording, or PAPER placement. The required order is `cycle -> request` for research and `cycle -> application -> journal-writer` for application. A cycle-lock loser performs no scan, credential access, Manus action, runner-state write, application, forecast mutation, or ledger mutation. Dry-run is lock-free and write-free.
+
+The runner calls the protected scanner exactly as `scan_candidates(include_provider_metadata=True, max_candidates=20)`, then preserves the returned order and never ranks by probability, edge, confidence, profit, model output, question text, description text, `category`, tag label, or tag slug. It selects at most one candidate only when the scanner's bounded normalized `provider_metadata` envelope has `market_tags_status == "ok"`, contains at least one allowed numeric provider tag ID (`"1"`, `"21"`, or `"64"`), and contains none of the excluded numeric provider tag IDs (`"2"`, `"1597"`, `"101206"`, `"101252"`, `"104743"`, `"100265"`, `"126"`, `"100285"`, `"102305"`, `"104010"`, `"104039"`, or `"104608"`). Missing, unavailable, invalid, malformed, unknown-only, empty, or mixed allowed/excluded metadata is ineligible and yields `completed-no-candidate` if no later retained scanner record is eligible. The runner freezes the selected record's normalized provider evidence and canonical SHA-256 beside—not inside—the guardian fixture; a mismatch fails closed without rescan or replacement. This is an operational provider-metadata exclusion, not a prediction or political classification system.
+
+`paper_runner` has no direct credential API, Manus HTTP request, reservation parser, raw response parser, intent validator, forecast writer, ledger writer, market-data client, broker, IBKR, Pearl, or real-execution route. `research_transport` remains authoritative for request locking, credential handling, task lifecycle, and validated staging. `paper_apply` remains authoritative for application receipts, application/journal locks, guarded forecast recording, PAPER placement, and replay recovery. Legacy `loop.sh` and other legacy journal writers do not honor these locks and must not be run concurrently with `paper_runner`.

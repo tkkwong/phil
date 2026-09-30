@@ -326,3 +326,45 @@ Every valid staged intent calls existing `record_candidate_forecast()` through t
 Only exact `forecast_disposition == "bet"` can then call existing `record_candidate_paper_placement()` through the guardian. Any non-bet disposition records the forecast, persists `completed-no-placement`, and stops before inspecting placement policy or calling placement. `bet` invokes no new risk logic: the existing protected Patch 4 stake, edge, spread, timing, event, exposure, cycle, cash, token, and real-eligibility controls remain authoritative. A rejection persists `placement-rejected` with zero manufactured ledger row.
 
 Patch 5B remains manual. Patch 5C serializes simultaneous `paper_apply` processes for the same intent and their guarded Manus journal path, but it does **not** extend this locking contract to legacy forecast/ledger writers; the legacy runner must not mutate forecast/ledger journals concurrently. Patch 5C adds no scheduler, service, loop, task, Git automation, Manus API behavior, Credential Manager use, broker, real execution, Pearl, or IBKR route. The only possible position mutation remains the existing guarded simulated PAPER ledger function.
+
+
+## Patch 5D: bounded manual PAPER cycle runner
+
+`manus.paper_runner` composes existing protected seams for **one manual PAPER cycle**. It does not change `core.scan` filtering/query/pagination/order/deduplication, research request identity, credential handling, Manus HTTP behavior, reservation state, intent validation, forecast mutation, PAPER placement rules, or application-receipt behavior. It consumes only the scanner's protected bounded provider-metadata API controls (`include_provider_metadata=True`, `max_candidates=20`).
+
+### Fixed limits and state model
+
+The runner hard-codes these limits; no CLI option can increase them:
+
+| Limit | Value |
+|---|---:|
+| Selected candidates per cycle | 1 |
+| New Manus tasks per cycle | 1 |
+| Forecast applications per cycle | 1 |
+| `paper_apply` application initiations per cycle | 1 |
+
+The explicit cycle states are `prepared`, `scanned`, `selected`, `research-pending`, `research-completed`, `application-pending`, `completed`, `completed-no-candidate`, and `failed-terminal`. `research-pending` and `application-pending` are nonterminal. A budget-zero authorization-needed result stays `research-pending`; it is not a completed cycle and does not permit candidate replacement. A guarded PAPER placement rejection is terminal for that cycle and never selects candidate #2.
+
+The counter for a new Manus task is incremented only from the existing transport's truthful `task_created_this_invocation` result. The logical application counter is persisted before the first `paper_apply` call and remains one while a later invocation reconciles the same fixed receipt/journal provenance. `paper_apply`'s durable `application_state`, not a transient placement-status string, is the sole terminal authority: `completed-no-placement` and `completed-placement` complete the cycle; `placement-rejected`, `forecast-rejected`, and `error` end it as `failed-terminal`; unknown or nonterminal application states leave it pending and fail closed.
+
+### Budget mapping and durable-state restriction
+
+`--manus-task-budget` accepts only `0` or `1`; default is `0`. It maps directly and only for the present Python call:
+
+```python
+research_transport.run(..., allow_new_task=(current_budget == 1))
+```
+
+The runner never derives `allow_new_task=True` from cycle state, advisory soft credit metadata, a prior command line, a transport reservation, task metadata, or staging metadata. The flag is not persisted. `--manus-task-budget=1` additionally requires `--manus-soft-credit-ceiling` from 1 through 100. The ceiling is advisory operator metadata only and is not represented as a Manus provider hard cap.
+
+### Locking and persistent files
+
+Non-dry cycles obtain `paper_locks.acquire_cycle_lock()` first and hold it across the complete invocation. The only valid nesting is `cycle -> request` in `research_transport`, or `cycle -> application -> journal-writer` in `paper_apply`. The lock's OS ownership is authoritative; metadata is diagnostic only. Persistent runner files are fixed under `%LOCALAPPDATA%\phil-manus\runner\`, not the repository or `runtime/manus/`, and never accept caller paths. Atomic writes use temporary file, complete JSON, flush, `fsync`, close, and `os.replace`.
+
+The runner's files are same-Windows-identity operational state, **not** a hard security boundary against arbitrary same-identity processes. It also does not extend the locking contract to legacy `loop.sh` or legacy journal writers; operators must not run those mutation paths concurrently with a guarded manual runner cycle.
+
+### Bounded provider-metadata selection
+
+The runner has no text classifier and treats question, description, outcome, provider tag label, provider tag slug, and `category` as untrusted data. It calls `core.scan.scan_candidates(include_provider_metadata=True, max_candidates=20)` and only considers the protected normalized `provider_metadata` returned with each retained scanner record. A candidate is eligible only when its exact numeric provider tag IDs contain one of `"1"`, `"21"`, or `"64"` and contain none of `"2"`, `"1597"`, `"101206"`, `"101252"`, `"104743"`, `"100265"`, `"126"`, `"100285"`, `"102305"`, `"104010"`, `"104039"`, or `"104608"`. The metadata envelope must have literal `market_tags_status == "ok"` and bounded normalized tag objects; unavailable, invalid, malformed, empty, unknown-only, and mixed allowed/excluded envelopes are ineligible. The first eligible scanner record is selected without ranking or reordering.
+
+The guardian fixture remains restricted to the public immutable `SCAN_SOURCE_FIELDS` contract and never contains provider metadata. The runner persists a separate immutable `{market_id, provider_metadata}` evidence envelope plus its canonical SHA-256 in its fixed external cycle state. Any mismatch, malformed evidence, fixture-only crash window, or missing frozen evidence fails closed without a rescan, replacement, or candidate substitution. This Patch is not an unattended-production authorization.
