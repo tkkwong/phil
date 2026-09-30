@@ -32,8 +32,10 @@ PAPER_PLACEMENT_VERSION = "paper-guardian-paper-placement/v1"
 
 # These are exactly the fields currently emitted by core/scan.py's keep().
 # Prepare accepts the full read-only scan record but emits only its bounded,
-# research-identifying subset into the candidate packet.
-_SCAN_SOURCE_FIELDS = frozenset(
+# research-identifying subset into the candidate packet. Other protected
+# operator-owned modules may import this immutable public contract to project
+# scanner records without admitting non-guardian evidence fields into fixtures.
+SCAN_SOURCE_FIELDS = frozenset(
     {
         "market_id",
         "question",
@@ -184,7 +186,7 @@ def _require_probability(value: Any, label: str) -> float | int:
 def _normalize_candidate_data(source: dict[str, Any], label: str) -> dict[str, Any]:
     if not isinstance(source, dict):
         raise GuardianValidationError(f"{label} must be an object")
-    unknown = set(source) - _SCAN_SOURCE_FIELDS
+    unknown = set(source) - SCAN_SOURCE_FIELDS
     if unknown:
         raise GuardianValidationError(f"Unknown field(s) in {label}: {sorted(unknown)}")
     missing = _SOURCE_REQUIRED_FIELDS - set(source)
