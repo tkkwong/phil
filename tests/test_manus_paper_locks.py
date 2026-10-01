@@ -5,9 +5,12 @@ from __future__ import annotations
 import multiprocessing
 import os
 import pathlib
+import stat
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from manus import paper_locks
 
@@ -131,6 +134,31 @@ class PaperLockTests(unittest.TestCase):
             paper_locks.acquire_cycle_lock(nonblocking=False, timeout_seconds=0.05, _lock_root=self.root)
         self.assertLess(time.monotonic() - started, 2)
         self.assertTrue(process.is_alive())
+
+    def test_path_indirection_rejects_symlinks_where_supported(self):
+        missing = self.root / "missing"
+        self.assertFalse(paper_locks.path_is_unsafe_indirection(missing))
+        target = self.root / "target"
+        target.mkdir(parents=True)
+        link = self.root / "link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows account lacks CreateSymbolicLink privilege (WinError 1314)")
+            raise
+        self.assertTrue(paper_locks.path_is_unsafe_indirection(link))
+
+    def test_path_indirection_rejects_simulated_windows_reparse_points_without_symlink_privilege(self):
+        candidate = self.root / "simulated-reparse"
+        reparse_flag = 0x400
+        with patch.object(paper_locks.stat, "FILE_ATTRIBUTE_REPARSE_POINT", reparse_flag, create=True), \
+             patch.object(pathlib.Path, "is_symlink", return_value=False), patch.object(
+            pathlib.Path,
+            "stat",
+            return_value=SimpleNamespace(st_file_attributes=reparse_flag),
+        ):
+            self.assertTrue(paper_locks.path_is_unsafe_indirection(candidate))
 
 
 if __name__ == "__main__":

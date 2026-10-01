@@ -10,10 +10,12 @@ import json
 import multiprocessing
 import os
 import pathlib
+import stat
 import tempfile
 import unittest
 import uuid
 from contextlib import contextmanager, redirect_stderr
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from core import forecast as forecast_core
@@ -793,6 +795,60 @@ class PaperRunnerTests(unittest.TestCase):
         self.assertEqual(self.calls["scan"], [])
         self.assertEqual(self.calls["research"], [])
         self.assertEqual(self.calls["apply"], [])
+        self.assert_repository_journals_unchanged()
+
+    def test_simulated_windows_reparse_runner_root_fails_before_scan(self):
+        real_check = paper_locks.path_is_unsafe_indirection
+
+        def reparse_root(path):
+            return pathlib.Path(path) == self.runner_root or real_check(path)
+
+        with patch.object(paper_locks, "path_is_unsafe_indirection", side_effect=reparse_root):
+            with self.assertRaisesRegex(paper_runner.PaperRunnerError, "runner root"):
+                self.run_runner(candidates=[candidate("should-not-scan")], budget=0)
+        self.assertEqual(self.calls["scan"], [])
+        self.assertEqual(self.calls["research"], [])
+        self.assertEqual(self.calls["apply"], [])
+        self.assert_repository_journals_unchanged()
+
+    def test_simulated_windows_reparse_cycle_directory_rejects_active_cycle_before_rescan(self):
+        self.run_runner(candidates=[candidate("existing")], budget=0)
+        cycle_directory = self.fixture_path().parent
+        self.calls["scan"].clear()
+        self.calls["research"].clear()
+        self.calls["apply"].clear()
+        real_stat = pathlib.Path.stat
+
+        def stat_with_reparse(path, *args, **kwargs):
+            if pathlib.Path(path) == cycle_directory:
+                return SimpleNamespace(st_file_attributes=0x400, st_mode=stat.S_IFDIR)
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(paper_locks.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, create=True), \
+             patch.object(pathlib.Path, "stat", new=stat_with_reparse):
+            with self.assertRaisesRegex(paper_runner.PaperRunnerError, "Cycle state is unavailable"):
+                self.run_runner(candidates=[candidate("must-not-replace")], budget=0)
+        self.assertEqual(self.calls["scan"], [])
+        self.assertEqual(self.calls["research"], [])
+        self.assertEqual(self.calls["apply"], [])
+        self.assert_repository_journals_unchanged()
+
+    def test_simulated_windows_reparse_cycle_directory_rejects_fixture_before_read(self):
+        self.run_runner(candidates=[candidate("existing")], budget=0)
+        fixture_path = self.fixture_path()
+        cycle_directory = fixture_path.parent
+        real_stat = pathlib.Path.stat
+
+        def stat_with_reparse(path, *args, **kwargs):
+            if pathlib.Path(path) == cycle_directory:
+                return SimpleNamespace(st_file_attributes=0x400, st_mode=stat.S_IFDIR)
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(paper_locks.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, create=True), \
+             patch.object(pathlib.Path, "stat", new=stat_with_reparse), \
+             patch.object(pathlib.Path, "read_bytes", side_effect=AssertionError("fixture contents must not be read")):
+            with self.assertRaisesRegex(paper_runner.PaperRunnerError, "Cycle fixture is unavailable"):
+                paper_runner._load_fixture(fixture_path)
         self.assert_repository_journals_unchanged()
 
 
