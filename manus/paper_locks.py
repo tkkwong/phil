@@ -20,6 +20,7 @@ import os
 import pathlib
 import re
 import socket
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -41,6 +42,30 @@ class LockUnavailableError(LockError):
 
 def _repository_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[1]
+
+
+def path_is_unsafe_indirection(path: pathlib.Path) -> bool:
+    """Return whether an existing path is a symlink or detectable reparse point.
+
+    The standard library exposes ordinary symlinks on every supported platform
+    and exposes Windows file attributes as ``st_file_attributes``.  On Windows,
+    a directory junction/reparse point therefore fails closed without ctypes,
+    pywin32, shell, or subprocess dependencies.  This guards the fixed local
+    authority paths; it is not a security boundary against another process
+    running under the same Windows identity.
+    """
+    candidate = pathlib.Path(path)
+    try:
+        metadata = candidate.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if candidate.is_symlink():
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(reparse_flag and isinstance(attributes, int) and attributes & reparse_flag)
 
 
 def resolve_lock_root() -> pathlib.Path:
@@ -69,8 +94,13 @@ def _validate_test_root(root: pathlib.Path | None) -> pathlib.Path:
 def _prepare_root(root: pathlib.Path) -> pathlib.Path:
     """Create/check the fixed root; same-identity tampering is not a trust claim."""
     try:
+        for directory in (root.parent, root):
+            if path_is_unsafe_indirection(directory):
+                raise OSError("unsafe fixed lock root")
+            if directory.exists() and not directory.is_dir():
+                raise OSError("invalid fixed lock root")
         root.mkdir(parents=True, exist_ok=True)
-        if not root.is_dir() or root.is_symlink():
+        if not root.is_dir() or path_is_unsafe_indirection(root):
             raise OSError("invalid lock root")
     except OSError:
         raise LockError("Fixed Manus lock root is unavailable") from None
@@ -85,7 +115,7 @@ def _lock_path(name: str, root: pathlib.Path) -> pathlib.Path:
         path.relative_to(root)
     except ValueError:
         raise LockError("Fixed Manus lock path is unavailable") from None
-    if path.is_symlink():
+    if path_is_unsafe_indirection(path):
         raise LockError("Fixed Manus lock path is unavailable")
     return path
 

@@ -196,6 +196,9 @@ def _resolve_runner_root() -> pathlib.Path:
 
 def _validate_runner_root(root: pathlib.Path) -> pathlib.Path:
     root = pathlib.Path(root)
+    for directory in (root.parent, root):
+        if paper_locks.path_is_unsafe_indirection(directory):
+            raise PaperRunnerError("Fixed PAPER runner root is unavailable")
     try:
         root.resolve(strict=False).relative_to(_repository_root())
     except ValueError:
@@ -210,7 +213,7 @@ def _prepare_runner_root(root: pathlib.Path) -> pathlib.Path:
         root.mkdir(parents=True, exist_ok=True)
         for directory in (root, cycles):
             directory.mkdir(exist_ok=True)
-            if directory.is_symlink() or not directory.is_dir():
+            if paper_locks.path_is_unsafe_indirection(directory) or not directory.is_dir():
                 raise OSError("unsafe runner directory")
     except OSError:
         raise PaperRunnerError("Fixed PAPER runner root is unavailable") from None
@@ -244,9 +247,14 @@ def _parse_json(raw: str, label: str) -> Any:
 
 
 def _read_regular_file(path: pathlib.Path, label: str) -> bytes | None:
-    if not path.exists() and not path.is_symlink():
+    if (
+        paper_locks.path_is_unsafe_indirection(path)
+        or paper_locks.path_is_unsafe_indirection(path.parent)
+    ):
+        raise PaperRunnerError(f"{label} is unavailable")
+    if not path.exists():
         return None
-    if path.is_symlink() or not path.is_file():
+    if not path.is_file():
         raise PaperRunnerError(f"{label} is unavailable")
     try:
         return path.read_bytes()
@@ -257,7 +265,11 @@ def _read_regular_file(path: pathlib.Path, label: str) -> bytes | None:
 def _atomic_write_json(path: pathlib.Path, document: dict[str, Any], label: str) -> None:
     directory = path.parent
     try:
-        if directory.is_symlink() or not directory.is_dir() or path.is_symlink():
+        if (
+            paper_locks.path_is_unsafe_indirection(directory)
+            or not directory.is_dir()
+            or paper_locks.path_is_unsafe_indirection(path)
+        ):
             raise OSError("unsafe runner path")
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=directory)
     except OSError:
@@ -503,7 +515,7 @@ def _persist_cycle(root: pathlib.Path, cycle: dict[str, Any], now: Callable[[], 
     directory = _cycle_directory(root, cycle["cycle_id"])
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        if directory.is_symlink() or not directory.is_dir():
+        if paper_locks.path_is_unsafe_indirection(directory) or not directory.is_dir():
             raise OSError("unsafe cycle directory")
     except OSError:
         raise PaperRunnerError("Cycle state is unavailable") from None

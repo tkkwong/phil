@@ -368,3 +368,73 @@ The runner's files are same-Windows-identity operational state, **not** a hard s
 The runner has no text classifier and treats question, description, outcome, provider tag label, provider tag slug, and `category` as untrusted data. It calls `core.scan.scan_candidates(include_provider_metadata=True, max_candidates=20)` and only considers the protected normalized `provider_metadata` returned with each retained scanner record. A candidate is eligible only when its exact numeric provider tag IDs contain one of `"1"`, `"21"`, or `"64"` and contain none of `"2"`, `"1597"`, `"101206"`, `"101252"`, `"104743"`, `"100265"`, `"126"`, `"100285"`, `"102305"`, `"104010"`, `"104039"`, or `"104608"`. The metadata envelope must have literal `market_tags_status == "ok"` and bounded normalized tag objects; unavailable, invalid, malformed, empty, unknown-only, and mixed allowed/excluded envelopes are ineligible. The first eligible scanner record is selected without ranking or reordering.
 
 The guardian fixture remains restricted to the public immutable `SCAN_SOURCE_FIELDS` contract and never contains provider metadata. The runner persists a separate immutable `{market_id, provider_metadata}` evidence envelope plus its canonical SHA-256 in its fixed external cycle state. Any mismatch, malformed evidence, fixture-only crash window, or missing frozen evidence fails closed without a rescan, replacement, or candidate substitution. This Patch is not an unattended-production authorization.
+
+
+## Patch 5E-1: disabled-by-default scheduled PAPER wrapper
+
+`manus.scheduled_paper` is a small **one-invocation entrypoint**, not a
+scheduler installer. Patch 5E-1 does not install, configure, activate, or claim
+any Windows Task Scheduler task, `schtasks` command, COM task, PowerShell
+schedule, service, daemon, timer, cron job, startup item, recurring loop, or
+retry loop. Windows task registration remains deferred to Patch 5E-2.
+
+The wrapper exposes only normal invocation and `--status`. It has no production
+option to enable/disable itself, choose a root/path, configure a schedule,
+retry, set a budget/credit ceiling, or select a live/real/broker route. The
+fixed opt-in document is local and outside the repository:
+
+```text
+%LOCALAPPDATA%\phil-manus\scheduler\enabled.json
+{"scheduler_version":"scheduled-paper/v1","enabled":true}
+```
+
+A missing marker or exact `enabled: false` is disabled and invokes no runner,
+creates no directory/state, and performs no cycle work. The marker parser is
+bounded and duplicate-key-safe; it accepts only that exact two-field versioned
+document. Invalid JSON, unknown/missing fields, invalid types, oversized input,
+symlink, junction, or other detectable reparse-point indirection fails closed
+before `paper_runner` is called. `--status` reads only this marker and never
+invokes the runner or creates local scheduler state.
+
+Marker input is read at most 1,025 bytes (the 1,024-byte parsing limit plus
+one overflow byte) before it is parsed. Runner authority-file reads likewise
+fail closed when either the file or its immediate fixed cycle-directory parent
+is an ordinary symlink or detectable Windows junction/reparse point.
+
+When the exact local marker enables a call, authority is permanently fixed to:
+
+```python
+paper_runner.run(
+    dry_run=False,
+    manus_task_budget=0,
+    manus_soft_credit_ceiling=None,
+)
+```
+
+There is no code path to request a new Manus task or infer such authority from
+prior state. Existing known-task/validated-staging reconciliation can remain
+available at zero budget through the protected runner and transport. A fresh
+`research-pending` result requiring current-invocation authorization is safely
+reported and stopped. A separate manual runner invocation remains the only path
+that can explicitly receive a budget of one and its required advisory ceiling.
+
+An enabled call atomically replaces only fixed
+`%LOCALAPPDATA%\phil-manus\scheduler\last-run.json`, using a same-directory
+temporary file, flush, `fsync`, close, and `os.replace`. That result is a
+bounded whitelist of scheduler timestamp/outcome; cycle, market, task, intent,
+application, forecast, and placement identifiers/states; zero new-task count;
+application/forecast/placement counters; and safe reason. It excludes raw
+runner output, prompt text, market prose, rationale, secrets, exception text,
+and tracebacks. A runner failure, unexpected exception, malformed result, or
+reported nonzero new-task count fails closed with only a generic safe result;
+there is no retry or fallback invocation.
+
+The wrapper does not introduce a second full-cycle lock. Overlap handling is
+owned by `paper_runner`'s existing outer cycle lock: a winner enters the normal
+protected cycle and a loser fails closed without retry. The wrapper has no
+direct scanner, transport, credential, application, forecast, placement, risk,
+broker, wallet, IBKR, Pearl, or real-execution route. Detectable reparse-point
+checks are defensive fixed-path validation, not a hard boundary against another
+process under the same Windows identity. Legacy `loop.sh` and legacy journal
+writers still do not honor the guarded Manus lock contract and must not run
+concurrently with guarded PAPER work.

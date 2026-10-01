@@ -108,3 +108,37 @@ For non-dry invocations, `paper_runner` holds the fixed outer cycle lock before 
 The runner calls the protected scanner exactly as `scan_candidates(include_provider_metadata=True, max_candidates=20)`, then preserves the returned order and never ranks by probability, edge, confidence, profit, model output, question text, description text, `category`, tag label, or tag slug. It selects at most one candidate only when the scanner's bounded normalized `provider_metadata` envelope has `market_tags_status == "ok"`, contains at least one allowed numeric provider tag ID (`"1"`, `"21"`, or `"64"`), and contains none of the excluded numeric provider tag IDs (`"2"`, `"1597"`, `"101206"`, `"101252"`, `"104743"`, `"100265"`, `"126"`, `"100285"`, `"102305"`, `"104010"`, `"104039"`, or `"104608"`). Missing, unavailable, invalid, malformed, unknown-only, empty, or mixed allowed/excluded metadata is ineligible and yields `completed-no-candidate` if no later retained scanner record is eligible. The runner freezes the selected record's normalized provider evidence and canonical SHA-256 beside—not inside—the guardian fixture; a mismatch fails closed without rescan or replacement. This is an operational provider-metadata exclusion, not a prediction or political classification system.
 
 `paper_runner` has no direct credential API, Manus HTTP request, reservation parser, raw response parser, intent validator, forecast writer, ledger writer, market-data client, broker, IBKR, Pearl, or real-execution route. `research_transport` remains authoritative for request locking, credential handling, task lifecycle, and validated staging. `paper_apply` remains authoritative for application receipts, application/journal locks, guarded forecast recording, PAPER placement, and replay recovery. Legacy `loop.sh` and other legacy journal writers do not honor these locks and must not be run concurrently with `paper_runner`.
+
+
+## Patch 5E-1: disabled scheduled PAPER entrypoint
+
+Patch 5E-1 adds `python -m manus.scheduled_paper`, a **disabled-by-default**
+local, one-invocation wrapper for a future external scheduler. It does not
+install, configure, activate, or claim any Task Scheduler task, service,
+daemon, timer, recurring/retry loop, or background worker; scheduler
+installation is deferred to Patch 5E-2.
+
+The wrapper runs only when exact fixed local
+`%LOCALAPPDATA%\phil-manus\scheduler\enabled.json` contains
+`{"scheduler_version":"scheduled-paper/v1","enabled":true}`. Missing state
+or exact `enabled:false` is disabled and creates no scheduler state. The
+wrapper has only normal invocation and `--status`; there is no enable/disable,
+path, schedule, retry, or budget control. Unsafe or malformed local state fails
+closed before runner invocation.
+
+An enabled call delegates once to the existing protected PAPER runner with
+permanent `manus_task_budget=0`, `dry_run=False`, and no credit ceiling. It
+cannot create a new Manus task. Existing known-task/staging reconciliation may
+remain available at zero budget, while a fresh manual-authorization result is
+recorded and stopped. Only a separate manual `paper_runner` invocation can
+receive explicit current-invocation budget one. This does not alter the fixed
+research instruction: the Manus task still returns **six research fields only**.
+
+The wrapper atomically replaces one bounded local `last-run.json` safe summary;
+it contains no raw runner output, prompt, market prose, rationale, secrets, or
+exception text. It adds no retry or new full-cycle lock: the existing runner
+cycle lock controls overlap. The wrapper has no direct scanner, transport,
+application, broker, wallet, IBKR, Pearl, or real-execution path. Reparse-point
+checks are defensive only and do not make a hard boundary against another
+process under the same Windows identity. Legacy `loop.sh` and legacy journal
+writers remain outside the guarded lock contract and must not run concurrently.
