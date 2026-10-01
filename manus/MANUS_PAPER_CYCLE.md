@@ -142,3 +142,55 @@ application, broker, wallet, IBKR, Pearl, or real-execution path. Reparse-point
 checks are defensive only and do not make a hard boundary against another
 process under the same Windows identity. Legacy `loop.sh` and legacy journal
 writers remain outside the guarded lock contract and must not run concurrently.
+
+
+## Patch 5E-2: fixed Windows Task Scheduler operator controls
+
+Patch 5E-2 adds local Windows **registration and operator controls only**. It
+uses exactly one fixed task named `Phil Manus PAPER Hourly`, with one fixed
+`TimeTrigger` at the next local top-of-hour and indefinite hourly `PT1H`
+repetition, to invoke the repository-root
+`scheduled_paper_task.py` launcher using the current `sys.executable`. The
+launcher changes to the repository root and calls only
+`manus.scheduled_paper.main([])`; it forwards no arguments and provides no
+direct runner, research, scan, application, network, credential, broker,
+wallet, IBKR, Pearl, or real-execution route.
+
+`python -m manus.scheduler_admin` accepts only `status`, `install`, `enable`,
+`disable`, and `uninstall`. It accepts no task-name, cadence, command, path,
+budget, credit, run-now, retry, force, shell, or live/real control. It invokes
+only the fixed absolute `%SystemRoot%\System32\schtasks.exe` utility with an
+argument list, closed `stdin` (`DEVNULL`), a bounded timeout, and captured raw
+output that is never printed or persisted.
+
+Registration is a temporary, bounded, fsynced stdlib XML definition submitted
+only as `/Create /TN <fixed-name> /XML <generated-file> /F`, then removed in a
+`finally` path. The XML has one `InteractiveToken` principal for the current
+validated `USERDOMAIN\USERNAME` identity at `LeastPrivilege`; it stores no
+password, prompts for no password, and provides no credential lookup. The task
+runs only while that user already has an interactive Windows session and thus
+requires the user to remain logged in. Its fixed settings include
+`MultipleInstancesPolicy=IgnoreNew`, `AllowStartOnDemand=false`, and no hard
+termination or scheduler retry behavior. It may start while the logged-in
+computer is on battery and is not stopped merely because the computer switches
+to battery; it does not wake the computer or catch up missed executions.
+
+Install atomically writes exact `enabled:false` at the existing 5E-1 marker
+**before any later Scheduler, launcher, identity, Python, XML, or task
+definition validation/action**; it does not run Phil and never automatically
+re-enables stale state. A successful fixed-task query is the only evidence that
+permits enable to write `enabled:true`; a nonzero query is reported as bounded
+`not-confirmed` rather than claimed absent, and stays fail-closed. Enable arms
+future wrapper entry only and does not run a task, scan, research, or create a
+Manus task. Disable atomically writes `enabled:false`
+without querying, deleting, or changing the task installation state; it is a
+future-entry kill switch, not a report that the task is absent. Uninstall also
+disarms first, then validates and deletes only the fixed task; any later failure
+leaves the marker false. The enable marker remains the sole admission gate, and
+unattended authority remains permanently budget zero. Manual `paper_runner` is
+the only explicit budget-one route.
+
+These are operational controls, not a hard barrier against arbitrary processes
+running under the same Windows identity. They install no scheduler during import
+or status, expose no run-now action, and do not make legacy `loop.sh` safe to
+run concurrently with guarded PAPER work.

@@ -438,3 +438,52 @@ checks are defensive fixed-path validation, not a hard boundary against another
 process under the same Windows identity. Legacy `loop.sh` and legacy journal
 writers still do not honor the guarded Manus lock contract and must not run
 concurrently with guarded PAPER work.
+
+
+## Patch 5E-2: fixed Windows scheduler operator controls
+
+`manus.scheduler_admin` is the only Windows registration/operator layer. It
+exposes exactly `status`, `install`, `enable`, `disable`, and `uninstall` and
+accepts no configuration argument. It uses one fixed task name, `Phil Manus
+PAPER Hourly`, one fixed `TimeTrigger` at the next local top-of-hour with
+indefinite hourly `PT1H` repetition, and the
+repository-root `scheduled_paper_task.py` launcher. The launcher calls only
+`scheduled_paper.main([])` after changing to its own repository root.
+
+The operator layer invokes only the exact absolute
+`%SystemRoot%\System32\schtasks.exe` process with argument arrays, bounded
+timeout, `stdin=subprocess.DEVNULL`, captured raw output, and no shell. It
+builds a bounded temporary stdlib XML definition, flushes, `fsync`s, closes,
+checks it for fixed-root reparse/symlink indirection, invokes `/Create` once,
+and removes it in `finally`. The XML has exactly one action—the exact validated
+Python executable and launcher path—and one InteractiveToken principal for the
+current validated `USERDOMAIN\USERNAME` identity at `LeastPrivilege`. It has no
+stored password, password prompt, credential lookup, SYSTEM/service account, or
+highest-privilege mode. The task can run only while that user remains logged in
+to an existing interactive session.
+
+Install atomically disarms the existing sole marker **before any later
+Scheduler, launcher, identity, Python, XML, or task-definition validation or
+action**. It does not run Phil and never automatically re-enables stale state.
+Only a successful fixed task query confirms `installed` and permits enable to
+arm `enabled:true`; a nonzero query is the exact bounded `not-confirmed` state,
+not a claim that the task is absent. Enable does not run the task or invoke the
+wrapper, runner, Manus, scan, or research.
+Disable is an admission-control kill switch for **future** wrapper entry only;
+it neither queries nor changes task installation state and never terminates an
+already-running protected cycle or deletes the task. Uninstall likewise
+disarms before subsequent utility validation and delete action. A failed create
+or delete leaves the marker false without retry.
+
+The unattended route remains permanently budget zero. Explicit budget one
+remains manual `paper_runner` authority only. There is no run-now command and
+no real, IBKR, Pearl, broker, wallet, or credential route. The fixed XML sets
+`MultipleInstancesPolicy=IgnoreNew`, `AllowStartOnDemand=false`,
+`AllowHardTerminate=false`, `ExecutionTimeLimit=PT0S`, and explicit
+`DisallowStartIfOnBatteries=false` / `StopIfGoingOnBatteries=false`: it may
+start while the logged-in computer is on battery and is not stopped merely by a
+switch to battery. It never wakes the computer, catches up missed executions,
+or creates scheduler retry behavior. Fixed-path/reparse checks and locks are
+same-Windows-identity operational controls, not a hard barrier against
+arbitrary processes under that identity; legacy `loop.sh` must not run
+concurrently with guarded PAPER work.
