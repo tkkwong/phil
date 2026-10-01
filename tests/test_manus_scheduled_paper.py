@@ -324,6 +324,16 @@ class ScheduledPaperTests(unittest.TestCase):
         self.assertEqual(self.last_run_path().read_bytes(), original)
         self.assertEqual(list(self.scheduler_root.glob(".last-run.json.*.tmp")), [])
 
+    def test_public_fixed_marker_writer_is_atomic_and_preserves_existing_marker_on_failure(self):
+        self.write_marker(True)
+        original = self.marker_path().read_bytes()
+        with patch.object(scheduled_paper.os, "replace", side_effect=OSError("simulated")):
+            with self.assertRaises(scheduled_paper.ScheduledPaperError):
+                scheduled_paper.write_enable_marker(False, _scheduler_root=self.scheduler_root)
+        self.assertEqual(self.marker_path().read_bytes(), original)
+        self.assertEqual(list(self.scheduler_root.glob(".enabled.json.*.tmp")), [])
+        self.assert_repository_journals_unchanged()
+
     def test_static_isolation_has_only_runner_cycle_dependency_and_no_scheduling_or_network_route(self):
         source = inspect.getsource(scheduled_paper)
         tree = ast.parse(source)

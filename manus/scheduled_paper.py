@@ -103,6 +103,16 @@ def _validate_scheduler_root(root: pathlib.Path) -> pathlib.Path:
     raise ScheduledPaperError("Fixed scheduler root must be outside the repository")
 
 
+def resolve_scheduler_root(*, _scheduler_root: pathlib.Path | None = None) -> pathlib.Path:
+    """Return the one validated fixed scheduler root.
+
+    ``_scheduler_root`` is an offline-test seam only. Production callers have
+    no root parameter and always use the fixed local scheduler root.
+    """
+    root = _resolve_scheduler_root() if _scheduler_root is None else pathlib.Path(_scheduler_root)
+    return _validate_scheduler_root(root)
+
+
 def _parse_json(raw: str, label: str) -> Any:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -172,6 +182,67 @@ def _read_enable_marker(root: pathlib.Path) -> bool:
     return document["enabled"]
 
 
+def read_enable_marker(*, _scheduler_root: pathlib.Path | None = None) -> bool:
+    """Read the exact fixed enable marker without creating scheduler state.
+
+    ``_scheduler_root`` is an offline-test seam only.  Production callers have
+    no path parameter and always use the one fixed local scheduler root.
+    """
+    root = resolve_scheduler_root(_scheduler_root=_scheduler_root)
+    return _read_enable_marker(root)
+
+
+def _atomic_write_enable_marker(root: pathlib.Path, enabled: bool) -> None:
+    """Atomically write the exact two-field enable marker at its fixed path."""
+    if type(enabled) is not bool:
+        raise ScheduledPaperError("Fixed scheduler marker is malformed")
+    root = _validate_scheduler_root(root)
+    document = {"scheduler_version": SCHEDULER_VERSION, "enabled": enabled}
+    try:
+        encoded = (_canonical_json(document) + "\n").encode("utf-8")
+    except (TypeError, ValueError):
+        raise ScheduledPaperError("Fixed scheduler marker is malformed") from None
+    if len(encoded) > _MARKER_MAX_BYTES:
+        raise ScheduledPaperError("Fixed scheduler marker is malformed")
+    try:
+        for directory in (root.parent, root):
+            if paper_locks.path_is_unsafe_indirection(directory):
+                raise OSError("unsafe fixed scheduler root")
+            if directory.exists() and not directory.is_dir():
+                raise OSError("invalid fixed scheduler root")
+        root.mkdir(parents=True, exist_ok=True)
+        if paper_locks.path_is_unsafe_indirection(root) or not root.is_dir():
+            raise OSError("invalid fixed scheduler root")
+        marker = _marker_path(root)
+        if paper_locks.path_is_unsafe_indirection(marker):
+            raise OSError("unsafe fixed scheduler marker")
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{marker.name}.", suffix=".tmp", dir=root)
+    except OSError:
+        raise ScheduledPaperError("Fixed scheduler marker is unavailable") from None
+    temporary_path = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, marker)
+    except Exception:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ScheduledPaperError("Fixed scheduler marker write failed") from None
+
+
+def write_enable_marker(enabled: bool, *, _scheduler_root: pathlib.Path | None = None) -> None:
+    """Persist exact fixed marker state without accepting a production path."""
+    root = resolve_scheduler_root(_scheduler_root=_scheduler_root)
+    # Existing state must be duplicate-key-safe and schema-valid before an
+    # administrative operation replaces it. A missing marker remains disabled.
+    _read_enable_marker(root)
+    _atomic_write_enable_marker(root, enabled)
+
+
 def _status_document(enabled: bool) -> dict[str, Any]:
     return {
         "scheduler_version": SCHEDULER_VERSION,
@@ -182,8 +253,7 @@ def _status_document(enabled: bool) -> dict[str, Any]:
 
 def status(*, _scheduler_root: pathlib.Path | None = None) -> dict[str, Any]:
     """Return fixed marker status only; this never invokes the PAPER runner."""
-    root = _resolve_scheduler_root() if _scheduler_root is None else pathlib.Path(_scheduler_root)
-    return _status_document(_read_enable_marker(root))
+    return _status_document(read_enable_marker(_scheduler_root=_scheduler_root))
 
 
 def _safe_identifier(value: Any, label: str, *, nullable: bool = True) -> str | None:
