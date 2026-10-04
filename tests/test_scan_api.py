@@ -12,14 +12,14 @@ from unittest.mock import patch
 from core import pmapi, scan
 
 
-def market(market_id, *, question=None, volume=10, prices="[0.5, 0.5]"):
+def market(market_id, *, question=None, volume=10, prices="[0.5, 0.5]", end_date="2026-10-01T00:00:00Z", closed=None):
     """Return the smallest Gamma-style record accepted by scan.keep()."""
-    return {
+    record = {
         "id": market_id,
         "question": question or f"Will {market_id} happen?",
         "volume24hr": volume,
         "outcomePrices": prices,
-        "endDate": "2026-10-01T00:00:00Z",
+        "endDate": end_date,
         "events": [{"id": f"event-{market_id}", "slug": f"event-{market_id}"}],
         "outcomes": json.dumps(["Yes", "No"]),
         "clobTokenIds": json.dumps([f"yes-{market_id}", f"no-{market_id}"]),
@@ -27,6 +27,9 @@ def market(market_id, *, question=None, volume=10, prices="[0.5, 0.5]"):
         "slug": f"slug-{market_id}",
         "description": f"Description for {market_id}",
     }
+    if closed is not None:
+        record["closed"] = closed
+    return record
 
 
 def tag(tag_id="1", slug="sports", label="Sports"):
@@ -60,6 +63,15 @@ class GammaMarketTagHelperTests(unittest.TestCase):
 
 
 class ScanCandidatesTests(unittest.TestCase):
+    def setUp(self):
+        # Scan decisions must be deterministic. The fixture market endDate is
+        # 2026-10-01T00:00:00Z, which is fresh relative to this frozen clock.
+        clock_patcher = patch.object(
+            scan, "utcnow", return_value=dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc)
+        )
+        self.scan_clock = clock_patcher.start()
+        self.addCleanup(clock_patcher.stop)
+
     def scan_with(self, queries, batches, **kwargs):
         with patch.object(scan, "discovery_queries", return_value=[dict(query) for query in queries]), \
              patch.object(scan.pmapi, "gamma_markets", side_effect=batches):
@@ -311,6 +323,66 @@ class ScanCandidatesTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), json.dumps(scan.keep(
             market("a"), set(), [], argparse.Namespace(min_volume_24h=0)
         )) + "\n")
+
+    def test_local_freshness_gate_rejects_stale_provider_records(self):
+        # Frozen clock is 2026-09-28T12:00Z; min_end = 12:20Z; horizon = 10-05T12Z.
+        cases = {
+            "already-ended": market("ended", end_date="2026-09-26T00:00:00Z"),
+            "before-min-end": market("soon", end_date="2026-09-28T12:19:59Z"),
+            "beyond-horizon": market("far", end_date="2026-10-06T00:00:00Z"),
+            "missing-end-date": market("no-date", end_date=None),
+            "malformed-end-date": market("bad-date", end_date="not-a-timestamp"),
+            "timezone-naive-end-date": market("naive", end_date="2026-10-01T00:00:00"),
+        }
+        for label, stale in cases.items():
+            with self.subTest(label=label):
+                records = self.scan_with([{"_label": "one"}], [[stale, market("fresh")], []])
+                self.assertEqual([record["market_id"] for record in records], ["fresh"])
+
+    def test_local_freshness_gate_rejects_explicitly_closed_records(self):
+        closed_but_fresh = market("closed", end_date="2026-10-01T00:00:00Z", closed=True)
+        records = self.scan_with([{"_label": "one"}], [[closed_but_fresh, market("fresh")], []])
+        self.assertEqual([record["market_id"] for record in records], ["fresh"])
+
+    def test_local_freshness_gate_accepts_boundary_equality_and_offsets(self):
+        min_end = dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc) + dt.timedelta(
+            minutes=scan.PROTECTED["min_minutes_to_resolution"]
+        )
+        boundary = market("boundary", end_date=min_end.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        offset = market("offset", end_date="2026-09-30T14:00:00+02:00")
+        records = self.scan_with([{"_label": "one"}], [[boundary, offset, market("plain")], []])
+        self.assertEqual([record["market_id"] for record in records], ["boundary", "offset", "plain"])
+
+    def test_single_scan_decision_uses_one_frozen_clock(self):
+        clock_calls = []
+
+        def frozen_clock():
+            clock_calls.append(1)
+            return dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc)
+
+        with patch.object(scan, "utcnow", side_effect=frozen_clock), \
+             patch.object(scan, "discovery_queries", return_value=[{"_label": "one"}]) as discovery, \
+             patch.object(scan.pmapi, "gamma_markets", side_effect=[[market("a")], []]), \
+             redirect_stderr(io.StringIO()):
+            records = scan.scan_candidates()
+        self.assertEqual([record["market_id"] for record in records], ["a"])
+        self.assertEqual(len(clock_calls), 1)
+        # discovery_queries receives the same frozen min_end derived from the
+        # one scan clock; no second clock read occurs inside the scan loop.
+        self.assertEqual(
+            discovery.call_args.args[1],
+            dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc)
+            + dt.timedelta(minutes=scan.PROTECTED["min_minutes_to_resolution"]),
+        )
+
+    def test_provider_metadata_lookup_happens_only_for_fresh_candidates(self):
+        stale = market("stale", end_date="2026-09-26T00:00:00Z")
+        with patch.object(scan, "discovery_queries", return_value=[{"_label": "one"}]), \
+             patch.object(scan.pmapi, "gamma_markets", side_effect=[[stale, market("kept")], []]), \
+             patch.object(scan.pmapi, "gamma_market_tags", return_value=[tag()]) as market_tags:
+            records = scan.scan_candidates(include_provider_metadata=True)
+        self.assertEqual([record["market_id"] for record in records], ["kept"])
+        self.assertEqual([call.args[0] for call in market_tags.call_args_list], ["kept"])
 
 
 if __name__ == "__main__":

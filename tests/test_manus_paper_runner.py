@@ -64,6 +64,18 @@ def candidate(market_id: str, *, metadata=None, question=None, description=None)
     }
 
 
+def stale_candidate(market_id: str, *, metadata=None) -> dict:
+    """Fresh-looking candidate whose end_date is already past the test clock."""
+    return {**candidate(market_id, metadata=metadata), "end_date": "2026-09-29T11:59:59Z"}
+
+
+def boundary_candidate(market_id: str, *, metadata=None) -> dict:
+    """Candidate exactly at the protected minimum time to resolution."""
+    minutes = paper_runner.core_scan.PROTECTED["min_minutes_to_resolution"]
+    boundary = NOW + dt.timedelta(minutes=minutes)
+    return {**candidate(market_id, metadata=metadata), "end_date": boundary.strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+
+
 def _hold_cycle_lock(lock_root: str, ready, release) -> None:
     """Spawn target holding the real fixed-root OS cycle lock."""
     with paper_locks.acquire_cycle_lock(nonblocking=True, _lock_root=pathlib.Path(lock_root)):
@@ -275,6 +287,103 @@ class PaperRunnerTests(unittest.TestCase):
         result = self.run_runner(candidates=values, budget=0)
         self.assertEqual(result["cycle_state"], "completed-no-candidate")
         self.assertEqual(self.calls["research"], [])
+
+    def test_stale_first_candidate_is_skipped_for_later_fresh_candidate(self):
+        values = [
+            stale_candidate("stale", metadata=provider_metadata(("1",))),
+            candidate("fresh", metadata=provider_metadata(("1",))),
+        ]
+        result = self.run_runner(candidates=values, research=self.research(reject_budget_zero=True), budget=0)
+        self.assertEqual(result["market_id"], "fresh")
+        self.assertEqual(self.calls["research"][0]["candidate_id"], self.active_cycle()["candidate_id"])
+        self.scan_assertion()
+
+    def test_all_tag_eligible_candidates_stale_yields_no_candidate_and_no_research(self):
+        result = self.run_runner(
+            candidates=[stale_candidate("stale", metadata=provider_metadata(("1",)))],
+            research=self.research(reject_budget_zero=True),
+            budget=0,
+        )
+        self.assertEqual(result["cycle_state"], "completed-no-candidate")
+        self.assertEqual(result["safe_reason"], "no-provider-tag-eligible-candidate")
+        self.assertEqual(self.calls["research"], [])
+        self.assertEqual(self.calls["apply"], [])
+        self.assert_repository_journals_unchanged()
+
+    def test_boundary_candidate_is_still_researchable(self):
+        result = self.run_runner(
+            candidates=[boundary_candidate("boundary", metadata=provider_metadata(("1",)))],
+            research=self.research(reject_budget_zero=True),
+            budget=0,
+        )
+        self.assertEqual(result["market_id"], "boundary")
+        self.assertEqual(result["cycle_state"], "research-pending")
+
+    def test_dry_run_skips_stale_candidates_with_same_rule(self):
+        result = paper_runner.run(
+            dry_run=True,
+            manus_task_budget=0,
+            _runner_root=self.runner_root,
+            _lock_root=self.lock_root,
+            _scan_candidates=self.scan([stale_candidate("stale", metadata=provider_metadata(("1",))), candidate("fresh", metadata=provider_metadata(("1",)))]),
+            _research_run=lambda *_args, **_kwargs: self.fail("research called"),
+            _apply_run=lambda *_args, **_kwargs: self.fail("application called"),
+            _now=lambda: NOW,
+            _new_uuid=lambda: CYCLE_ID,
+        )
+        self.assertEqual(result["cycle_state"], "selected")
+        self.assertEqual(result["market_id"], "fresh")
+
+    def test_dry_run_reports_no_candidate_when_all_stale(self):
+        result = paper_runner.run(
+            dry_run=True,
+            manus_task_budget=0,
+            _runner_root=self.runner_root,
+            _lock_root=self.lock_root,
+            _scan_candidates=self.scan([stale_candidate("stale", metadata=provider_metadata(("1",)))]),
+            _research_run=lambda *_args, **_kwargs: self.fail("research called"),
+            _apply_run=lambda *_args, **_kwargs: self.fail("application called"),
+            _now=lambda: NOW,
+            _new_uuid=lambda: CYCLE_ID,
+        )
+        self.assertEqual(result["cycle_state"], "completed-no-candidate")
+
+    def test_selected_candidate_becoming_stale_before_research_terminates_safely(self):
+        # First invocation selects and freezes the candidate, then stops before
+        # research (budget 0). The clock then advances past the resolution floor.
+        self.run_runner(candidates=[candidate("frozen", metadata=provider_metadata(("1",)))], research=self.research(reject_budget_zero=True), budget=0)
+        first_cycle = self.active_cycle()
+        self.assertEqual(first_cycle["state"], "research-pending")
+        research_calls_before = len(self.calls["research"])
+        # The frozen candidate resolves 2026-10-01T00:00Z; advancing the clock
+        # past (end_date - resolution floor) makes it unresearchable on resume.
+        expired = dt.datetime(2026, 9, 30, 23, 45, tzinfo=dt.timezone.utc)
+        second = paper_runner.run(
+            manus_task_budget=1,
+            manus_soft_credit_ceiling=10,
+            _runner_root=self.runner_root,
+            _lock_root=self.lock_root,
+            _scan_candidates=self.scan([candidate("frozen", metadata=provider_metadata(("1",)))]),
+            _research_run=self.research(),
+            _apply_run=self.application(),
+            _now=lambda: expired,
+            _new_uuid=lambda: CYCLE_ID,
+        )
+        self.assertEqual(second["cycle_state"], "failed-terminal")
+        self.assertEqual(second["safe_reason"], "selected-candidate-no-longer-researchable")
+        self.assertEqual(len(self.calls["research"]), research_calls_before)
+        self.assertEqual(self.calls["apply"], [])
+        cycle = self.active_cycle()
+        self.assertEqual(cycle["candidate_id"], first_cycle["candidate_id"])
+        self.assertEqual(cycle["selection_evidence"], first_cycle["selection_evidence"])
+        self.assertEqual(cycle["selection_evidence_sha256"], first_cycle["selection_evidence_sha256"])
+        self.assertEqual(cycle["counters"], {"candidates_selected": 1, "new_manus_tasks": 0, "logical_applications": 0})
+        self.assertEqual(cycle["intent_id"], None)
+        self.assertEqual(cycle["task_id"], None)
+        self.assertEqual(cycle["forecast_id"], None)
+        self.assertEqual(cycle["placement_id"], None)
+        self.assertEqual(cycle["application_state"], None)
+        self.assert_repository_journals_unchanged()
 
     def test_fixture_excludes_provider_metadata_and_imports_public_guardian_contract(self):
         self.run_runner(research=self.research(reject_budget_zero=True), budget=0)

@@ -55,6 +55,7 @@ _SAFE_REASON_VALUES = frozenset(
         "paper-placement-rejected",
         "paper-forecast-rejected",
         "paper-application-error",
+        "selected-candidate-no-longer-researchable",
     }
 )
 _ALLOWED_PROVIDER_TAG_IDS = frozenset({"1", "21", "64"})
@@ -369,6 +370,36 @@ def _provider_metadata_is_eligible(value: Any) -> bool:
     return bool(tag_ids & _ALLOWED_PROVIDER_TAG_IDS)
 
 
+def _parse_utc_timestamp(value: Any) -> dt.datetime | None:
+    """Return a timezone-aware UTC datetime for a fixture end_date, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _candidate_is_researchable(candidate: dict[str, Any], now: Callable[[], dt.datetime]) -> bool:
+    """Independent runner freshness gate using the injected runner clock.
+
+    Scanner filtering is not trusted enforcement. A frozen candidate may only
+    consume research authority while its trusted fixture end_date still leaves
+    the protected minimum time to resolution; boundary equality is valid.
+    """
+    end = _parse_utc_timestamp(candidate.get("end_date"))
+    if end is None:
+        return False
+    floor = now() + dt.timedelta(minutes=core_scan.PROTECTED["min_minutes_to_resolution"])
+    return end >= floor
+
+
 def _selection_evidence(market_id: str, provider_metadata: Any) -> dict[str, Any]:
     _require_identifier(market_id, "selection evidence market_id")
     metadata = _normalize_provider_metadata(provider_metadata)
@@ -456,13 +487,21 @@ def _validate_cycle(value: Any) -> dict[str, Any]:
     if state in selected_or_later:
         if value["candidate_id"] is None or market_id is None or evidence is None or counters["candidates_selected"] != 1:
             raise PaperRunnerError("Cycle selection provenance is incomplete")
-    if state in {"research-completed", "application-pending", "completed", "failed-terminal"} and value["intent_id"] is None:
+    pre_research_stale = state == "failed-terminal" and value["safe_reason"] == "selected-candidate-no-longer-researchable"
+    if pre_research_stale:
+        # Narrow exception for the pre-research stale terminal only: research
+        # never ran, so no research/application provenance may exist.
+        if any(value[field] is not None for field in ("intent_id", "task_id", "application_state", "forecast_id", "placement_id")):
+            raise PaperRunnerError("Pre-research stale terminal has conflicting provenance")
+        if counters != {"candidates_selected": 1, "new_manus_tasks": 0, "logical_applications": 0}:
+            raise PaperRunnerError("Pre-research stale terminal has conflicting counters")
+    elif state in {"research-completed", "application-pending", "completed", "failed-terminal"} and value["intent_id"] is None:
         raise PaperRunnerError("Cycle research provenance is incomplete")
     if state in {"prepared", "scanned", "selected", "research-pending", "research-completed"} and counters["logical_applications"] != 0:
         raise PaperRunnerError("Cycle logical application counter conflicts with cycle state")
-    if state in {"application-pending", "completed", "failed-terminal"} and counters["logical_applications"] != 1:
+    if state in {"application-pending", "completed", "failed-terminal"} and not pre_research_stale and counters["logical_applications"] != 1:
         raise PaperRunnerError("Cycle logical application counter conflicts with cycle state")
-    if state in {"completed", "failed-terminal"} and value["application_state"] not in _APPLICATION_TERMINAL_STATES:
+    if state in {"completed", "failed-terminal"} and not pre_research_stale and value["application_state"] not in _APPLICATION_TERMINAL_STATES:
         raise PaperRunnerError("Cycle terminal application state is invalid")
     return value
 
@@ -652,7 +691,7 @@ def _select_or_recover(
         if market_id not in packet_by_market:
             raise PaperRunnerError("Provider selection evidence conflicts with frozen fixture")
         metadata = metadata_by_market[market_id]
-        if _provider_metadata_is_eligible(metadata):
+        if _provider_metadata_is_eligible(metadata) and _candidate_is_researchable(packet_by_market[market_id], now):
             selected = packet_by_market[market_id]
             selected_evidence = _selection_evidence(selected["market_id"], metadata)
             break
@@ -734,7 +773,7 @@ def _dry_run(
     for source in fixture["candidates"]:
         market_id = source["market_id"]
         metadata = metadata_by_market[market_id]
-        if _provider_metadata_is_eligible(metadata):
+        if _provider_metadata_is_eligible(metadata) and _candidate_is_researchable(packet_by_market[market_id], now):
             candidate = packet_by_market[market_id]
             evidence = _selection_evidence(market_id, metadata)
             cycle.update(
@@ -862,6 +901,21 @@ def run(
                 cycle = _persist_cycle(root, cycle, _now)
 
             if cycle["state"] == "research-pending":
+                # Defense in depth: a candidate valid at selection may age past
+                # the protected resolution floor while persisted as
+                # selected/research-pending (stop, wait, later budget-1 resume).
+                # Re-check immediately before spending research authority; no
+                # substitute candidate is silently selected.
+                if not _candidate_is_researchable(candidate, _now):
+                    cycle = dict(cycle)
+                    cycle.update(
+                        {
+                            "state": "failed-terminal",
+                            "safe_reason": "selected-candidate-no-longer-researchable",
+                        }
+                    )
+                    cycle = _persist_cycle(root, cycle, _now)
+                    return _summary(cycle)
                 try:
                     research = _research_run(str(fixture_path), candidate["candidate_id"], allow_new_task=budget == 1)
                 except research_transport.ResearchTransportError as exc:
