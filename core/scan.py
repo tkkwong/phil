@@ -116,6 +116,37 @@ def keep(m, seen, banned, args):
     }
 
 
+def _parse_utc_end(value):
+    """Return a timezone-aware UTC datetime for an ISO-8601 endDate, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _time_fresh(end_date, closed, min_end, horizon):
+    """Authoritative local freshness gate using the one frozen scan clock.
+
+    Provider query parameters (closed=false, end_date_min) are advisory input
+    filtering, not enforcement. Every returned market must independently pass
+    this local time-bound check before becoming a candidate.
+    """
+    if closed is True:
+        return False
+    end = _parse_utc_end(end_date)
+    if end is None:
+        return False
+    return min_end <= end <= horizon
+
+
 def _validate_scan_controls(include_provider_metadata, max_candidates):
     """Reject non-default API controls that would make scanner bounds ambiguous."""
     if type(include_provider_metadata) is not bool:
@@ -227,6 +258,8 @@ def _iter_candidates(
                 if max_candidates is not None and kept >= max_candidates:
                     return
                 rec = keep(m, seen, banned, args)
+                if rec and not _time_fresh(rec["end_date"], m.get("closed"), min_end, horizon):
+                    rec = None
                 if rec:
                     if include_provider_metadata:
                         rec["provider_metadata"] = _provider_metadata(rec["market_id"])
