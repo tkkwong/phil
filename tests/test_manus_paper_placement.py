@@ -70,7 +70,7 @@ def valid_intent(packet, *, intent_id=FIRST_INTENT_ID, disposition="bet", probab
     }
 
 
-class GuardedPaperPlacementTests(unittest.TestCase):
+class GuardedPaperPlacementTestsMixin:
     def setUp(self):
         self.fixture = copy.deepcopy(FIXTURE)
         self.packet = prepare_packet(self.fixture)
@@ -607,3 +607,216 @@ class GuardedPaperPlacementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardedPaperPlacementTests(GuardedPaperPlacementTestsMixin, unittest.TestCase):
+    """Original guarded placement regression suite."""
+
+
+class GuardedPlacementRejectionCodeTests(GuardedPaperPlacementTestsMixin, unittest.TestCase):
+    """Every protected placement rejection carries its stable bounded code.
+
+    All scenarios are offline: public market seams are mocked and file paths
+    are per-test temporary directories.
+    """
+
+    def _code(self, root, *, intent=None, ledger_rows=None, forecast_rows=None,
+              protected=None, risk=None, market=None, tokens=None, prices=(0.50, 0.52),
+              event_rows=None, gamma_markets_side_effect=None,
+              gamma_market_side_effect=None):
+        intent = copy.deepcopy(self.intent if intent is None else intent)
+        fixture = copy.deepcopy(self.fixture)
+        ledger_path = root / "ledger.jsonl"
+        forecast_path = root / "forecasts.jsonl"
+        if ledger_rows:
+            self._write_rows(ledger_path, ledger_rows)
+        rows = [self._forecast_row(intent)] if forecast_rows is None else forecast_rows
+        self._write_rows(forecast_path, rows)
+        if protected is None or risk is None:
+            protected, risk = self._policy()
+        market = self._market() if market is None else market
+        tokens = {"Texas A&M": "token-texas", "Wake Forest": "token-wake"} if tokens is None else tokens
+        if event_rows is None and gamma_markets_side_effect is None:
+            event_rows = [{"id": "market-100", "events": [{"id": "event-100"}]}]
+        if gamma_markets_side_effect is not None:
+            gamma_markets_patch = patch.object(ledger_core.pmapi, "gamma_markets", side_effect=gamma_markets_side_effect)
+        else:
+            gamma_markets_patch = patch.object(ledger_core.pmapi, "gamma_markets", return_value=event_rows)
+        if gamma_market_side_effect is not None:
+            gamma_market_patch = patch.object(ledger_core.pmapi, "gamma_market", side_effect=gamma_market_side_effect)
+        else:
+            gamma_market_patch = patch.object(ledger_core.pmapi, "gamma_market", return_value=market)
+        with gamma_market_patch, \
+             patch.object(ledger_core.pmapi, "market_tokens", return_value=tokens), \
+             patch.object(ledger_core.pmapi, "best_prices", return_value=prices), \
+             gamma_markets_patch:
+            try:
+                record_candidate_paper_placement(
+                    fixture,
+                    json.dumps(intent),
+                    _ledger_path=ledger_path,
+                    _forecast_path=forecast_path,
+                    _protected_config=protected,
+                    _risk_config=risk,
+                    _now=NOW,
+                )
+            except GuardianValidationError as exc:
+                return getattr(exc, "code", None)
+        raise AssertionError("expected GuardianValidationError with a rejection code")
+
+    def test_placement_rejection_vocabulary_is_closed_and_classified(self):
+        from manus.paper_apply import REJECTION_CLASSIFICATIONS
+        placement_codes = ledger_core.PLACEMENT_REJECTION_CODES
+        self.assertLessEqual(placement_codes, set(REJECTION_CLASSIFICATIONS))
+        for code in placement_codes:
+            self.assertIn(REJECTION_CLASSIFICATIONS[code], {"policy", "infrastructure", "provenance", "internal"})
+        self.assertIn("unclassified", placement_codes)
+        self.assertIn("risk-cap-event", placement_codes)
+        self.assertIn("event-identity-unresolved-current-market", placement_codes)
+        self.assertIn("event-identity-unresolved-existing-position", placement_codes)
+
+    def test_each_pre_market_guard_maps_to_its_stable_code(self):
+        duplicate_open = {"market_id": "market-100", "outcome": "Texas A&M", "status": "open", "stake_usd": 5}
+        protected_cash, risk_cash = self._policy()
+        protected_cash["sim_bankroll_usd"] = 4
+        protected_open, risk_open = self._policy()
+        protected_open["max_open_positions"] = 0
+        protected_packet, risk_packet = self._policy()
+        protected_packet["max_new_positions_per_cycle"] = 1
+        cycle_row = {"source_packet_id": self.packet["packet_id"], "status": "lost", "stake_usd": 5, "shares": 0}
+        protected_category, risk_category = self._policy()
+        risk_category["max_positions_per_category_per_cycle"] = 1
+        category_row = {"source_packet_id": self.packet["packet_id"], "category": "sports", "status": "won", "stake_usd": 5, "shares": 0}
+        protected_event, risk_event = self._policy()
+        risk_event["max_stake_per_event_usd"] = 5
+        event_row = {"event_id": "event-100", "status": "open", "stake_usd": 5, "market_id": "market-other"}
+        second_intent = valid_intent(self.packet, intent_id=SECOND_INTENT_ID, probability=0.62)
+        second_intent["outcome"] = self.intent["outcome"]
+        second_intent["rationale"] = self.intent["rationale"]
+        second_intent["category"] = self.intent["category"]
+        second_intent["estimated_probability"] = self.intent["estimated_probability"]
+        scenarios = [
+            ("duplicate-source-intent", {"intent": second_intent,
+             "ledger_rows": [{"source_intent_id": SECOND_INTENT_ID, "source_forecast_id": "forecast-dup",
+                              "status": "open", "stake_usd": 5, "market_id": "market-other"}],
+             "forecast_rows": [self._forecast_row(second_intent)]}),
+            ("duplicate-source-forecast", {"ledger_rows": [{"source_forecast_id": "forecast-100",
+             "status": "open", "stake_usd": 5, "market_id": "market-other"}]}),
+            ("duplicate-market-outcome", {"ledger_rows": [duplicate_open]}),
+            ("max-open-positions", {"protected": protected_open, "risk": risk_open}),
+            ("insufficient-cash", {"protected": protected_cash, "risk": risk_cash}),
+            ("packet-position-cap", {"protected": protected_packet, "risk": risk_packet, "ledger_rows": [cycle_row]}),
+            ("category-position-cap", {"protected": protected_category, "risk": risk_category, "ledger_rows": [category_row]}),
+            ("risk-cap-event", {"protected": protected_event, "risk": risk_event, "ledger_rows": [event_row]}),
+            ("forecast-provenance-invalid", {"forecast_rows": [dict(self._forecast_row(), note="other rationale")]}),
+        ]
+        for label, kwargs in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                code = self._code(pathlib.Path(temporary_directory), **kwargs)
+                self.assertEqual(code, label)
+
+    def test_each_live_market_guard_maps_to_its_stable_code(self):
+        scenarios = [
+            ("market-closed", {"market": self._market(closed=True)}),
+            ("too-close-to-resolution", {"market": self._market(end_date="2026-09-27T05:10:00Z")}),
+            ("outcome-token-invalid", {"tokens": {"Wake Forest": "token-wake"}}),
+            ("orderbook-unavailable", {"prices": (None, None)}),
+            ("entry-price-out-of-bounds", {"prices": (0.005, 0.01)}),
+            ("spread-too-wide", {"prices": (0.40, 0.52)}),
+            ("edge-below-threshold", {"prices": (0.50, 0.56)}),
+            ("event-identity-mismatch", {"event_rows": [{"id": "market-100", "events": [{"id": "event-other"}]}]}),
+        ]
+        for label, kwargs in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                code = self._code(pathlib.Path(temporary_directory), **kwargs)
+                self.assertEqual(code, label)
+
+    def test_gamma_market_lookup_failure_maps_to_market_data_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            code = self._code(
+                pathlib.Path(temporary_directory),
+                gamma_market_side_effect=OSError("gamma down"),
+            )
+        self.assertEqual(code, "market-data-unavailable")
+
+    def test_current_market_event_resolution_failure_code(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            code = self._code(
+                pathlib.Path(temporary_directory),
+                gamma_markets_side_effect=OSError("gamma down"),
+            )
+        self.assertEqual(code, "event-identity-unresolved-current-market")
+
+    def test_legacy_open_row_event_resolution_failure_distinct_code(self):
+        legacy_row = {"market_id": "legacy-market", "status": "open", "stake_usd": 5}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(ledger_core.pmapi, "gamma_market", return_value=self._market()), \
+                 patch.object(ledger_core.pmapi, "market_tokens", return_value={"Texas A&M": "token-texas"}), \
+                 patch.object(ledger_core.pmapi, "best_prices", return_value=(0.50, 0.52)):
+                # First gamma_markets call (candidate) succeeds; the legacy row
+                # resolution call fails.
+                code = self._code(
+                    pathlib.Path(temporary_directory),
+                    ledger_rows=[legacy_row],
+                    gamma_markets_side_effect=[
+                        [{"id": "market-100", "events": [{"id": "event-100"}]}],
+                        OSError("gamma down"),
+                    ],
+                )
+        self.assertEqual(code, "event-identity-unresolved-existing-position")
+
+    def test_legacy_row_resolving_to_candidate_event_hits_risk_cap_code(self):
+        legacy_row = {"market_id": "legacy-market", "status": "open", "stake_usd": 6}
+        event_rows = [
+            {"id": "market-100", "events": [{"id": "event-100"}]},
+            {"id": "legacy-market", "events": [{"id": "event-100"}]},
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            code = self._code(
+                pathlib.Path(temporary_directory),
+                ledger_rows=[legacy_row],
+                gamma_markets_side_effect=[event_rows[:1], event_rows[1:]],
+            )
+        self.assertEqual(code, "risk-cap-event")
+
+    def test_below_cap_existing_event_exposure_still_places_normally(self):
+        legacy_row = {"event_id": "event-100", "status": "open", "stake_usd": 5, "market_id": "market-other"}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result, _ledger_path, _forecast_path, _public = self._place(
+                pathlib.Path(temporary_directory), ledger_rows=[legacy_row]
+            )
+            rows = [json.loads(line) for line in _ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(rows), 2)
+
+    def test_ledger_write_failure_code(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(ledger_core, "_atomic_append_source_record", side_effect=OSError("disk full")):
+                code = self._code(pathlib.Path(temporary_directory))
+        self.assertEqual(code, "ledger-write-failed")
+
+    def test_unexpected_internal_error_maps_only_to_unclassified(self):
+        from manus import paper_apply as apply_core
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            context = {"intent": self.intent}
+            for arbitrary in (
+                RuntimeError("/secret/path leaked key=SK-FAKE-000 body=<html>"),
+                ValueError("multi\nline\nstack-like\n  File \"x.py\", line 1"),
+                OSError(13, "denied"),
+                12345,
+            ):
+                with self.subTest(value=type(arbitrary).__name__):
+                    self.assertEqual(apply_core._bounded_rejection_code(arbitrary), "unclassified")
+        # End-to-end: an unexpected RuntimeError inside the placement path
+        # surfaces with code None at the guardian boundary (no trusted code),
+        # and paper_apply maps that to the bounded unclassified code.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(
+                ledger_core,
+                "_read_manus_policy",
+                side_effect=RuntimeError("/secret/path leaked key=SK-FAKE-000 body=<html>"),
+            ):
+                code = self._code(pathlib.Path(temporary_directory))
+        self.assertIsNone(code)
+        self.assertEqual(apply_core._bounded_rejection_code(
+            apply_core.PaperApplyError("Guarded PAPER placement rejected: x", code=None)
+        ), "unclassified")

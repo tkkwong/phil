@@ -733,7 +733,12 @@ def _validate_budget(budget: Any, ceiling: Any) -> tuple[int, int | None]:
     return budget, ceiling
 
 
-def _summary(cycle: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+def _summary(cycle: dict[str, Any], *, dry_run: bool = False, rejection_code: str | None = None) -> dict[str, Any]:
+    # The persisted cycle schema intentionally stays unchanged: the application
+    # receipt is the authoritative rejection source, and the runner summary is
+    # a per-invocation view of that bounded code. safe_reason is not overloaded.
+    if rejection_code is not None and rejection_code not in paper_apply.REJECTION_CODES:
+        rejection_code = "unclassified"
     return {
         "mode": "PAPER",
         "dry_run": dry_run,
@@ -751,6 +756,7 @@ def _summary(cycle: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
         "forecasts_recorded": int(cycle["forecast_id"] is not None),
         "placements_recorded": int(cycle["placement_id"] is not None),
         "safe_reason": cycle["safe_reason"],
+        "rejection_code": rejection_code,
     }
 
 
@@ -795,6 +801,21 @@ def _dry_run(
 
 def _require_result_identifier(value: Any, label: str, *, nullable: bool = False) -> str | None:
     return _require_identifier(value, label, nullable=nullable)
+
+
+def _bounded_rejection_code(application: Any) -> str | None:
+    """Validate one bounded rejection code from a durable application result.
+
+    Only the closed paper_apply vocabulary is accepted; any other value —
+    including arbitrary text — maps to ``unclassified``. This mirrors, never
+    weakens, the receipt-side validation and adds no runner authority.
+    """
+    code = application.get("rejection_code") if isinstance(application, dict) else None
+    if code is None:
+        return None
+    if isinstance(code, str) and code in paper_apply.REJECTION_CODES:
+        return code
+    return "unclassified"
 
 
 def _terminal_application_update(application: Any) -> tuple[str, str, str | None, str | None, str]:
@@ -968,6 +989,7 @@ def run(
                 cycle = _persist_cycle(root, cycle, _now)
                 return _summary(cycle)
             terminal_state, reason, forecast_id, placement_id, application_state = _terminal_application_update(application)
+            rejection_code = _bounded_rejection_code(application)
             cycle = dict(cycle)
             cycle.update(
                 {
@@ -979,7 +1001,7 @@ def run(
                 }
             )
             cycle = _persist_cycle(root, cycle, _now)
-            return _summary(cycle)
+            return _summary(cycle, rejection_code=rejection_code)
     except paper_locks.LockUnavailableError:
         raise PaperRunnerError("PAPER cycle is already running; no mutation was performed") from None
     except paper_locks.LockError:
