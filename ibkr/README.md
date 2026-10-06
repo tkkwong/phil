@@ -42,6 +42,29 @@ third-party wrapper (ib_insync / ib_async) is introduced. The `ibapi`
 import is deferred so importing the package has no side effects and the
 cloud test suite never requires the dependency.
 
+The supported operator installation path is the Python package from the
+official IBKR TWS API distribution (the downloaded official source,
+installed with local pip/install tooling). Do not install the broker API
+from PyPI.
+
+## Official Python connection lifecycle (Patch 5F-1a)
+
+The transport uses the official Python API connection sequence exactly:
+
+    client.connect(host, port, clientId)  # creates and starts the reader
+    client.run()                          # one bounded daemon thread per
+                                          # connected transport processes
+                                          # the incoming message queue and
+                                          # invokes EWrapper callbacks
+    client.disconnect()                   # ends the session and the loop
+
+A successful TCP connect alone is not sufficient: every adapter read waits,
+bounded, for the official initial-handshake callback (`nextValidId`) to
+arrive through the message-processing path before issuing requests. That
+payload is discarded; it is a readiness indication only and never an
+order-id authority. Readiness failure disconnects and fails closed with a
+bounded diagnostic; there is no reconnect loop and no retry storm.
+
 ## Public surface (`ibkr.adapter.ReadonlyIbkrAdapter`)
 
 - `status()` — snapshot: connection, environment, masked account, base

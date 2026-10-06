@@ -1,14 +1,30 @@
-"""Official TWS / IB Gateway read-only transport (Patch 5F-1).
+"""Official TWS / IB Gateway read-only transport (Patch 5F-1a).
 
-Uses the official IBKR TWS API client (``ibapi``) synchronously with a
-short-lived EClient connection and no reader thread beyond the bounded
-request loop. The ``ibapi`` import is deferred to :meth:`TwsTransport.connect`
-so that importing this module performs no work and has no side effects.
+Uses the official IBKR Python TWS API client (``ibapi``) with the official
+Python connection lifecycle:
+
+    client.connect(host, port, clientId)   # creates and starts the reader
+    client.run()                           # processes the incoming message
+                                           # queue and invokes EWrapper
+                                           # callbacks (one bounded daemon
+                                           # thread per connected transport)
+    client.disconnect()                    # ends the session and the loop
+
+The ``ibapi`` import is deferred to :meth:`TwsTransport.connect` so that
+importing this module performs no work and has no side effects: no network,
+no threads, no subprocesses, no credential access, no files created.
 
 CRITICAL BOUNDARY: the underlying ``ibapi.EClient`` exposes order-mutation
 methods (``placeOrder``, ``cancelOrder``, ...). It is held only in a private
 attribute of this private class and is never returned, exposed, or wrapped.
 The public adapter never receives this object.
+
+READINESS: a successful TCP connect alone is not sufficient. The transport
+waits, bounded, for the official initial-handshake callback
+(:meth:`_CollectingWrapper.nextValidId`) to arrive through the run/message
+processing path before any read request is issued. The nextValidId payload
+is discarded; it is a readiness indication only and never an order-id
+authority. No Order object is ever constructed anywhere in this module.
 """
 from __future__ import annotations
 
@@ -17,13 +33,22 @@ from typing import Any
 
 from ibkr.transport import ReadonlyTransport, TransportError
 
+# Bounded shutdown budget for the message-processing thread.
+_RUN_JOIN_TIMEOUT_SECONDS = 5.0
+
 
 class _CollectingWrapper:
-    """Bounded request collector for synchronous read-only snapshots."""
+    """Bounded request collector for read-only snapshots.
+
+    Mirrors the official ``EWrapper`` callback surface used by this
+    transport. Callbacks are invoked by the message-processing run loop,
+    never directly by this transport's own code.
+    """
 
     def __init__(self, timeout: float) -> None:
         self.timeout = timeout
         self.done = threading.Event()
+        self.ready = threading.Event()
         self.error: str | None = None
         self.accounts: list[str] = []
         self.account_summary: dict[str, Any] = {}
@@ -39,22 +64,47 @@ class _CollectingWrapper:
 
     # -- EWrapper callbacks (read-only data collection only) ----------------
 
-    def managedAccounts(self, accountsList: str) -> None:  # noqa: N802 (ibapi naming)
+    def nextValidId(self, orderId: int) -> None:  # noqa: N802 (ibapi naming)
+        """Official initial-handshake callback; readiness signal ONLY.
+
+        The delivered identifier is deliberately discarded: it is never
+        stored as an order id and never authorizes any order action.
+        """
+        del orderId
+        self.ready.set()
+
+    def managedAccounts(self, accountsList: str) -> None:  # noqa: N802
         self.accounts = [item for item in accountsList.split(",") if item]
         self.done.set()
 
-    def error(self, reqId: Any, errorCode: int, errorString: str) -> None:  # noqa: N802
-        # Keep only the numeric category; discard the broker text entirely.
-        del errorString
-        if errorCode in (502, 504, 1100, 1102, 1300):
+    def error(self, reqId: Any, errorCode: int, errorString: str, *args: Any) -> None:  # noqa: N802
+        """Bounded error categorization; broker text always discarded.
+
+        Tolerates both the classic and the 10.x extended signature
+        (``advancedOrderRejectJson`` trailing argument). Notifications with
+        negative ids (e.g. 2104/2106 farm notices) are not failures.
+        """
+        del errorString, args
+        if errorCode in (502, 504, 1100, 1101, 1102, 1300):
             self.error = "connection"
             self.done.set()
+            self.ready.set()
         elif errorCode in (508, 510, 511, 540, 542):
             self.error = "session"
             self.done.set()
+            self.ready.set()
+
+    def connectionClosed(self) -> None:  # noqa: N802
+        """Official callback when the socket is closed by the peer/API."""
+        self.error = "connection"
+        self.done.set()
+        self.ready.set()
 
     def accountSummary(self, _req: int, account: str, tag: str, value: str, _currency: str) -> None:  # noqa: N802
         self.account_summary.setdefault(account, {})[tag] = value
+
+    def accountSummaryEnd(self, _req: int) -> None:  # noqa: N802
+        self.done.set()
 
     def position(self, account: str, contract: Any, pos: float, avgCost: float) -> None:  # noqa: N802
         self.positions.append(
@@ -74,6 +124,8 @@ class _CollectingWrapper:
         self.done.set()
 
     def openOrder(self, _orderId: int, contract: Any, order: Any, _orderState: Any) -> None:  # noqa: N802
+        # Read-only observation of an existing order object delivered by the
+        # broker; no Order is ever constructed by this module.
         self.open_orders.append(
             {
                 "order_id": getattr(order, "orderId", _orderId),
@@ -143,9 +195,16 @@ class TwsTransport(ReadonlyTransport):
         self._config = config
         self._client: Any | None = None
         self._wrapper: _CollectingWrapper | None = None
+        self._run_thread: threading.Thread | None = None
+
+    # -- lifecycle -------------------------------------------------------------
 
     def connect(self, config: dict[str, Any]) -> None:
         self._config = config
+        if self._client is not None:
+            # Reconnect without an intervening disconnect is not supported;
+            # treat as already-connected state (no duplicate run loops).
+            return
         # Deferred official import: no side effects at module import time.
         try:
             from ibapi import client as ibapi_client  # type: ignore
@@ -160,33 +219,81 @@ class TwsTransport(ReadonlyTransport):
         self._wrapper = _BoundWrapper(timeout)
         self._client = ibapi_client.EClient(self._wrapper)
         try:
-            self._client.eConnect(config["host"], int(config["port"]), int(config["client_id"]))
+            # Official Python API connection: creates and starts the reader.
+            self._client.connect(
+                config["host"], int(config["port"]), int(config["client_id"])
+            )
         except Exception as exc:
-            raise TransportError("eConnect failed") from exc
-        if not self._client.isConnected():
-            raise TransportError("connection is not established")
-
-    def disconnect(self) -> None:
-        if self._client is not None:
-            try:
-                self._client.eDisconnect()
-            except Exception:  # pragma: no cover - best effort only
-                pass
             self._client = None
             self._wrapper = None
+            raise TransportError("connect failed") from exc
+        if not self._client.isConnected():
+            self._client = None
+            self._wrapper = None
+            raise TransportError("connection is not established")
+        # Start exactly one bounded message-processing loop. Callbacks can
+        # only arrive through this path; no thread exists before connect().
+        self._run_thread = threading.Thread(
+            target=self._process_messages,
+            name="phil-ibkr-readonly-messages",
+            daemon=True,
+        )
+        self._run_thread.start()
+        try:
+            self._await_readiness()
+        except TransportError:
+            self.disconnect()
+            raise
+
+    def _process_messages(self) -> None:
+        """Official message-processing loop (bounded daemon thread)."""
+        assert self._client is not None
+        try:
+            self._client.run()
+        except Exception:
+            # The loop died; surface a bounded failure state.
+            if self._wrapper is not None:
+                self._wrapper.error = "connection"
+                self._wrapper.done.set()
+                self._wrapper.ready.set()
+
+    def _await_readiness(self) -> None:
+        """Wait, bounded, for the official handshake callback."""
+        assert self._wrapper is not None and self._client is not None
+        if not self._wrapper.ready.wait(self._wrapper.timeout):
+            raise TransportError("connection readiness timed out")
+        if self._wrapper.error is not None:
+            raise TransportError("connection error reported")
+
+    def disconnect(self) -> None:
+        thread = self._run_thread
+        self._run_thread = None
+        if self._client is not None:
+            try:
+                # Official Python API disconnect; ends the run() loop.
+                self._client.disconnect()
+            except Exception:  # pragma: no cover - best effort only
+                pass
+        if thread is not None and thread.is_alive():
+            thread.join(_RUN_JOIN_TIMEOUT_SECONDS)
+        self._client = None
+        self._wrapper = None
 
     # -- internal helpers ----------------------------------------------------
 
+    def _shutdown_on_error(self) -> None:
+        self.disconnect()
+
     def _wait(self) -> None:
-        assert self._wrapper is not None and self._client is not None
+        assert self._wrapper is not None
         if not self._wrapper.done.wait(self._wrapper.timeout):
-            self._client.eDisconnect()
+            self._shutdown_on_error()
             raise TransportError("read-only request timed out")
         if self._wrapper.error == "connection":
-            self._client.eDisconnect()
+            self._shutdown_on_error()
             raise TransportError("connection error reported")
         if self._wrapper.error == "session":
-            self._client.eDisconnect()
+            self._shutdown_on_error()
             raise TransportError("session error reported")
 
     def _require_connected(self) -> tuple[Any, _CollectingWrapper]:
@@ -197,22 +304,22 @@ class TwsTransport(ReadonlyTransport):
     # -- read-only operations --------------------------------------------------
 
     def managed_accounts(self) -> list[str]:
-        _client, wrapper = self._require_connected()
+        client, wrapper = self._require_connected()
         wrapper.done.clear()
         wrapper.accounts = []
         wrapper.error = None
-        _client.reqManagedAccts()
+        client.reqManagedAccts()
         self._wait()
         return list(wrapper.accounts)
 
     def account_summary(self, account_id: str) -> dict[str, Any]:
-        _client, wrapper = self._require_connected()
+        client, wrapper = self._require_connected()
         request_id = wrapper.next_id()
         wrapper.done.clear()
         wrapper.account_summary = {}
         wrapper.error = None
         tags = "AccountType,NetLiquidation,AvailableFunds,BuyingPower,Currency"
-        _client.reqAccountSummary(request_id, "All", tags)
+        client.reqAccountSummary(request_id, "All", tags)
         self._wait()
         summary = wrapper.account_summary.get(account_id)
         if summary is None:

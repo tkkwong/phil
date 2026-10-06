@@ -17,6 +17,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -31,9 +34,14 @@ from ibkr.adapter import ADAPTER_VERSION, ReadonlyIbkrAdapter, mask_account  # n
 from ibkr.config import AdapterConfigError  # noqa: E402
 from ibkr.readonly import build_parser, main  # noqa: E402
 from ibkr.transport import TransportError, default_transport_factory  # noqa: E402
+from ibkr.transport_tws import _CollectingWrapper  # noqa: E402
 
 NOW = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.timezone.utc)
 EXPECTED_ACCOUNT = "DU0000011"
+
+
+def config_host():
+    return base_config()["host"]
 
 
 def base_config(**changes):
@@ -799,6 +807,471 @@ class TransportFactoryTests(AdapterTestBase):
                 transport.connect(config)
         finally:
             transport.disconnect()
+
+
+class _PythonShapedEClient:
+    """Fake modeling the official Python ibapi 10.50.2 EClient surface.
+
+    Deliberately exposes connect/run/disconnect/isConnected and NOTHING
+    named eConnect/eDisconnect, mirroring the operator's verified
+    installed API. Callbacks occur only through the run() path.
+    """
+
+    def __init__(self, wrapper, *, script=None, readiness_delay=0.05):
+        self.wrapper = wrapper
+        self.script = script or {}
+        self.readiness_delay = readiness_delay
+        self.socket_connected = False
+        self.run_entered = threading.Event()
+        self.run_should_exit = threading.Event()
+        self.requests: list[tuple] = []
+        self.connect_args: tuple | None = None
+
+    # official Python surface ------------------------------------------------
+
+    def connect(self, host, port, clientId):
+        self.connect_args = (host, port, clientId)
+        self.socket_connected = True
+
+    def isConnected(self):
+        return self.socket_connected
+
+    def run(self):
+        self.run_entered.set()
+        # The initial handshake callback arrives only through the run path.
+        self.readiness_delay and time.sleep(self.readiness_delay)
+        self.wrapper.nextValidId(19)  # payload discarded by the wrapper
+        # Serve scripted read requests until disconnect() flips the state.
+        while self.socket_connected and not self.run_should_exit.is_set():
+            self._serve_scripted_requests()
+            if self.run_should_exit.wait(0.01):
+                break
+
+    def disconnect(self):
+        self.socket_connected = False
+        self.run_should_exit.set()
+
+    # scripted request service (stand-in for the broker) ---------------------
+
+    def _serve_scripted_requests(self):
+        for name, args in list(self.script.get("requests", [])):
+            self.requests.append((name, args))
+        self.script["requests"] = []
+        for name, args in self.requests:
+            handler = self.script.get(name)
+            if handler:
+                handler(self.wrapper, *args)
+
+    # request surface used by the transport (verified names only) ------------
+
+    def reqManagedAccts(self):
+        self.requests.append(("reqManagedAccts", ()))
+
+    def reqAccountSummary(self, req_id, group, tags):
+        self.requests.append(("reqAccountSummary", (req_id, group, tags)))
+
+    def reqPositions(self):
+        self.requests.append(("reqPositions", ()))
+
+    def reqOpenOrders(self):
+        self.requests.append(("reqOpenOrders", ()))
+
+    def reqExecutions(self, req_id, _filter):
+        self.requests.append(("reqExecutions", (req_id,)))
+
+    def reqContractDetails(self, req_id, _contract):
+        self.requests.append(("reqContractDetails", (req_id,)))
+
+
+def _python_script(**handlers):
+    return dict(handlers)
+
+
+def _serve_managed_accounts(wrapper):
+    wrapper.managedAccounts("DU0000011")
+    wrapper.done.set()
+
+
+def _serve_summary(wrapper, req_id, _group, _tags):
+    for tag, value in (
+        ("AccountType", "PAPER"), ("NetLiquidation", "12345.67"),
+        ("AvailableFunds", "10000.00"), ("BuyingPower", "20000.00"),
+        ("Currency", "CAD"),
+    ):
+        wrapper.accountSummary(req_id, "DU0000011", tag, value, "CAD")
+    wrapper.accountSummaryEnd(req_id)
+    wrapper.done.set()
+
+
+def _serve_positions(wrapper):
+    class _C:
+        conId, symbol, secType, exchange, currency = 111, "AAA", "STK", "SMART", "CAD"
+    wrapper.position("DU0000011", _C(), 1.0, 2.0)
+    wrapper.positionEnd()
+    wrapper.done.set()
+
+
+def _serve_open_orders(wrapper):
+    class _C:
+        conId, symbol, secType, exchange, currency = 111, "AAA", "STK", "SMART", "CAD"
+    class _O:
+        orderId, action, totalQuantity, cashQty, lmtPrice, orderType = 7, "BUY", 1, 0, 2.0, "LMT"
+    class _S:
+        status = "Submitted"
+    wrapper.openOrder(7, _C(), _O(), _S())
+    wrapper.openOrderEnd()
+    wrapper.done.set()
+
+
+def _python_transport(**script):
+    """Build a transport whose client is Python-API-shaped (no eConnect)."""
+    config = base_config()
+    holder = {}
+    from ibkr.transport_tws import TwsTransport
+
+    transport = TwsTransport(config)
+    # connect() builds its own client; patch the deferred ibapi imports
+    # through connect()'s module seam and attach the scripted handlers to
+    # every constructed client.
+    import ibkr.transport_tws as module
+
+    fake_client_module = types.SimpleNamespace()
+    fake_client_module.EClient = _PythonShapedEClient
+    fake_wrapper_module = types.SimpleNamespace()
+    fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+    # The wrapper instance must be the one the fake client holds.
+    original_client_init = _PythonShapedEClient.__init__
+
+    def patched_client_init(self, wrapper, **kwargs):
+        wrapper.ready.clear()  # simulate: callbacks only via run path
+        original_client_init(self, wrapper, **kwargs)
+        self.script = _python_script(
+            reqManagedAccts=_serve_managed_accounts,
+            reqAccountSummary=_serve_summary,
+            reqPositions=_serve_positions,
+            reqOpenOrders=_serve_open_orders,
+            **script,
+        )
+        holder["client"] = self
+
+    _PythonShapedEClient.__init__ = patched_client_init
+    try:
+        with patch.dict(sys.modules, {
+            "ibapi": types.ModuleType("ibapi"),
+            "ibapi.client": fake_client_module,
+            "ibapi.wrapper": fake_wrapper_module,
+            "ibapi.contract": types.ModuleType("ibapi.contract"),
+        }):
+            transport.connect(config)
+    finally:
+        _PythonShapedEClient.__init__ = original_client_init
+    return transport, holder["client"]
+
+
+class PythonLifecycleTests(AdapterTestBase):
+    """5F-1a regressions modeling the real Python ibapi interface."""
+
+    def setUp(self):
+        super().setUp()
+        # NOTE: _python_transport patches ibapi modules per call; these tests
+        # use it directly.
+
+    def test_connect_uses_official_python_connect_without_econnect(self):
+        transport, client = _python_transport()
+        try:
+            self.assertEqual(client.connect_args, (config_host(), 7497, 19))
+            source = inspect.getsource(transport.connect)
+            self.assertNotIn("eConnect", source)
+            self.assertIn(".connect(", source)
+        finally:
+            transport.disconnect()
+
+    def test_run_loop_thread_starts_after_connect_and_only_once(self):
+        transport, _client = _python_transport()
+        try:
+            threads = [
+                thread for thread in threading.enumerate()
+                if thread.name == "phil-ibkr-readonly-messages"
+            ]
+            self.assertEqual(len(threads), 1)
+            self.assertTrue(threads[0].is_alive())
+        finally:
+            transport.disconnect()
+        threads = [
+            thread for thread in threading.enumerate()
+            if thread.name == "phil-ibkr-readonly-messages"
+        ]
+        self.assertEqual(len(threads), 0)
+
+    def test_no_run_loop_at_import_or_before_connect(self):
+        before = [
+            thread for thread in threading.enumerate()
+            if thread.name == "phil-ibkr-readonly-messages"
+        ]
+        self.assertEqual(before, [])
+
+    def test_reads_wait_for_readiness_signal(self):
+        transport, client = _python_transport()
+        try:
+            self.assertTrue(client.run_entered.wait(2))
+            accounts = transport.managed_accounts()
+            self.assertEqual(accounts, [EXPECTED_ACCOUNT])
+        finally:
+            transport.disconnect()
+
+    def test_readiness_timeout_fails_closed_and_disconnects(self):
+        """A broker that never delivers the handshake callback must time
+        out bounded, fail closed, and leave no live client behind."""
+        class _SilentClient(_PythonShapedEClient):
+            def run(self):
+                self.run_entered.set()
+                # Deliberately never call nextValidId on the wrapper.
+                while self.socket_connected and not self.run_should_exit.is_set():
+                    if self.run_should_exit.wait(0.01):
+                        break
+
+        import ibkr.transport_tws as module
+        fake_client_module = types.SimpleNamespace()
+        fake_client_module.EClient = _SilentClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+        config = base_config(read_only_timeout_seconds=0.1)
+        from ibkr.transport_tws import TwsTransport
+        transport = TwsTransport(config)
+        with patch.dict(sys.modules, {
+            "ibapi": types.ModuleType("ibapi"),
+            "ibapi.client": fake_client_module,
+            "ibapi.wrapper": fake_wrapper_module,
+        }):
+            started = time.monotonic()
+            with self.assertRaises(TransportError):
+                transport.connect(config)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        self.assertIsNone(transport._client)
+        self.assertFalse(
+            any(t.name == "phil-ibkr-readonly-messages" for t in threading.enumerate())
+        )
+
+    def test_readiness_timeout_disconnects_bounded(self):
+        # Direct unit: _await_readiness with a never-set readiness event and
+        # a tiny wrapper timeout.
+        from ibkr.transport_tws import TwsTransport, _RUN_JOIN_TIMEOUT_SECONDS
+        transport = TwsTransport(base_config(read_only_timeout_seconds=0.05))
+        transport._wrapper = _CollectingWrapper(timeout=0.05)
+        transport._client = _PythonShapedEClient(transport._wrapper)
+        started = time.monotonic()
+        with self.assertRaises(TransportError):
+            transport._await_readiness()
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        transport.disconnect()
+
+    def test_connect_exception_fails_closed(self):
+        import ibkr.transport_tws as module
+        fake_client_module = types.SimpleNamespace()
+
+        class _BrokenClient:
+            def __init__(self, wrapper):
+                self.wrapper = wrapper
+
+            def connect(self, *args, **kwargs):
+                raise OSError("boom")
+
+        fake_client_module.EClient = _BrokenClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+        config = base_config()
+        from ibkr.transport_tws import TwsTransport
+        transport = TwsTransport(config)
+        with patch.dict(sys.modules, {
+            "ibapi": types.ModuleType("ibapi"),
+            "ibapi.client": fake_client_module,
+            "ibapi.wrapper": fake_wrapper_module,
+        }):
+            with self.assertRaises(TransportError):
+                transport.connect(config)
+        self.assertIsNone(transport._client)
+
+    def test_run_loop_failure_fails_closed(self):
+        class _RunFailureClient(_PythonShapedEClient):
+            def run(self):
+                self.run_entered.set()
+                raise RuntimeError("reader died")
+
+        import ibkr.transport_tws as module
+        fake_client_module = types.SimpleNamespace()
+        fake_client_module.EClient = _RunFailureClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+        config = base_config()
+        from ibkr.transport_tws import TwsTransport, _CollectingWrapper
+        transport = TwsTransport(config)
+        with patch.dict(sys.modules, {
+            "ibapi": types.ModuleType("ibapi"),
+            "ibapi.client": fake_client_module,
+            "ibapi.wrapper": fake_wrapper_module,
+        }):
+            started = time.monotonic()
+            with self.assertRaises(TransportError):
+                # A run loop that dies during startup means readiness never
+                # arrives through the processing path, so connect() itself
+                # must fail closed with the session cleaned up.
+                transport.connect(config)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        self.assertIsNone(transport._client)
+
+    def test_disconnect_stops_connection_bounded(self):
+        transport, client = _python_transport()
+        transport.disconnect()
+        self.assertFalse(client.socket_connected)
+        self.assertIsNone(transport._client)
+        self.assertIsNone(transport._wrapper)
+        # Bounded join: no orphaned non-daemon thread prevents CLI exit.
+        self.assertFalse(
+            any(t.name == "phil-ibkr-readonly-messages" for t in threading.enumerate())
+        )
+
+    def test_duplicate_connect_does_not_start_second_run_loop(self):
+        transport, _client = _python_transport()
+        try:
+            config = base_config()
+            transport.connect(config)  # second connect on a live transport
+            threads = [
+                t for t in threading.enumerate()
+                if t.name == "phil-ibkr-readonly-messages"
+            ]
+            self.assertEqual(len(threads), 1)
+        finally:
+            transport.disconnect()
+
+    def test_no_mutation_method_in_python_shaped_client_path(self):
+        transport, client = _python_transport()
+        try:
+            transport.managed_accounts()
+            transport.account_summary(EXPECTED_ACCOUNT)
+            transport.positions()
+            transport.open_orders()
+        finally:
+            transport.disconnect()
+        names = {name for name, _args in client.requests}
+        self.assertEqual(
+            names,
+            {"reqManagedAccts", "reqAccountSummary", "reqPositions", "reqOpenOrders"},
+        )
+        self.assertFalse(hasattr(client, "eConnect"))
+
+    def test_no_order_object_constructed_in_transport_source(self):
+        source = (REPOSITORY_ROOT / "ibkr" / "transport_tws.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                target = node.func
+                name = getattr(target, "attr", getattr(target, "id", ""))
+                self.assertNotEqual(str(name), "Order")
+                self.assertNotEqual(str(name), "Order.__init__")
+        # No ibapi.order import anywhere in the module (AST level).
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotEqual(node.module or "", "ibapi.order")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(alias.name.startswith("ibapi.order"))
+        # No mutation invocation appears as a call target (AST level, so
+        # documentation text mentioning these names is not a defect).
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                target = node.func
+                name = getattr(target, "attr", getattr(target, "id", ""))
+                self.assertNotIn(str(name), ("placeOrder", "cancelOrder", "exerciseOptions"))
+
+    def test_adapter_public_surface_unchanged_after_lifecycle_fix(self):
+        public = [
+            name for name in dir(ReadonlyIbkrAdapter)
+            if not name.startswith("_") and name not in dir(unittest.TestCase)
+        ]
+        self.assertEqual(
+            sorted(public),
+            sorted([
+                "account_summary", "close", "executions", "interface",
+                "lookup_contract", "open_orders", "positions", "status",
+            ]),
+        )
+
+    def test_adapter_read_with_python_shaped_client_end_to_end(self):
+        config = base_config()
+        from ibkr.adapter import ReadonlyIbkrAdapter
+        from ibkr.transport_tws import TwsTransport, _CollectingWrapper
+        import ibkr.transport_tws as module
+
+        fake_client_module = types.SimpleNamespace()
+        fake_client_module.EClient = _PythonShapedEClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+
+        holder = {}
+        original_client_init = _PythonShapedEClient.__init__
+
+        def patched_client_init(self, wrapper, **kwargs):
+            wrapper.ready.clear()
+            original_client_init(self, wrapper, **kwargs)
+            self.script = _python_script(
+                reqManagedAccts=_serve_managed_accounts,
+                reqAccountSummary=_serve_summary,
+                reqPositions=_serve_positions,
+                reqOpenOrders=_serve_open_orders,
+            )
+            holder["client"] = self
+
+        _PythonShapedEClient.__init__ = patched_client_init
+        adapter = ReadonlyIbkrAdapter(
+            config,
+            _transport_factory=lambda _c: TwsTransport(config),
+            _now=lambda: self.now,
+        )
+        try:
+            with patch.dict(sys.modules, {
+                "ibapi": types.ModuleType("ibapi"),
+                "ibapi.client": fake_client_module,
+                "ibapi.wrapper": fake_wrapper_module,
+                "ibapi.contract": types.ModuleType("ibapi.contract"),
+            }):
+                document = adapter.status()
+            self.assertTrue(document["connected"])
+            self.assertTrue(document["account_match"])
+            self.assertEqual(document["base_currency"], "CAD")
+            self.assertEqual(document["positions_count"], 1)
+            self.assertEqual(document["open_orders_count"], 1)
+            self.assertIsNone(document["diagnostic_code"])
+            self.assertNotIn(EXPECTED_ACCOUNT, json.dumps(document))
+        finally:
+            adapter.close()
+            _PythonShapedEClient.__init__ = original_client_init
+
+    def test_next_valid_id_payload_is_discarded(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        wrapper.nextValidId(12345678)
+        self.assertTrue(wrapper.ready.is_set())
+        # The payload is not retained anywhere on the wrapper.
+        self.assertNotIn(12345678, vars(wrapper).values())
+
+    def test_isolation_and_forbidlists_unchanged(self):
+        # Protected modules must not import ibkr; forbidlists unchanged.
+        for relative in ("manus/research_transport.py", "manus/paper_runner.py",
+                         "manus/paper_apply.py", "manus/scheduled_paper.py"):
+            tree = ast.parse((REPOSITORY_ROOT / relative).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertFalse(alias.name.startswith("ibkr"), relative)
+                elif isinstance(node, ast.ImportFrom):
+                    self.assertFalse((node.module or "").startswith("ibkr"), relative)
+        self.assertIn("interactivebrokers",
+                      (REPOSITORY_ROOT / "manus/intent_validator.py").read_text(encoding="utf-8"))
+
+    def test_journals_unchanged_after_lifecycle_tests(self):
+        self.assertEqual(self.journal_hashes(), self.journal_hashes())
 
 
 if __name__ == "__main__":
