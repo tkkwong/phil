@@ -487,3 +487,23 @@ or creates scheduler retry behavior. Fixed-path/reparse checks and locks are
 same-Windows-identity operational controls, not a hard barrier against
 arbitrary processes under that identity; legacy `loop.sh` must not run
 concurrently with guarded PAPER work.
+
+## Patch 5F-1: fail-closed IBKR read-only adapter
+
+`ibkr/` is a strictly read-only infrastructure discovery boundary. It can never submit, modify, replace, or cancel an order, exercise a contract, move funds, or change broker configuration, and it has no LIVE or PAPER arming capability. Read-only means read-only. The adapter uses the official IBKR TWS / IB Gateway Python API (`ibapi`), chosen over the Client Portal Web API for unattended Windows operation with a long-lived session, reliable reconnect recovery, complete account, position, order, execution, and contract visibility, and the eventual PAPER execution paths behind separate hard controls. No third-party wrapper is introduced. The `ibapi` import is deferred to connect time so importing the package performs no work and the cloud test suite never requires the dependency.
+
+### Public surface and mutation impossibility
+
+The only public surface is `ibkr.adapter.ReadonlyIbkrAdapter`: `status`, `account_summary`, `positions`, `open_orders`, `executions`, `lookup_contract`, `interface`, `close`, and context-manager support. The class exposes no order mutating method of any kind, the mutation capable official client is held only in a name mangled private attribute of the private transport and is never returned by any public member, and a regression test pins the public surface to exactly that closed set. `lookup_contract` performs read-only contract discovery only: zero matches raise `contract-not-found`, ambiguous matches raise `contract-ambiguous`, malformed responses raise `invalid-broker-response`, and no Polymarket to IBKR mapping is performed and no order object is ever constructed.
+
+### Operator configuration and fail-closed behavior
+
+Configuration is operator owned and never committed. It resolves from `PHIL_IBKR_CONFIG`, then `config/ibkr.local.json` (gitignored), then `~/.config/phil/ibkr.json`, and requires `expected_account_id`, `environment` (`PAPER` or `LIVE`), `host`, `port`, and `client_id`. Missing, malformed, unknown field, missing field, ambiguous environment, or invalid numeric configurations fail closed before any connection attempt. Every read path verifies the single connected account against the allowlist and fails closed on mismatch (`unexpected-account`), ambiguity (`multiple-accounts`), or an empty account list (`session-unavailable`), closing the session first. Infrastructure and configuration failures surface as bounded diagnostic codes; broker exception text is discarded, never logged or persisted, and account identifiers are always masked (last four characters). No retry policy is introduced.
+
+### Diagnostics and CLI
+
+Diagnostics follow the Patch 5E-5a closed vocabulary: `not-configured`, `connection-unavailable`, `session-unavailable`, `unexpected-account`, `multiple-accounts`, `environment-ambiguous`, `unsupported-environment`, `broker-data-unavailable`, `invalid-broker-response`, `contract-not-found`, `contract-ambiguous`, `unclassified`, classified as `configuration`, `infrastructure`, `provenance`, or `internal`. `python -m ibkr.readonly status` prints compact canonical JSON with masked accounts, rejects mutation like options, and exits 1 with a bounded code on any fail closed condition. It creates no files and touches no journal or PAPER runtime state.
+
+### Architecture separation
+
+`ibkr/` is not imported by `manus.research_transport`, `manus.paper_runner`, `manus.paper_apply`, `manus.scheduled_paper`, or any scheduler administration surface, and it creates no route from the PAPER runner to IBKR. The existing IBKR forbidlists in those protected modules remain correct and unchanged. The planned gate order continues: this read-only boundary, then 5E-6 decision provenance, then 5F-2 exact instrument mapping, then later PAPER execution behind separate hard controls. Real money execution remains prohibited.
