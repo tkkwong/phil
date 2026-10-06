@@ -17,3 +17,6 @@ subagent-template.txt
 
 # Future agent-writable Manus runtime state
 runtime/manus/
+
+# Patch 5F-1: operator-owned local IBKR adapter configuration (never committed)
+config/ibkr.local.json
