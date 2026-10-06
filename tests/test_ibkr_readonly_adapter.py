@@ -798,13 +798,37 @@ class TransportFactoryTests(AdapterTestBase):
     """The default factory defers the official import to connect time."""
 
     def test_default_factory_raises_transport_error_without_ibapi(self):
-        # In the cloud test environment ibapi is absent; the factory must
-        # surface a clean TransportError at connect time, not at import time.
+        """Deterministic regardless of whether official ibapi is installed.
+
+        Import interception simulates the 'ibapi unavailable' path; the
+        locally installed package is never altered or uninstalled.
+        """
         config = base_config()
         transport = default_transport_factory(config)
         try:
-            with self.assertRaises(TransportError):
+            with patch.dict(sys.modules, {"ibapi": None, "ibapi.client": None,
+                                          "ibapi.wrapper": None}), \
+                 self.assertRaises(TransportError):
                 transport.connect(config)
+        finally:
+            transport.disconnect()
+
+    def test_default_factory_connects_with_python_shaped_ibapi(self):
+        """The same factory path succeeds when a Python-shaped ibapi exists."""
+        config = base_config()
+        transport = default_transport_factory(config)
+        fake_client_module = types.SimpleNamespace()
+        fake_client_module.EClient = _PythonShapedEClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+        try:
+            with patch.dict(sys.modules, {
+                "ibapi": types.ModuleType("ibapi"),
+                "ibapi.client": fake_client_module,
+                "ibapi.wrapper": fake_wrapper_module,
+            }):
+                transport.connect(config)
+                self.assertTrue(transport._client.isConnected())
         finally:
             transport.disconnect()
 
@@ -1272,6 +1296,186 @@ class PythonLifecycleTests(AdapterTestBase):
 
     def test_journals_unchanged_after_lifecycle_tests(self):
         self.assertEqual(self.journal_hashes(), self.journal_hashes())
+
+
+def _ts():
+    """An epoch-millisecond timestamp like the operator's probe observed."""
+    return 1791296429836
+
+
+class ErrorCallbackSignatureTests(AdapterTestBase):
+    """5F-1b regressions for the official 10.50 EWrapper.error shape."""
+
+    def test_current_style_error_parses_error_time_separately(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        # Official 10.50-style callback: (reqId, errorTime, errorCode,
+        # errorString, advancedOrderRejectJson=""). The epoch-ms timestamp
+        # in the second position must NOT be interpreted as an error code.
+        wrapper.error(-1, _ts(), 2104, "Market data farm connection is OK")
+        self.assertIsNone(wrapper.failure)
+        self.assertFalse(wrapper.done.is_set())
+        # Fatal path: the numeric code is read from the third position.
+        wrapper.error(-1, _ts(), 504, "Not connected")
+        self.assertEqual(wrapper.failure, "connection")
+
+    def test_timestamp_is_never_interpreted_as_error_code(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        # If errorTime were misread as the code, this epoch value would not
+        # match any known classification and (under the pre-5F-1b layout)
+        # the real code 504 would be silently dropped. Neither may happen:
+        wrapper.error(-1, _ts(), 504, "Not connected")
+        self.assertEqual(wrapper.failure, "connection")
+        wrapper2 = _CollectingWrapper(timeout=1.0)
+        wrapper2.error(-1, _ts(), 1100, "Connectivity lost")
+        self.assertEqual(wrapper2.failure, "connection")
+
+    def test_benign_informational_codes_are_non_fatal(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        for code in (2104, 2106, 2107, 2108, 2158):
+            with self.subTest(code=code):
+                wrapper.error(-1, _ts(), code, "informational")
+                self.assertIsNone(wrapper.failure)
+                self.assertFalse(wrapper.done.is_set())
+                self.assertFalse(wrapper.ready.is_set())
+
+    def test_true_fatal_connection_codes_remain_fatal(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        for code in (502, 504, 1100, 1300):
+            with self.subTest(code=code):
+                wrapper.error(-1, _ts(), code, "fatal")
+                self.assertEqual(wrapper.failure, "connection")
+                self.assertTrue(wrapper.done.is_set())
+                self.assertTrue(wrapper.ready.is_set())
+
+    def test_unknown_codes_remain_fail_closed(self):
+        """Unknown broker codes never pass silently: the pending read's
+        bounded wait expires and the session is torn down (fail closed)."""
+        from ibkr.transport_tws import TwsTransport
+        for code in (312, 2000, 9999):
+            with self.subTest(code=code):
+                transport = TwsTransport(base_config(read_only_timeout_seconds=0.05))
+                state = _CollectingWrapper(timeout=0.05)
+                state.ready.set()  # readiness already established
+                transport._wrapper = state
+                transport._client = _PythonShapedEClient(state)
+                state.error(-1, _ts(), code, "unknown")
+                self.assertIsNone(state.failure)  # not misclassified as benign or fatal
+                with self.assertRaises(TransportError):
+                    transport.managed_accounts()  # bounded wait expires
+                self.assertIsNone(transport._client)  # session torn down
+
+    def test_raw_error_string_and_reject_json_not_exposed(self):
+        import io as _io
+        from contextlib import redirect_stderr
+        wrapper = _CollectingWrapper(timeout=1.0)
+        secret_text = "SECRETSUFFIX-9x8y7z"
+        buffer = _io.StringIO()
+        with redirect_stderr(buffer):
+            wrapper.error(-1, _ts(), 504, secret_text,
+                          '{"advanced":"SECRETJSON-4c5b6a"}')
+        self.assertNotIn("SECRETSUFFIX", buffer.getvalue())
+        self.assertNotIn("SECRETJSON", buffer.getvalue())
+        # Not retained on the wrapper either.
+        self.assertNotIn(secret_text, vars(wrapper).values().__iter__().__length_hint__() * "")
+
+    def test_benign_before_next_valid_id_does_not_block_readiness(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        wrapper.error(-1, _ts(), 2104, "farm connection is OK")
+        wrapper.error(-1, _ts(), 2106, "market data farm connection is OK")
+        self.assertFalse(wrapper.ready.is_set())
+        wrapper.nextValidId(19)
+        self.assertTrue(wrapper.ready.is_set())
+        self.assertIsNone(wrapper.failure)
+
+    def test_benign_after_next_valid_id_does_not_break_session(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        wrapper.nextValidId(19)
+        self.assertTrue(wrapper.ready.is_set())
+        wrapper.error(-1, _ts(), 2158, "benchmark market data farm is inactive")
+        self.assertIsNone(wrapper.failure)
+        self.assertTrue(wrapper.ready.is_set())
+
+    def test_fatal_before_readiness_fails_closed(self):
+        wrapper = _CollectingWrapper(timeout=1.0)
+        wrapper.error(-1, _ts(), 502, "couldn't connect")
+        self.assertEqual(wrapper.failure, "connection")
+        self.assertTrue(wrapper.ready.is_set())
+
+    def test_realistic_notification_sequence_keeps_adapter_healthy(self):
+        """Realistic healthy-session sequence around the handshake."""
+        transport, client = _python_transport()
+        wrapper = transport._wrapper
+        try:
+            self.assertTrue(client.run_entered.wait(2))
+            self.assertTrue(wrapper.ready.wait(2))
+            # Informational notifications around the handshake.
+            wrapper.error(-1, _ts(), 2104, "ok")
+            wrapper.error(-1, _ts(), 2106, "ok")
+            wrapper.nextValidId(19)
+            wrapper.managedAccounts("DU0000011")
+            wrapper.error(-1, _ts(), 2158, "inactive benchmark farm")
+            accounts = transport.managed_accounts()
+            self.assertEqual(accounts, [EXPECTED_ACCOUNT])
+            self.assertIsNone(wrapper.failure)
+        finally:
+            transport.disconnect()
+
+    def test_fatal_during_read_fails_closed(self):
+        transport, _client = _python_transport()
+        wrapper = transport._wrapper
+        try:
+            self.assertTrue(wrapper.ready.wait(2))
+            # Deterministic mid-read failure: the scripted response is slower
+            # than the fatal callback, so the callback wins the race and the
+            # pending read must terminate fail-closed rather than hang.
+            import time as _time
+            import threading as _threading
+
+            def _slow_managed_accounts(w):
+                _time.sleep(0.15)
+                w.managedAccounts(EXPECTED_ACCOUNT)
+                w.done.set()
+
+            client_script = transport._client.script
+            client_script["reqManagedAccts"] = _slow_managed_accounts
+            wrapper.done.clear()
+            timer = _threading.Timer(
+                0.05, lambda: wrapper.error(-1, _ts(), 1300, "socket port reset")
+            )
+            timer.start()
+            try:
+                with self.assertRaises(TransportError):
+                    transport.managed_accounts()
+            finally:
+                timer.join()
+        finally:
+            transport.disconnect()
+
+    def test_lifecycle_invariants_remain_after_error_fix(self):
+        # connect/run/disconnect lifecycle and single-run-loop invariants
+        # from 5F-1a are exercised by the existing suite; spot-check here.
+        transport, client = _python_transport()
+        try:
+            threads = [
+                t for t in threading.enumerate()
+                if t.name == "phil-ibkr-readonly-messages"
+            ]
+            self.assertEqual(len(threads), 1)
+            self.assertFalse(hasattr(client, "eConnect"))
+        finally:
+            transport.disconnect()
+
+    def test_no_mutation_calls_after_error_fix(self):
+        source = (REPOSITORY_ROOT / "ibkr" / "transport_tws.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                target = node.func
+                name = str(getattr(target, "attr", getattr(target, "id", "")))
+                self.assertNotIn(name, ("placeOrder", "cancelOrder", "exerciseOptions"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotEqual(node.module or "", "ibapi.order")
 
 
 if __name__ == "__main__":

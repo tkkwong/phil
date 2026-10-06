@@ -36,6 +36,11 @@ from ibkr.transport import ReadonlyTransport, TransportError
 # Bounded shutdown budget for the message-processing thread.
 _RUN_JOIN_TIMEOUT_SECONDS = 5.0
 
+# Documented initial-status/inactive-but-normal TWS notifications that must
+# NOT make a healthy read-only session unusable (numeric-code policy only;
+# no text parsing, no broad 21xx suppression, unknown codes stay fatal).
+_BENIGN_INFORMATIONAL_CODES = frozenset({2104, 2106, 2107, 2108, 2158})
+
 
 class _CollectingWrapper:
     """Bounded request collector for read-only snapshots.
@@ -49,7 +54,7 @@ class _CollectingWrapper:
         self.timeout = timeout
         self.done = threading.Event()
         self.ready = threading.Event()
-        self.error: str | None = None
+        self.failure: str | None = None
         self.accounts: list[str] = []
         self.account_summary: dict[str, Any] = {}
         self.positions: list[dict[str, Any]] = []
@@ -77,26 +82,41 @@ class _CollectingWrapper:
         self.accounts = [item for item in accountsList.split(",") if item]
         self.done.set()
 
-    def error(self, reqId: Any, errorCode: int, errorString: str, *args: Any) -> None:  # noqa: N802
-        """Bounded error categorization; broker text always discarded.
+    def error(
+        self,
+        reqId: Any,
+        errorTime: int,
+        errorCode: int,
+        errorString: str,
+        advancedOrderRejectJson: str = "",
+    ) -> None:  # noqa: N802 (ibapi naming)
+        """Official current Python callback shape (ibapi > 10.33).
 
-        Tolerates both the classic and the 10.x extended signature
-        (``advancedOrderRejectJson`` trailing argument). Notifications with
-        negative ids (e.g. 2104/2106 farm notices) are not failures.
+        The exact official signature is
+        ``error(reqId, errorTime, errorCode, errorString,
+        advancedOrderRejectJson="")``; ``errorTime`` is an epoch-millisecond
+        timestamp that precedes the numeric code and must never be
+        interpreted as an error code. Broker text (``errorString``) and
+        ``advancedOrderRejectJson`` are discarded entirely: never logged,
+        persisted, or printed. Classification uses only the numeric code.
         """
-        del errorString, args
+        del errorTime, errorString, advancedOrderRejectJson
+        if errorCode in _BENIGN_INFORMATIONAL_CODES:
+            # Documented connection-status notifications; not fatal, not
+            # readiness-ending, processing continues.
+            return
         if errorCode in (502, 504, 1100, 1101, 1102, 1300):
-            self.error = "connection"
+            self.failure = "connection"
             self.done.set()
             self.ready.set()
         elif errorCode in (508, 510, 511, 540, 542):
-            self.error = "session"
+            self.failure = "session"
             self.done.set()
             self.ready.set()
 
     def connectionClosed(self) -> None:  # noqa: N802
         """Official callback when the socket is closed by the peer/API."""
-        self.error = "connection"
+        self.failure = "connection"
         self.done.set()
         self.ready.set()
 
@@ -253,7 +273,7 @@ class TwsTransport(ReadonlyTransport):
         except Exception:
             # The loop died; surface a bounded failure state.
             if self._wrapper is not None:
-                self._wrapper.error = "connection"
+                self._wrapper.failure = "connection"
                 self._wrapper.done.set()
                 self._wrapper.ready.set()
 
@@ -262,7 +282,7 @@ class TwsTransport(ReadonlyTransport):
         assert self._wrapper is not None and self._client is not None
         if not self._wrapper.ready.wait(self._wrapper.timeout):
             raise TransportError("connection readiness timed out")
-        if self._wrapper.error is not None:
+        if self._wrapper.failure is not None:
             raise TransportError("connection error reported")
 
     def disconnect(self) -> None:
@@ -289,10 +309,10 @@ class TwsTransport(ReadonlyTransport):
         if not self._wrapper.done.wait(self._wrapper.timeout):
             self._shutdown_on_error()
             raise TransportError("read-only request timed out")
-        if self._wrapper.error == "connection":
+        if self._wrapper.failure == "connection":
             self._shutdown_on_error()
             raise TransportError("connection error reported")
-        if self._wrapper.error == "session":
+        if self._wrapper.failure == "session":
             self._shutdown_on_error()
             raise TransportError("session error reported")
 
@@ -307,7 +327,7 @@ class TwsTransport(ReadonlyTransport):
         client, wrapper = self._require_connected()
         wrapper.done.clear()
         wrapper.accounts = []
-        wrapper.error = None
+        wrapper.failure = None
         client.reqManagedAccts()
         self._wait()
         return list(wrapper.accounts)
@@ -317,7 +337,7 @@ class TwsTransport(ReadonlyTransport):
         request_id = wrapper.next_id()
         wrapper.done.clear()
         wrapper.account_summary = {}
-        wrapper.error = None
+        wrapper.failure = None
         tags = "AccountType,NetLiquidation,AvailableFunds,BuyingPower,Currency"
         client.reqAccountSummary(request_id, "All", tags)
         self._wait()
@@ -330,7 +350,7 @@ class TwsTransport(ReadonlyTransport):
         client, wrapper = self._require_connected()
         wrapper.done.clear()
         wrapper.positions = []
-        wrapper.error = None
+        wrapper.failure = None
         client.reqPositions()
         self._wait()
         return [dict(row) for row in wrapper.positions]
@@ -339,7 +359,7 @@ class TwsTransport(ReadonlyTransport):
         client, wrapper = self._require_connected()
         wrapper.done.clear()
         wrapper.open_orders = []
-        wrapper.error = None
+        wrapper.failure = None
         client.reqOpenOrders()
         self._wait()
         return [dict(row) for row in wrapper.open_orders]
@@ -349,7 +369,7 @@ class TwsTransport(ReadonlyTransport):
         request_id = wrapper.next_id()
         wrapper.done.clear()
         wrapper.executions = []
-        wrapper.error = None
+        wrapper.failure = None
         client.reqExecutions(request_id, _ExecutionFilter())
         self._wait()
         return [dict(row) for row in wrapper.executions]
@@ -366,7 +386,7 @@ class TwsTransport(ReadonlyTransport):
         request_id = wrapper.next_id()
         wrapper.done.clear()
         wrapper.contract_matches = []
-        wrapper.error = None
+        wrapper.failure = None
         from ibapi import contract as ibapi_contract  # type: ignore
 
         contract = ibapi_contract.Contract()
