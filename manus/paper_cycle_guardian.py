@@ -77,6 +77,13 @@ _FORBIDDEN_CLI_MARKERS = (
 class GuardianValidationError(ValueError):
     """Raised when fixture, intent, or guarded forecast data is invalid or unsafe."""
 
+    def __init__(self, message: str, code: str | None = None):
+        # ``code`` is optional bounded diagnostic metadata from the protected
+        # core's closed vocabularies. It never carries exception text, paths,
+        # or provider content, and never changes validation behavior.
+        super().__init__(message)
+        self.code = code
+
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
@@ -294,16 +301,17 @@ def _validate_fixture_bound_intent(
     try:
         intent = validate_intent(intent_document, already_applied_intent_ids)
     except IntentValidationError as exc:
-        raise GuardianValidationError(str(exc)) from exc
+        # Bounded diagnostic metadata only; the message text is unchanged.
+        raise GuardianValidationError(str(exc), code="invalid-input") from exc
 
     candidates = {candidate["candidate_id"]: candidate for candidate in packet["candidates"]}
     candidate = candidates.get(intent["candidate_id"])
     if candidate is None:
-        raise GuardianValidationError("intent candidate_id is not present in the trusted fixture")
+        raise GuardianValidationError("intent candidate_id is not present in the trusted fixture", code="invalid-input")
     if intent["market_id"] != candidate["market_id"]:
-        raise GuardianValidationError("intent market_id does not exactly match its candidate")
+        raise GuardianValidationError("intent market_id does not exactly match its candidate", code="invalid-input")
     if intent["outcome"] not in candidate["outcomes"]:
-        raise GuardianValidationError("intent outcome does not exactly match a trusted outcome")
+        raise GuardianValidationError("intent outcome does not exactly match a trusted outcome", code="invalid-input")
     return packet, intent, candidate
 
 
@@ -363,10 +371,12 @@ def record_candidate_forecast(
             kwargs["forecast_path"] = _forecast_path
         recorded = forecast_core.record_forecast(**kwargs)
     except forecast_core.ForecastRecordError as exc:
-        raise GuardianValidationError(str(exc)) from exc
+        raise GuardianValidationError(str(exc), code=getattr(exc, "code", None)) from exc
     except OSError as exc:
         raise GuardianValidationError("Forecast write failed") from exc
     except Exception as exc:
+        # Unexpected internal failure: no trusted code exists, so the
+        # downstream bounded mapping classifies it as unclassified.
         raise GuardianValidationError("Forecast recording failed") from exc
 
     return {
@@ -453,10 +463,12 @@ def record_candidate_paper_placement(
             kwargs["_now"] = _now
         placed = ledger_core.record_manus_paper_placement(**kwargs)
     except ledger_core.ManusPlacementError as exc:
-        raise GuardianValidationError(str(exc)) from exc
+        raise GuardianValidationError(str(exc), code=getattr(exc, "code", None)) from exc
     except OSError as exc:
         raise GuardianValidationError("PAPER ledger write failed") from exc
     except Exception as exc:
+        # Unexpected internal failure: no trusted code exists, so the
+        # downstream bounded mapping classifies it as unclassified.
         raise GuardianValidationError("PAPER placement failed") from exc
     return {
         "placement_version": PAPER_PLACEMENT_VERSION,

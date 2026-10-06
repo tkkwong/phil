@@ -63,8 +63,34 @@ MIN_REVISION_DELTA = 0.05
 EXTREME_DISAGREEMENT = 0.40
 
 
+FORECAST_REJECTION_CODES = frozenset(
+    {
+        "duplicate-forecast",
+        "market-closed",
+        "outcome-token-invalid",
+        "market-data-unavailable",
+        "orderbook-unavailable",
+        "extreme-disagreement",
+        "invalid-input",
+        "unclassified",
+    }
+)
+
+
 class ForecastRecordError(ValueError):
-    """Raised when protected forecast recording rejects an input before write."""
+    """Raised when protected forecast recording rejects an input before write.
+
+    ``code`` is a stable, non-sensitive diagnostic identifier drawn from
+    ``FORECAST_REJECTION_CODES``. It carries no exception text, filesystem
+    path, or provider response content, and is diagnostic metadata only:
+    guard order and policy are untouched.
+    """
+
+    def __init__(self, message, code="unclassified"):
+        if code not in FORECAST_REJECTION_CODES:
+            code = "unclassified"
+        super().__init__(message)
+        self.code = code
 
 
 def read_forecasts(forecast_path=FORECASTS):
@@ -100,13 +126,13 @@ def _validate_source_intent_id(source_intent_id):
     if source_intent_id is None:
         return None
     if not isinstance(source_intent_id, str):
-        raise ForecastRecordError("source_intent_id must be a canonical UUIDv4")
+        raise ForecastRecordError("source_intent_id must be a canonical UUIDv4", "invalid-input")
     try:
         parsed = uuid.UUID(source_intent_id)
     except (AttributeError, ValueError) as exc:
-        raise ForecastRecordError("source_intent_id must be a canonical UUIDv4") from exc
+        raise ForecastRecordError("source_intent_id must be a canonical UUIDv4", "invalid-input") from exc
     if parsed.version != 4 or str(parsed) != source_intent_id:
-        raise ForecastRecordError("source_intent_id must be a canonical UUIDv4")
+        raise ForecastRecordError("source_intent_id must be a canonical UUIDv4", "invalid-input")
     return source_intent_id
 
 
@@ -188,7 +214,7 @@ def record_forecast(
     rows = list(existing_rows) if existing_rows is not None else read_forecasts(forecast_path)
     source_intent_id = _validate_source_intent_id(source_intent_id)
     if source_intent_id is not None and supersede:
-        raise ForecastRecordError("source_intent_id records may not use --supersede")
+        raise ForecastRecordError("source_intent_id records may not use --supersede", "invalid-input")
 
     # Durable provenance comes before market I/O and all normal duplicate or
     # supersede logic. A successful append followed by a caller crash remains
@@ -196,10 +222,10 @@ def record_forecast(
     if source_intent_id is not None and any(
         row.get("source_intent_id") == source_intent_id for row in rows
     ):
-        raise ForecastRecordError("source_intent_id has already recorded a forecast")
+        raise ForecastRecordError("source_intent_id has already recorded a forecast", "duplicate-forecast")
 
     if not isinstance(est_prob, (int, float)) or isinstance(est_prob, bool) or not 0.0 < est_prob < 1.0:
-        raise ForecastRecordError("est-prob must be in (0,1)")
+        raise ForecastRecordError("est-prob must be in (0,1)", "invalid-input")
 
     live = [
         row
@@ -212,12 +238,13 @@ def record_forecast(
     if live and not supersede:
         raise ForecastRecordError(
             "already have an open forecast on this market+outcome "
-            "(a materially changed read may supersede it: --supersede)"
+            "(a materially changed read may supersede it: --supersede)",
+            "duplicate-forecast",
         )
     old = None
     if supersede:
         if not live:
-            raise ForecastRecordError("--supersede, but no live open forecast on this market+outcome to supersede")
+            raise ForecastRecordError("--supersede, but no live open forecast on this market+outcome to supersede", "duplicate-forecast")
         old = live[0]
         # Round like ledger.py's edge field so an exactly-boundary revision
         # (0.33 - 0.28 = 0.049999...) does not float-drop below the gate.
@@ -229,7 +256,8 @@ def record_forecast(
                 "supersede needs a material change — "
                 f"|delta est_prob| >= {MIN_REVISION_DELTA} "
                 f"(old {old['est_prob']}, new {est_prob}) or a changed "
-                f"skip-reason (old {old.get('skip_reason')!r})"
+                f"skip-reason (old {old.get('skip_reason')!r})",
+                "duplicate-forecast",
             )
 
     # Public, read-only market data preserves the existing forecast semantics.
@@ -237,21 +265,21 @@ def record_forecast(
     try:
         market = pmapi.gamma_market(market_id)
     except Exception as exc:  # noqa: BLE001 — surface a stable pre-write rejection
-        raise ForecastRecordError("market-data lookup failed before recording") from exc
+        raise ForecastRecordError("market-data lookup failed before recording", "market-data-unavailable") from exc
     if market.get("closed"):
-        raise ForecastRecordError("market is closed")
+        raise ForecastRecordError("market is closed", "market-closed")
     try:
         tokens = pmapi.market_tokens(market)
     except Exception as exc:  # noqa: BLE001 — malformed public market data
-        raise ForecastRecordError("market-data lookup failed before recording") from exc
+        raise ForecastRecordError("market-data lookup failed before recording", "market-data-unavailable") from exc
     if outcome not in tokens:
-        raise ForecastRecordError(f"outcome {outcome!r} not in {list(tokens)}")
+        raise ForecastRecordError(f"outcome {outcome!r} not in {list(tokens)}", "outcome-token-invalid")
     try:
         bid, ask = pmapi.best_prices(tokens[outcome])
     except Exception as exc:  # noqa: BLE001 — public CLOB read failure
-        raise ForecastRecordError("market-data lookup failed before recording") from exc
+        raise ForecastRecordError("market-data lookup failed before recording", "orderbook-unavailable") from exc
     if bid is None and ask is None:
-        raise ForecastRecordError("empty book — no market probability to benchmark against")
+        raise ForecastRecordError("empty book — no market probability to benchmark against", "orderbook-unavailable")
     mid = (bid + ask) / 2 if bid is not None and ask is not None else bid or ask
 
     gap = abs(est_prob - mid)
@@ -262,7 +290,8 @@ def record_forecast(
             f"(> {EXTREME_DISAGREEMENT}). If this extreme disagreement is your "
             "researched belief, re-run with --confirm-extreme; if not, you "
             "probably inverted the outcome side (est_prob must be for the "
-            f"named outcome {outcome!r}, not its complement)."
+            f"named outcome {outcome!r}, not its complement).",
+            "extreme-disagreement",
         )
 
     row = {

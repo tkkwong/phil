@@ -15,7 +15,7 @@ import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
-from manus import paper_cycle_inspector, paper_runner
+from manus import paper_apply, paper_cycle_inspector, paper_runner
 from manus.paper_cycle_guardian import prepare_packet
 
 
@@ -73,7 +73,7 @@ def candidate(market_id: str, *, end_date: str = "2026-10-01T00:00:00.000Z") -> 
     }
 
 
-class PaperCycleInspectorTests(unittest.TestCase):
+class PaperCycleInspectorTestsMixin:
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -400,3 +400,87 @@ def sys_module():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaperCycleInspectorTests(PaperCycleInspectorTestsMixin, unittest.TestCase):
+    """Original read-only inspector regression suite."""
+
+
+class InspectorRejectionCodeTests(PaperCycleInspectorTestsMixin, unittest.TestCase):
+    """The inspector surfaces the persisted receipt code read-only."""
+
+    INTENT_ID = "223e4567-e89b-42d3-a456-426614174000"
+
+    def seed_failed_terminal_cycle(self, *, application_state: str, receipt: dict | None) -> dict:
+        candidates = [candidate("100")]
+        cycle = self.seed_selected_cycle(candidates, state="research-pending")
+        cycle.update(
+            {
+                "state": "failed-terminal",
+                "application_state": application_state,
+                "safe_reason": (
+                    "paper-placement-rejected"
+                    if application_state == "placement-rejected"
+                    else "paper-forecast-rejected"
+                ),
+                "intent_id": self.INTENT_ID,
+                "counters": {"candidates_selected": 1, "new_manus_tasks": 0, "logical_applications": 1},
+            }
+        )
+        cycle = paper_runner._persist_cycle(self.runner_root, cycle, lambda: NOW)
+        if receipt is not None:
+            staging_root = self.root / "external-staging"
+            receipt_path = paper_apply._fixed_paths(staging_root, cycle["packet_id"], cycle["intent_id"])[2]
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            paper_apply._atomic_write_receipt(receipt_path, receipt)
+        return cycle
+
+    def status_document(self, *, staging: bool = True) -> dict:
+        if staging:
+            staging_root = self.root / "external-staging"
+        else:
+            staging_root = None
+        return paper_cycle_inspector.status(_runner_root=self.runner_root, _staging_root=staging_root)
+
+    def test_status_reports_persisted_rejection_code(self):
+        self.seed_failed_terminal_cycle(
+            application_state="placement-rejected",
+            receipt={"application_version": "paper-apply/v1", "state": "placement-rejected",
+                     "rejection_code": "edge-below-threshold"},
+        )
+        document = self.status_document()
+        self.assertEqual(document["rejection_code"], "edge-below-threshold")
+        self.assert_repository_journals_unchanged()
+
+    def test_status_reports_none_for_receipt_without_code(self):
+        self.seed_failed_terminal_cycle(
+            application_state="placement-rejected",
+            receipt={"application_version": "paper-apply/v1", "state": "placement-rejected"},
+        )
+        self.assertIsNone(self.status_document()["rejection_code"])
+
+    def test_status_reports_none_for_unknown_code(self):
+        self.seed_failed_terminal_cycle(
+            application_state="placement-rejected",
+            receipt={"application_version": "paper-apply/v1", "state": "placement-rejected",
+                     "rejection_code": "made-up-code"},
+        )
+        self.assertIsNone(self.status_document()["rejection_code"])
+
+    def test_status_reports_none_for_missing_receipt(self):
+        self.seed_failed_terminal_cycle(application_state="placement-rejected", receipt=None)
+        self.assertIsNone(self.status_document()["rejection_code"])
+
+    def test_status_reports_none_outside_failed_terminal(self):
+        self.seed_selected_cycle([candidate("100")], state="research-pending")
+        self.assertIsNone(self.status_document()["rejection_code"])
+
+    def test_malformed_receipt_is_reported_as_none(self):
+        self.seed_failed_terminal_cycle(application_state="forecast-rejected", receipt=None)
+        staging_root = self.root / "external-staging"
+        cycle = paper_runner._read_active_cycle(self.runner_root)[0]
+        receipt_path = paper_apply._fixed_paths(staging_root, cycle["packet_id"], cycle["intent_id"])[2]
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(self.status_document()["rejection_code"])
+        self.assert_repository_journals_unchanged()

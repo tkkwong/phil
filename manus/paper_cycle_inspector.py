@@ -18,7 +18,7 @@ import pathlib
 import sys
 from typing import Any, Callable
 
-from manus import paper_locks, paper_runner
+from manus import paper_apply, paper_locks, paper_runner
 
 INSPECTOR_VERSION = "paper-cycle-inspector/v1"
 
@@ -124,12 +124,47 @@ def _empty_status(clock: Callable[[], dt.datetime]) -> dict[str, Any]:
     }
 
 
+def _receipt_path_for(cycle: dict[str, Any], staging_root: pathlib.Path | None) -> pathlib.Path | None:
+    """Resolve one canonical receipt path without creating or mutating anything."""
+    if staging_root is None:
+        try:
+            staging_root = paper_apply._resolve_staging_root()
+        except paper_apply.PaperApplyError:
+            return None
+    try:
+        return paper_apply._fixed_paths(staging_root, cycle["packet_id"], cycle["intent_id"])[2]
+    except paper_apply.PaperApplyError:
+        return None
+
+
+def _persisted_rejection_code(receipt_path: pathlib.Path) -> str | None:
+    """Read the bounded rejection code from one canonical application receipt.
+
+    Strictly read-only. Only values from the closed paper_apply vocabulary are
+    surfaced; historical receipts without the field report ``None``. The
+    inspector never infers a code from arbitrary text.
+    """
+    try:
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return None
+        document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    code = document.get("rejection_code")
+    if isinstance(code, str) and code in paper_apply.REJECTION_CODES:
+        return code
+    return None
+
+
 def _status_document(
     root: pathlib.Path,
     cycle: dict[str, Any],
     clock: Callable[[], dt.datetime],
     *,
     cycle_id: str | None = None,
+    staging_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Build the safe operational summary for one already-validated cycle."""
     selected_or_later = cycle["fixture_sha256"] is not None
@@ -159,6 +194,20 @@ def _status_document(
         "logical_applications": counters["logical_applications"],
         "forecast_id": cycle["forecast_id"],
         "placement_id": cycle["placement_id"],
+        # Persisted bounded diagnostic from the canonical application receipt.
+        # Historical receipts without the field report null; the inspector
+        # never infers a rejection code from arbitrary text.
+        "rejection_code": (
+            _persisted_rejection_code(
+                _receipt_path_for(cycle, staging_root)
+            )
+            if staging_root is not None
+            and cycle["state"] == "failed-terminal"
+            and cycle["application_state"] in {"placement-rejected", "forecast-rejected", "error"}
+            and cycle["packet_id"] is not None
+            and cycle["intent_id"] is not None
+            else None
+        ),
     }
     if cycle_id is not None:
         document["requested_cycle_id"] = cycle_id
@@ -170,8 +219,13 @@ def status(
     *,
     now: Callable[[], dt.datetime] | None = None,
     _runner_root: pathlib.Path | None = None,
+    _staging_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
-    """Return the safe operational status of the persisted active cycle."""
+    """Return the safe operational status of the persisted active cycle.
+
+    ``_staging_root`` is an internal test seam pointing at the fixed external
+    application staging root; inspection never writes to it.
+    """
     clock = _frozen_clock(now)
     root = _resolve_inspection_root(_runner_root)
     try:
@@ -181,7 +235,7 @@ def status(
     if active is None:
         return _empty_status(clock)
     cycle, _cycle_directory_path = active
-    return _status_document(root, cycle, clock)
+    return _status_document(root, cycle, clock, staging_root=_staging_root)
 
 
 def cycle_status(
@@ -189,6 +243,7 @@ def cycle_status(
     *,
     now: Callable[[], dt.datetime] | None = None,
     _runner_root: pathlib.Path | None = None,
+    _staging_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Return the safe operational status of one explicitly requested cycle."""
     clock = _frozen_clock(now)
@@ -204,7 +259,7 @@ def cycle_status(
         active = None  # a malformed active pointer does not block explicit inspection
     if active is not None and active[0]["cycle_id"] == cycle_id:
         cycle = active[0]
-    return _status_document(root, cycle, clock, cycle_id=cycle_id)
+    return _status_document(root, cycle, clock, cycle_id=cycle_id, staging_root=_staging_root)
 
 
 def build_parser() -> argparse.ArgumentParser:

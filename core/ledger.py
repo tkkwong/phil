@@ -34,8 +34,49 @@ _ISO_UTC_TIMESTAMP_RE = re.compile(
 MANUS_PAPER_EDGE_CLASS = "manus-paper-only"
 
 
+PLACEMENT_REJECTION_CODES = frozenset(
+    {
+        "duplicate-source-intent",
+        "duplicate-source-forecast",
+        "duplicate-market-outcome",
+        "forecast-provenance-invalid",
+        "market-data-unavailable",
+        "market-closed",
+        "too-close-to-resolution",
+        "outcome-token-invalid",
+        "orderbook-unavailable",
+        "entry-price-out-of-bounds",
+        "spread-too-wide",
+        "edge-below-threshold",
+        "event-identity-unresolved-current-market",
+        "event-identity-unresolved-existing-position",
+        "event-identity-mismatch",
+        "risk-cap-event",
+        "max-open-positions",
+        "insufficient-cash",
+        "packet-position-cap",
+        "category-position-cap",
+        "invalid-policy",
+        "ledger-write-failed",
+        "unclassified",
+    }
+)
+
+
 class ManusPlacementError(ValueError):
-    """Raised when guarded Manus PAPER placement rejects before ledger mutation."""
+    """Raised when guarded Manus PAPER placement rejects before ledger mutation.
+
+    ``code`` is a stable, non-sensitive diagnostic identifier drawn from
+    ``PLACEMENT_REJECTION_CODES``. It carries no exception text, filesystem
+    path, or provider response content, and is diagnostic metadata only:
+    guard order, policy, and thresholds are untouched.
+    """
+
+    def __init__(self, message: str, code: str = "unclassified"):
+        if code not in PLACEMENT_REJECTION_CODES:
+            code = "unclassified"
+        super().__init__(message)
+        self.code = code
 
 
 def read_ledger():
@@ -75,32 +116,32 @@ def cmd_status(entries):
 
 def _require_identifier(value, label, maximum=128):
     if not isinstance(value, str) or not value or len(value) > maximum:
-        raise ManusPlacementError(f"{label} must be a non-empty identifier up to {maximum} characters")
+        raise ManusPlacementError(f"{label} must be a non-empty identifier up to {maximum} characters", "unclassified")
     if not _IDENTIFIER_RE.fullmatch(value):
-        raise ManusPlacementError(f"{label} has an invalid identifier format")
+        raise ManusPlacementError(f"{label} has an invalid identifier format", "unclassified")
     return value
 
 
 def _require_text(value, label, maximum):
     if not isinstance(value, str) or not value or len(value) > maximum:
-        raise ManusPlacementError(f"{label} must be a non-empty string up to {maximum} characters")
+        raise ManusPlacementError(f"{label} must be a non-empty string up to {maximum} characters", "unclassified")
     return value
 
 
 def _require_probability(value, label):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ManusPlacementError(f"{label} must be a number")
+        raise ManusPlacementError(f"{label} must be a number", "unclassified")
     if not math.isfinite(value) or not 0.0 < value < 1.0:
-        raise ManusPlacementError(f"{label} must be in (0,1)")
+        raise ManusPlacementError(f"{label} must be in (0,1)", "unclassified")
     return float(value)
 
 
 def _require_nonnegative_number(value, label, *, positive=False):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ManusPlacementError(f"{label} must be a number")
+        raise ManusPlacementError(f"{label} must be a number", "unclassified")
     if not math.isfinite(value) or (value <= 0 if positive else value < 0):
         comparison = "positive" if positive else "non-negative"
-        raise ManusPlacementError(f"{label} must be {comparison}")
+        raise ManusPlacementError(f"{label} must be {comparison}", "unclassified")
     return float(value)
 
 
@@ -109,16 +150,16 @@ def _exact_decimal(value, label):
     try:
         exact = Decimal(str(value))
     except Exception as exc:  # noqa: BLE001 -- preserve the guarded rejection boundary
-        raise ManusPlacementError(f"{label} must be a decimal number") from exc
+        raise ManusPlacementError(f"{label} must be a decimal number", "unclassified") from exc
     if not exact.is_finite():
-        raise ManusPlacementError(f"{label} must be a finite decimal number")
+        raise ManusPlacementError(f"{label} must be a finite decimal number", "unclassified")
     return exact
 
 
 def _require_limit(value, label):
     number = _require_nonnegative_number(value, label)
     if not number.is_integer():
-        raise ManusPlacementError(f"{label} must be an integer")
+        raise ManusPlacementError(f"{label} must be an integer", "unclassified")
     return int(number)
 
 
@@ -129,7 +170,7 @@ def _read_jsonl(path, label):
     try:
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     except (OSError, json.JSONDecodeError) as exc:
-        raise ManusPlacementError(f"Unable to read {label}") from exc
+        raise ManusPlacementError(f"Unable to read {label}", "market-data-unavailable") from exc
 
 
 def _read_manus_policy(protected_config=None, risk_config=None):
@@ -139,34 +180,34 @@ def _read_manus_policy(protected_config=None, risk_config=None):
         try:
             risk = json.loads(RISK.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ManusPlacementError("Unable to read guarded PAPER risk policy") from exc
+            raise ManusPlacementError("Unable to read guarded PAPER risk policy", "invalid-policy") from exc
     else:
         risk = risk_config
     if not isinstance(protected, dict) or not isinstance(risk, dict):
-        raise ManusPlacementError("Guarded PAPER policy must be an object")
+        raise ManusPlacementError("Guarded PAPER policy must be an object", "invalid-policy")
     real_policy = protected.get("real")
     if not isinstance(real_policy, dict):
-        raise ManusPlacementError("Protected real policy must be an object")
+        raise ManusPlacementError("Protected real policy must be an object", "invalid-policy")
     real_allowlist = real_policy.get("allowed_edge_classes")
     if not isinstance(real_allowlist, list) or not all(isinstance(item, str) for item in real_allowlist):
-        raise ManusPlacementError("Protected real allowed_edge_classes must be a list of strings")
+        raise ManusPlacementError("Protected real allowed_edge_classes must be a list of strings", "invalid-policy")
     if MANUS_PAPER_EDGE_CLASS in real_allowlist:
-        raise ManusPlacementError("manus-paper-only must never be real-eligible")
+        raise ManusPlacementError("manus-paper-only must never be real-eligible", "invalid-policy")
 
     stake = _require_nonnegative_number(risk.get("default_stake_usd"), "default_stake_usd", positive=True)
     max_stake = _require_nonnegative_number(protected.get("max_stake_usd"), "max_stake_usd", positive=True)
     if stake > max_stake:
-        raise ManusPlacementError("default_stake_usd exceeds protected max_stake_usd")
+        raise ManusPlacementError("default_stake_usd exceeds protected max_stake_usd", "invalid-policy")
 
     min_edge = _require_nonnegative_number(risk.get("min_edge"), "min_edge")
     min_edge_book_devig = _require_nonnegative_number(
         risk.get("min_edge_book_devig"), "min_edge_book_devig"
     )
     if min_edge >= 1 or min_edge_book_devig >= 1:
-        raise ManusPlacementError("Guarded PAPER edge threshold must be below 1")
+        raise ManusPlacementError("Guarded PAPER edge threshold must be below 1", "invalid-policy")
     max_spread = _require_nonnegative_number(risk.get("max_spread"), "max_spread")
     if max_spread >= 1:
-        raise ManusPlacementError("max_spread must be below 1")
+        raise ManusPlacementError("max_spread must be below 1", "invalid-policy")
 
     return {
         "stake": stake,
@@ -218,44 +259,49 @@ def _guarded_bankroll(entries, sim_bankroll):
     return cash
 
 
-def _read_live_event_id(market_id):
-    """Use the same Gamma list-record event shape that core/scan.py reads."""
+def _read_live_event_id(market_id, unresolved_code="event-identity-unresolved-current-market"):
+    """Use the same Gamma list-record event shape that core/scan.py reads.
+
+    ``unresolved_code`` distinguishes which lookup failed (the current
+    candidate market vs an existing legacy open position) without any change
+    in resolution behavior or additional network calls.
+    """
     try:
         records = pmapi.gamma_markets(id=market_id)
     except Exception as exc:  # noqa: BLE001 -- stable fail-closed boundary
-        raise ManusPlacementError("Unable to resolve live event identity") from exc
+        raise ManusPlacementError("Unable to resolve live event identity", unresolved_code) from exc
     if not isinstance(records, list):
-        raise ManusPlacementError("Unable to resolve live event identity")
+        raise ManusPlacementError("Unable to resolve live event identity", unresolved_code)
     matches = [record for record in records if isinstance(record, dict) and str(record.get("id")) == market_id]
     if len(matches) != 1:
-        raise ManusPlacementError("Unable to resolve live event identity")
+        raise ManusPlacementError("Unable to resolve live event identity", unresolved_code)
     events = matches[0].get("events")
     if not isinstance(events, list) or not events or not isinstance(events[0], dict):
-        raise ManusPlacementError("Unable to resolve live event identity")
+        raise ManusPlacementError("Unable to resolve live event identity", unresolved_code)
     return _require_identifier(events[0].get("id"), "live event_id")
 
 
 def _parse_live_end_date(value):
     if not isinstance(value, str) or not _ISO_UTC_TIMESTAMP_RE.fullmatch(value):
-        raise ManusPlacementError("live market endDate is malformed or timezone-naive")
+        raise ManusPlacementError("live market endDate is malformed or timezone-naive", "too-close-to-resolution")
     try:
         parsed = dt.datetime.fromisoformat(f"{value[:-1]}+00:00" if value.endswith("Z") else value)
     except ValueError as exc:
-        raise ManusPlacementError("live market endDate is malformed") from exc
+        raise ManusPlacementError("live market endDate is malformed", "too-close-to-resolution") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ManusPlacementError("live market endDate is malformed or timezone-naive")
+        raise ManusPlacementError("live market endDate is malformed or timezone-naive", "too-close-to-resolution")
     return parsed.astimezone(dt.timezone.utc)
 
 
 def _matching_source_forecast(rows, source_intent_id, *, market_id, outcome, est_prob, category, rationale):
     matches = [row for row in rows if row.get("source_intent_id") == source_intent_id]
     if not matches:
-        raise ManusPlacementError("No persisted forecast matches source_intent_id")
+        raise ManusPlacementError("No persisted forecast matches source_intent_id", "forecast-provenance-invalid")
     if len(matches) != 1:
-        raise ManusPlacementError("source_intent_id has multiple persisted forecasts")
+        raise ManusPlacementError("source_intent_id has multiple persisted forecasts", "forecast-provenance-invalid")
     forecast = matches[0]
     if forecast.get("status") != "open" or forecast.get("superseded_by"):
-        raise ManusPlacementError("source forecast must be open and not superseded")
+        raise ManusPlacementError("source forecast must be open and not superseded", "forecast-provenance-invalid")
     expected = {
         "market_id": market_id,
         "outcome": outcome,
@@ -266,7 +312,7 @@ def _matching_source_forecast(rows, source_intent_id, *, market_id, outcome, est
     }
     for field, required in expected.items():
         if forecast.get(field) != required:
-            raise ManusPlacementError(f"source forecast {field} does not match the validated intent")
+            raise ManusPlacementError(f"source forecast {field} does not match the validated intent", "forecast-provenance-invalid")
     return _require_identifier(forecast.get("id"), "source_forecast_id")
 
 
@@ -308,13 +354,13 @@ def _atomic_append_source_record(ledger_path, row):
 
 def _validate_source_intent_id(source_intent_id):
     if not isinstance(source_intent_id, str):
-        raise ManusPlacementError("source_intent_id must be a canonical UUIDv4")
+        raise ManusPlacementError("source_intent_id must be a canonical UUIDv4", "unclassified")
     try:
         parsed = uuid.UUID(source_intent_id)
     except (AttributeError, ValueError) as exc:
-        raise ManusPlacementError("source_intent_id must be a canonical UUIDv4") from exc
+        raise ManusPlacementError("source_intent_id must be a canonical UUIDv4", "unclassified") from exc
     if parsed.version != 4 or str(parsed) != source_intent_id:
-        raise ManusPlacementError("source_intent_id must be a canonical UUIDv4")
+        raise ManusPlacementError("source_intent_id must be a canonical UUIDv4", "unclassified")
     return source_intent_id
 
 
@@ -361,7 +407,7 @@ def record_manus_paper_placement(
     # Durable replay protection precedes every public Gamma/CLOB market read,
     # including when the prior row is already settled.
     if any(row.get("source_intent_id") == source_intent_id for row in entries):
-        raise ManusPlacementError("source_intent_id has already placed a PAPER position")
+        raise ManusPlacementError("source_intent_id has already placed a PAPER position", "duplicate-source-intent")
 
     forecast_rows = _read_jsonl(forecast_path, "forecast book")
     source_forecast_id = _matching_source_forecast(
@@ -374,71 +420,71 @@ def record_manus_paper_placement(
         rationale=rationale,
     )
     if any(row.get("source_forecast_id") == source_forecast_id for row in entries):
-        raise ManusPlacementError("source_forecast_id has already placed a PAPER position")
+        raise ManusPlacementError("source_forecast_id has already placed a PAPER position", "duplicate-source-forecast")
 
     open_positions = [row for row in entries if row.get("status") == "open"]
     if len(open_positions) >= policy["max_open_positions"]:
-        raise ManusPlacementError("max_open_positions reached")
+        raise ManusPlacementError("max_open_positions reached", "max-open-positions")
     if policy["stake"] > policy["max_stake"]:
-        raise ManusPlacementError("default_stake_usd exceeds protected max_stake_usd")
+        raise ManusPlacementError("default_stake_usd exceeds protected max_stake_usd", "insufficient-cash")
     if policy["stake"] > _guarded_bankroll(entries, policy["sim_bankroll"]):
-        raise ManusPlacementError("insufficient simulated cash")
+        raise ManusPlacementError("insufficient simulated cash", "insufficient-cash")
     if any(
         row.get("market_id") == market_id and row.get("outcome") == outcome
         for row in open_positions
     ):
-        raise ManusPlacementError("already have an open position on this market+outcome")
+        raise ManusPlacementError("already have an open position on this market+outcome", "duplicate-market-outcome")
     if sum(1 for row in entries if row.get("source_packet_id") == source_packet_id) >= policy[
         "max_new_positions_per_cycle"
     ]:
-        raise ManusPlacementError("max_new_positions_per_cycle reached")
+        raise ManusPlacementError("max_new_positions_per_cycle reached", "packet-position-cap")
     if sum(
         1
         for row in entries
         if row.get("source_packet_id") == source_packet_id and row.get("category") == category
     ) >= policy["max_positions_per_category_per_cycle"]:
-        raise ManusPlacementError("max_positions_per_category_per_cycle reached")
+        raise ManusPlacementError("max_positions_per_category_per_cycle reached", "category-position-cap")
 
     # Existing public read-only Phil paper-fill semantics: Gamma market,
     # exact outcome/token mapping, then a simulated taker fill at CLOB best ask.
     try:
         market = pmapi.gamma_market(market_id)
     except Exception as exc:  # noqa: BLE001 -- public read failure is a rejection
-        raise ManusPlacementError("market-data lookup failed") from exc
+        raise ManusPlacementError("market-data lookup failed", "market-data-unavailable") from exc
     if not isinstance(market, dict) or market.get("closed"):
-        raise ManusPlacementError("market is closed")
+        raise ManusPlacementError("market is closed", "market-closed")
     live_end = _parse_live_end_date(market.get("endDate"))
     now = dt.datetime.now(dt.timezone.utc) if _now is None else _now
     if not isinstance(now, dt.datetime) or now.tzinfo is None or now.utcoffset() is None:
-        raise ManusPlacementError("protected clock is invalid")
+        raise ManusPlacementError("protected clock is invalid", "unclassified")
     if live_end <= now.astimezone(dt.timezone.utc) + dt.timedelta(minutes=policy["min_minutes_to_resolution"]):
-        raise ManusPlacementError("market is too close to resolution")
+        raise ManusPlacementError("market is too close to resolution", "too-close-to-resolution")
     try:
         tokens = pmapi.market_tokens(market)
     except Exception as exc:  # noqa: BLE001
-        raise ManusPlacementError("market-data lookup failed") from exc
+        raise ManusPlacementError("market-data lookup failed", "market-data-unavailable") from exc
     if outcome not in tokens:
-        raise ManusPlacementError(f"outcome {outcome!r} not in live market outcomes")
+        raise ManusPlacementError(f"outcome {outcome!r} not in live market outcomes", "outcome-token-invalid")
     try:
         bid, ask = pmapi.best_prices(tokens[outcome])
     except Exception as exc:  # noqa: BLE001
-        raise ManusPlacementError("market-data lookup failed") from exc
+        raise ManusPlacementError("market-data lookup failed", "orderbook-unavailable") from exc
     if bid is None or ask is None:
-        raise ManusPlacementError("guarded PAPER placement requires both best bid and best ask")
+        raise ManusPlacementError("guarded PAPER placement requires both best bid and best ask", "orderbook-unavailable")
     raw_bid, raw_ask, raw_est_prob = bid, ask, est_prob
     bid = _require_nonnegative_number(bid, "live best_bid")
     ask = _require_nonnegative_number(ask, "live best_ask", positive=True)
     if not policy["min_entry_price"] <= ask <= policy["max_entry_price"]:
-        raise ManusPlacementError("fill price is outside protected entry bounds")
+        raise ManusPlacementError("fill price is outside protected entry bounds", "entry-price-out-of-bounds")
     exact_bid = _exact_decimal(raw_bid, "live best_bid")
     exact_ask = _exact_decimal(raw_ask, "live best_ask")
     exact_est_prob = _exact_decimal(raw_est_prob, "estimated_probability")
     exact_spread = exact_ask - exact_bid
     if exact_spread < Decimal("0") or exact_spread > _exact_decimal(policy["max_spread"], "max_spread"):
-        raise ManusPlacementError("live spread exceeds guarded PAPER max_spread")
+        raise ManusPlacementError("live spread exceeds guarded PAPER max_spread", "spread-too-wide")
     exact_edge = exact_est_prob - exact_ask
     if exact_edge < _exact_decimal(policy["required_edge"], "required_edge"):
-        raise ManusPlacementError("ask_edge is below the guarded PAPER required_edge")
+        raise ManusPlacementError("ask_edge is below the guarded PAPER required_edge", "edge-below-threshold")
     # Rounding remains a legacy/reporting representation only; all guarded
     # risk decisions above use the exact Decimal values from the inputs.
     spread = round(float(exact_spread), 4)
@@ -448,7 +494,7 @@ def record_manus_paper_placement(
     # below is exactly the extraction semantics used by core/scan.py.
     live_event_id = _read_live_event_id(market_id)
     if live_event_id != event_id:
-        raise ManusPlacementError("trusted fixture event_id does not match live market event identity")
+        raise ManusPlacementError("trusted fixture event_id does not match live market event identity", "event-identity-mismatch")
 
     # Every open legacy row without an event id must be resolved before this
     # event's exposure can be proven safe. Unknown identity fails closed.
@@ -456,7 +502,10 @@ def record_manus_paper_placement(
     for row in open_positions:
         existing_event_id = row.get("event_id")
         if existing_event_id is None:
-            existing_event_id = _read_live_event_id(_require_identifier(row.get("market_id"), "legacy market_id"))
+            existing_event_id = _read_live_event_id(
+                _require_identifier(row.get("market_id"), "legacy market_id"),
+                unresolved_code="event-identity-unresolved-existing-position",
+            )
         else:
             existing_event_id = _require_identifier(existing_event_id, "existing event_id")
         if existing_event_id == event_id:
@@ -464,7 +513,7 @@ def record_manus_paper_placement(
                 row.get("stake_usd"), "existing event stake", positive=True
             )
     if open_event_stake + policy["stake"] > policy["max_stake_per_event_usd"]:
-        raise ManusPlacementError("max_stake_per_event_usd reached")
+        raise ManusPlacementError("max_stake_per_event_usd reached", "risk-cap-event")
 
     row = {
         "id": uuid.uuid4().hex[:12],
@@ -499,9 +548,9 @@ def record_manus_paper_placement(
     try:
         _atomic_append_source_record(ledger_path, row)
     except OSError as exc:
-        raise ManusPlacementError("guarded PAPER ledger write failed") from exc
+        raise ManusPlacementError("guarded PAPER ledger write failed", "ledger-write-failed") from exc
     except Exception as exc:  # noqa: BLE001 -- no partial source-row mutation
-        raise ManusPlacementError("guarded PAPER ledger write failed") from exc
+        raise ManusPlacementError("guarded PAPER ledger write failed", "ledger-write-failed") from exc
     return {
         "placed": row["id"],
         "filled_at": ask,

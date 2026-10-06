@@ -74,7 +74,7 @@ def snapshot_tree(root):
     }
 
 
-class GuardedForecastBridgeTests(unittest.TestCase):
+class GuardedForecastBridgeTestsMixin:
     def setUp(self):
         self.fixture = copy.deepcopy(FIXTURE)
         self.packet = prepare_packet(self.fixture)
@@ -500,3 +500,89 @@ class GuardedForecastBridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardedForecastBridgeTests(GuardedForecastBridgeTestsMixin, unittest.TestCase):
+    """Original guarded forecast bridge regression suite."""
+
+
+class GuardedForecastRejectionCodeTests(GuardedForecastBridgeTestsMixin, unittest.TestCase):
+    """Protected forecast rejections carry stable bounded codes."""
+
+    def _code_for(self, *, intent=None, market=None, tokens=None, prices=(0.49, 0.51),
+                  gamma_error=None, already_applied=None, probability=None):
+        intent = copy.deepcopy(self.intent if intent is None else intent)
+        if probability is not None:
+            intent["estimated_probability"] = probability
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            forecast_path = pathlib.Path(temporary_directory) / "forecasts.jsonl"
+            if gamma_error is not None:
+                stack = ExitStack()
+                stack.enter_context(
+                    patch.object(forecast_core.pmapi, "gamma_market", side_effect=gamma_error)
+                )
+            else:
+                stack = self._public_market(market=market, tokens=tokens, prices=prices)
+            with stack:
+                try:
+                    record_candidate_forecast(
+                        self.fixture,
+                        json.dumps(intent),
+                        already_applied,
+                        _forecast_path=forecast_path,
+                    )
+                except GuardianValidationError as exc:
+                    return getattr(exc, "code", None)
+        raise AssertionError("expected GuardianValidationError with a rejection code")
+
+    def test_forecast_rejection_vocabulary_is_closed(self):
+        codes = forecast_core.FORECAST_REJECTION_CODES
+        self.assertIn("unclassified", codes)
+        for expected in ("duplicate-forecast", "market-closed", "outcome-token-invalid",
+                         "market-data-unavailable", "orderbook-unavailable",
+                         "extreme-disagreement", "invalid-input"):
+            self.assertIn(expected, codes)
+
+    def test_each_forecast_guard_maps_to_its_stable_code(self):
+        scenarios = [
+            ("market-closed", dict(market=dict(self._market(), closed=True))),
+            ("outcome-token-invalid", dict(tokens={"Wake Forest": "token-wake"})),
+            ("market-data-unavailable", dict(gamma_error=RuntimeError("gamma down"))),
+            ("orderbook-unavailable", dict(prices=(None, None))),
+            ("extreme-disagreement", dict(probability=0.99)),
+        ]
+        for label, kwargs in scenarios:
+            with self.subTest(label=label):
+                self.assertEqual(self._code_for(**kwargs), label)
+
+    def test_duplicate_forecast_intent_maps_to_duplicate_code(self):
+        intent = valid_intent(self.packet, disposition="bet")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            forecast_path = pathlib.Path(temporary_directory) / "forecasts.jsonl"
+            with self._public_market():
+                record_candidate_forecast(self.fixture, json.dumps(intent), None, _forecast_path=forecast_path)
+            with self._public_market():
+                try:
+                    record_candidate_forecast(self.fixture, json.dumps(intent), None, _forecast_path=forecast_path)
+                except GuardianValidationError as exc:
+                    code = getattr(exc, "code", None)
+        self.assertEqual(code, "duplicate-forecast")
+
+    def test_invalid_provenance_maps_to_invalid_input_code(self):
+        intent = valid_intent(self.packet, disposition="bet")
+        intent["intent_id"] = "not-a-uuid"
+        self.assertEqual(self._code_for(intent=intent), "invalid-input")
+
+    def test_unexpected_forecast_failure_has_no_trusted_code(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            forecast_path = pathlib.Path(temporary_directory) / "forecasts.jsonl"
+            with patch.object(forecast_core.pmapi, "gamma_market", side_effect=KeyboardInterrupt("boom")):
+                try:
+                    forecast_core.record_forecast(
+                        market_id="m", outcome="o", est_prob=0.6, category="c",
+                        skip_reason="bet", note="n", source_intent_id=FIRST_INTENT_ID,
+                        forecast_path=forecast_path,
+                    )
+                except (forecast_core.ForecastRecordError, KeyboardInterrupt) as exc:
+                    code = getattr(exc, "code", None) if isinstance(exc, forecast_core.ForecastRecordError) else "untrusted"
+        self.assertEqual(code, "untrusted")

@@ -76,6 +76,45 @@ _RECEIPT_FIELDS = frozenset(
         "updated_at",
     }
 )
+# Closed diagnostic vocabularies and their operator-facing classification.
+# This mapping is metadata only: it never alters guard order, policy, or any
+# retry behavior, and ``infrastructure`` codes are NOT automatically retried.
+REJECTION_CODES = frozenset(ledger_core.PLACEMENT_REJECTION_CODES) | frozenset(
+    forecast_core.FORECAST_REJECTION_CODES
+)
+REJECTION_CLASSIFICATIONS = {
+    # provenance: identity/data binding defects
+    "duplicate-source-intent": "provenance",
+    "duplicate-source-forecast": "provenance",
+    "duplicate-forecast": "provenance",
+    "forecast-provenance-invalid": "provenance",
+    "event-identity-mismatch": "provenance",
+    "invalid-input": "provenance",
+    # policy: risk/policy rejections that a re-run cannot fix
+    "duplicate-market-outcome": "policy",
+    "max-open-positions": "policy",
+    "insufficient-cash": "policy",
+    "packet-position-cap": "policy",
+    "category-position-cap": "policy",
+    "risk-cap-event": "policy",
+    "entry-price-out-of-bounds": "policy",
+    "spread-too-wide": "policy",
+    "edge-below-threshold": "policy",
+    "too-close-to-resolution": "policy",
+    "market-closed": "policy",
+    "extreme-disagreement": "policy",
+    # infrastructure: transient provider/orderbook/file failures
+    "market-data-unavailable": "infrastructure",
+    "orderbook-unavailable": "infrastructure",
+    "outcome-token-invalid": "infrastructure",
+    "event-identity-unresolved-current-market": "infrastructure",
+    "event-identity-unresolved-existing-position": "infrastructure",
+    "ledger-write-failed": "infrastructure",
+    # internal: operator policy files or unexpected failures
+    "invalid-policy": "internal",
+    "unclassified": "internal",
+}
+_OPTIONAL_RECEIPT_FIELDS = frozenset({"rejection_code"})
 _FORBIDDEN_OPTION_TERMS = frozenset(
     {
         "intent-file",
@@ -115,7 +154,16 @@ _SHA256_LENGTH = 64
 
 
 class PaperApplyError(RuntimeError):
-    """Raised when staging, reconciliation, or guarded application rejects."""
+    """Raised when staging, reconciliation, or guarded application rejects.
+
+    ``code`` is an optional stable diagnostic identifier drawn from
+    ``REJECTION_CODES``. It never carries exception text, filesystem paths,
+    or provider response content, and is diagnostic metadata only.
+    """
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def _utc_timestamp(now: Callable[[], dt.datetime]) -> str:
@@ -373,7 +421,8 @@ def _new_receipt(context: dict[str, Any], now: Callable[[], dt.datetime]) -> dic
 
 
 def _validate_receipt(receipt: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    if set(receipt) != _RECEIPT_FIELDS:
+    allowed_fields = _RECEIPT_FIELDS | _OPTIONAL_RECEIPT_FIELDS
+    if not _RECEIPT_FIELDS <= set(receipt) or not set(receipt) <= allowed_fields:
         raise PaperApplyError("Application receipt is malformed")
     expected = _new_receipt(context, lambda: dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc))
     for field in (
@@ -397,6 +446,9 @@ def _validate_receipt(receipt: dict[str, Any], context: dict[str, Any]) -> dict[
     for field in ("created_at", "updated_at"):
         if not isinstance(receipt.get(field), str) or not receipt[field].endswith("Z"):
             raise PaperApplyError(f"Application receipt {field} is invalid")
+    rejection_code = receipt.get("rejection_code")
+    if rejection_code is not None and (not isinstance(rejection_code, str) or rejection_code not in REJECTION_CODES):
+        raise PaperApplyError("Application receipt rejection_code is invalid")
     return receipt
 
 
@@ -439,6 +491,16 @@ def _atomic_write_receipt(path: pathlib.Path, receipt: dict[str, Any]) -> None:
         raise PaperApplyError("Application receipt write failed") from None
 
 
+def _bounded_rejection_code(error: BaseException | None) -> str | None:
+    """Map an error to a stable vocabulary code without persisting its text."""
+    if error is None:
+        return None
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code in REJECTION_CODES:
+        return code
+    return "unclassified"
+
+
 def _transition_receipt(
     path: pathlib.Path,
     receipt: dict[str, Any],
@@ -447,6 +509,7 @@ def _transition_receipt(
     now: Callable[[], dt.datetime],
     forecast_id: str | None = None,
     placement_id: str | None = None,
+    rejection_code: str | None = None,
 ) -> dict[str, Any]:
     if state not in _RECEIPT_STATES:
         raise ValueError("invalid application state")
@@ -457,6 +520,12 @@ def _transition_receipt(
         "placement_id": receipt["placement_id"] if placement_id is None else placement_id,
         "updated_at": _utc_timestamp(now),
     }
+    # The code is persisted only for rejected/error terminals; historical
+    # receipts and all other states keep the field absent, unchanged.
+    if rejection_code is not None:
+        if rejection_code not in REJECTION_CODES:
+            rejection_code = "unclassified"
+        updated["rejection_code"] = rejection_code
     _atomic_write_receipt(path, updated)
     return updated
 
@@ -562,7 +631,7 @@ def _record_forecast(
     try:
         return record_candidate_forecast(context["fixture"], context["intent_raw"], **kwargs)
     except GuardianValidationError as exc:
-        raise PaperApplyError(f"Guarded forecast rejected: {exc}") from None
+        raise PaperApplyError(f"Guarded forecast rejected: {exc}", code=getattr(exc, "code", None)) from None
 
 
 def _record_placement(
@@ -582,7 +651,7 @@ def _record_placement(
     try:
         return record_candidate_paper_placement(context["fixture"], context["intent_raw"], **kwargs)
     except GuardianValidationError as exc:
-        raise PaperApplyError(f"Guarded PAPER placement rejected: {exc}") from None
+        raise PaperApplyError(f"Guarded PAPER placement rejected: {exc}", code=getattr(exc, "code", None)) from None
 
 
 def _result(
@@ -600,6 +669,7 @@ def _result(
             "placement_id": receipt["placement_id"],
             "placement_status": placement_status,
             "application_state": receipt["state"],
+            "rejection_code": receipt.get("rejection_code"),
         }
     )
     return result
@@ -745,9 +815,12 @@ def run(
         receipt = _transition_receipt(receipt_path, receipt, "forecast-pending", now=_now)
         try:
             recorded = _record_forecast(context, _forecast_path)
-        except PaperApplyError:
+        except PaperApplyError as exc:
             try:
-                _transition_receipt(receipt_path, receipt, "forecast-rejected", now=_now)
+                _transition_receipt(
+                    receipt_path, receipt, "forecast-rejected", now=_now,
+                    rejection_code=_bounded_rejection_code(exc),
+                )
             except PaperApplyError:
                 pass
             raise
@@ -803,10 +876,11 @@ def run(
             ledger_path=_ledger_path,
             now=_placement_now,
         )
-    except PaperApplyError:
+    except PaperApplyError as exc:
         try:
             rejected = _transition_receipt(
-                receipt_path, receipt, "placement-rejected", now=_now, forecast_id=forecast["id"]
+                receipt_path, receipt, "placement-rejected", now=_now, forecast_id=forecast["id"],
+                rejection_code=_bounded_rejection_code(exc),
             )
         except PaperApplyError:
             raise PaperApplyError("Guarded PAPER placement rejected; receipt state requires reconciliation") from None

@@ -172,7 +172,7 @@ def _concurrent_bet_apply_worker(
         results.put(("error", str(exc)))
 
 
-class PaperApplyTests(unittest.TestCase):
+class PaperApplyTestsMixin:
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary_directory.name)
@@ -853,3 +853,132 @@ class PaperApplyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaperApplyTests(PaperApplyTestsMixin, unittest.TestCase):
+    """Original PAPER application regression suite."""
+
+
+class RejectionCodeReceiptTests(PaperApplyTestsMixin, unittest.TestCase):
+    """Rejected receipts persist one bounded, closed-vocabulary code."""
+
+    def test_rejection_code_vocabulary_is_closed_and_classified(self):
+        from manus.paper_apply import REJECTION_CODES, REJECTION_CLASSIFICATIONS
+        self.assertLessEqual(ledger_core.PLACEMENT_REJECTION_CODES, REJECTION_CODES)
+        self.assertLessEqual(forecast_core.FORECAST_REJECTION_CODES, REJECTION_CODES)
+        self.assertEqual(set(REJECTION_CLASSIFICATIONS), REJECTION_CODES)
+        for code, classification in REJECTION_CLASSIFICATIONS.items():
+            self.assertIn(classification, {"provenance", "policy", "infrastructure", "internal"})
+
+    def test_placement_rejection_receipt_persists_bounded_code(self):
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.61)):
+            result = self.call()
+        self.assertEqual(result["application_state"], "placement-rejected")
+        self.assertEqual(result["rejection_code"], "spread-too-wide")
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "placement-rejected")
+        self.assertEqual(receipt["rejection_code"], "spread-too-wide")
+        # Replay keeps the persisted code and does not re-derive it.
+        again = self.call()
+        self.assertEqual(again["rejection_code"], "spread-too-wide")
+
+    def test_market_data_failure_receipt_maps_to_infrastructure_code(self):
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        # Patching the shared pmapi seam fails the guarded forecast recording
+        # before placement: the receipt records the bounded infrastructure code.
+        with patch.object(ledger_core.pmapi, "gamma_market", side_effect=OSError("gamma down")):
+            with self.assertRaisesRegex(paper_apply.PaperApplyError, "Guarded forecast rejected"):
+                self.call()
+        self.assertEqual(self.receipt()["state"], "forecast-rejected")
+        self.assertEqual(self.receipt()["rejection_code"], "market-data-unavailable")
+
+    def test_forecast_rejection_receipt_persists_bounded_code(self):
+        self.stage()
+        with patch.object(
+            paper_apply, "record_candidate_forecast",
+            side_effect=paper_apply.PaperApplyError("rejected", code="extreme-disagreement"),
+        ):
+            with self.assertRaisesRegex(paper_apply.PaperApplyError, "rejected"):
+                self.call()
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "forecast-rejected")
+        self.assertEqual(receipt["rejection_code"], "extreme-disagreement")
+
+    def test_unexpected_forecast_failure_persists_unclassified(self):
+        self.stage()
+        with patch.object(
+            paper_apply, "record_candidate_forecast",
+            side_effect=paper_apply.PaperApplyError("boom"),
+        ):
+            with self.assertRaisesRegex(paper_apply.PaperApplyError, "boom"):
+                self.call()
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "forecast-rejected")
+        self.assertEqual(receipt["rejection_code"], "unclassified")
+
+    def test_successful_applications_have_no_rejection_code(self):
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market():
+            result = self.call()
+        self.assertEqual(result["application_state"], "completed-placement")
+        self.assertIsNone(result["rejection_code"])
+        self.assertNotIn("rejection_code", self.receipt())
+
+    def test_historical_receipt_without_code_still_replays(self):
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.61)):
+            self.call()
+        receipt = self.receipt()
+        del receipt["rejection_code"]
+        paper_apply._atomic_write_receipt(self.receipt_path(), receipt)
+        result = self.call()
+        self.assertEqual(result["application_state"], "placement-rejected")
+        self.assertIsNone(result["rejection_code"])
+
+    def test_malformed_receipt_code_fails_closed(self):
+        self.stage()
+        receipt = paper_apply._new_receipt(self.context(), lambda: NOW)
+        receipt["rejection_code"] = "totally-unknown-code"
+        paper_apply._atomic_write_receipt(self.receipt_path(), receipt)
+        with self.assertRaisesRegex(paper_apply.PaperApplyError, "rejection_code is invalid"):
+            self.call()
+
+    def test_error_state_receipt_persists_code(self):
+        self.stage()
+        receipt = paper_apply._new_receipt(self.context(), lambda: NOW)
+        receipt["state"] = "error"
+        paper_apply._atomic_write_receipt(self.receipt_path(), receipt)
+        with patch.object(paper_apply, "record_candidate_forecast", side_effect=AssertionError("no forecast")):
+            with patch.object(
+                paper_apply, "record_candidate_paper_placement",
+                side_effect=paper_apply.PaperApplyError("x", code="insufficient-cash"),
+            ):
+                # error state replays as terminal without a new guarded call;
+                # this scenario instead covers the transition directly.
+                pass
+        transitioned = paper_apply._transition_receipt(
+            self.receipt_path(), receipt, "error", now=lambda: NOW,
+            rejection_code="insufficient-cash",
+        )
+        self.assertEqual(transitioned["rejection_code"], "insufficient-cash")
+
+    def test_runner_summary_contract_via_terminal_update(self):
+        from manus.paper_apply import REJECTION_CODES
+        from manus import paper_runner
+        # out-of-vocabulary values map to unclassified at the runner boundary
+        class _Application(dict):
+            pass
+        self.assertEqual(
+            paper_runner._bounded_rejection_code({"rejection_code": "edge-below-threshold"}),
+            "edge-below-threshold",
+        )
+        self.assertEqual(
+            paper_runner._bounded_rejection_code({"rejection_code": "made-up-code"}),
+            "unclassified",
+        )
+        self.assertIsNone(paper_runner._bounded_rejection_code({}))
