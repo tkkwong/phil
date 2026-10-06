@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import errno
 import hashlib
 import inspect
 import io
@@ -22,6 +23,26 @@ CYCLE_ID = "123e4567-e89b-42d3-a456-426614174000"
 OTHER_CYCLE_ID = "223e4567-e89b-42d3-a456-426614174000"
 NOW = dt.datetime(2026, 9, 29, 12, 0, 0, tzinfo=dt.timezone.utc)
 FLOOR_MINUTES = paper_runner.core_scan.PROTECTED["min_minutes_to_resolution"]
+_SYMLINK_PRIVILEGE_MESSAGE = "OS denied symlink creation (WinError 1314 equivalent)"
+
+
+def create_symlink(link: pathlib.Path, target: pathlib.Path) -> bool:
+    """Create a test symlink fixture, returning False when the OS denies it.
+
+    A normal non-elevated Windows session cannot create symlinks without
+    Developer Mode or the SeCreateSymbolicLinkPrivilege. This helper is only
+    for constructing test fixtures; production path-safety behavior is never
+    skipped because of it.
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            return False
+        if isinstance(error, NotImplementedError) or error.errno in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+            return False
+        raise
+    return True
 
 
 def provider_metadata(tag_ids=("1",)):
@@ -232,7 +253,8 @@ class PaperCycleInspectorTests(unittest.TestCase):
         # Runner root behind a symlink is rejected by the shared runner
         # validation before any file is read.
         link_root = self.root / "linked-runner"
-        link_root.symlink_to(self.root / "elsewhere")
+        if not create_symlink(link_root, self.root / "elsewhere"):
+            self.skipTest(_SYMLINK_PRIVILEGE_MESSAGE)
         with self.assertRaises(paper_cycle_inspector.PaperCycleInspectorError):
             paper_cycle_inspector.status(now=lambda: NOW, _runner_root=link_root)
         # A symlinked cycle file is rejected by the shared regular-file read.
@@ -242,7 +264,8 @@ class PaperCycleInspectorTests(unittest.TestCase):
         external = self.root / "external-cycle.json"
         external.write_bytes(cycle_bytes)
         real_cycle.unlink()
-        real_cycle.symlink_to(external)
+        if not create_symlink(real_cycle, external):
+            self.skipTest(_SYMLINK_PRIVILEGE_MESSAGE)
         with self.assertRaises(paper_cycle_inspector.PaperCycleInspectorError):
             paper_cycle_inspector.status(now=lambda: NOW, _runner_root=self.runner_root)
 
