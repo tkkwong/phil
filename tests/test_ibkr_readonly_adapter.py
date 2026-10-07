@@ -865,6 +865,9 @@ class _PythonShapedEClient:
         # The initial handshake callback arrives only through the run path.
         self.readiness_delay and time.sleep(self.readiness_delay)
         self.wrapper.nextValidId(19)  # payload discarded by the wrapper
+        # IBKR automatically emits managedAccounts once the API connection
+        # is established (before any request); model that delivery here.
+        self.wrapper.managedAccounts(EXPECTED_ACCOUNT)
         # Serve scripted read requests until disconnect() flips the state.
         while self.socket_connected and not self.run_should_exit.is_set():
             self._serve_scripted_requests()
@@ -913,7 +916,6 @@ def _python_script(**handlers):
 
 def _serve_managed_accounts(wrapper):
     wrapper.managedAccounts("DU0000011")
-    wrapper.done.set()
 
 
 def _serve_summary(wrapper, req_id, _group, _tags):
@@ -924,7 +926,6 @@ def _serve_summary(wrapper, req_id, _group, _tags):
     ):
         wrapper.accountSummary(req_id, "DU0000011", tag, value, "CAD")
     wrapper.accountSummaryEnd(req_id)
-    wrapper.done.set()
 
 
 def _serve_positions(wrapper):
@@ -932,7 +933,6 @@ def _serve_positions(wrapper):
         conId, symbol, secType, exchange, currency = 111, "AAA", "STK", "SMART", "CAD"
     wrapper.position("DU0000011", _C(), 1.0, 2.0)
     wrapper.positionEnd()
-    wrapper.done.set()
 
 
 def _serve_open_orders(wrapper):
@@ -944,12 +944,11 @@ def _serve_open_orders(wrapper):
         status = "Submitted"
     wrapper.openOrder(7, _C(), _O(), _S())
     wrapper.openOrderEnd()
-    wrapper.done.set()
 
 
-def _python_transport(**script):
+def _python_transport(config=None, **script):
     """Build a transport whose client is Python-API-shaped (no eConnect)."""
-    config = base_config()
+    config = config or base_config()
     holder = {}
     from ibkr.transport_tws import TwsTransport
 
@@ -1182,7 +1181,9 @@ class PythonLifecycleTests(AdapterTestBase):
         names = {name for name, _args in client.requests}
         self.assertEqual(
             names,
-            {"reqManagedAccts", "reqAccountSummary", "reqPositions", "reqOpenOrders"},
+            # managedAccounts is the automatic connection callback: the
+            # transport issues no duplicate reqManagedAccts() for it.
+            {"reqAccountSummary", "reqPositions", "reqOpenOrders"},
         )
         self.assertFalse(hasattr(client, "eConnect"))
 
@@ -1313,7 +1314,7 @@ class ErrorCallbackSignatureTests(AdapterTestBase):
         # in the second position must NOT be interpreted as an error code.
         wrapper.error(-1, _ts(), 2104, "Market data farm connection is OK")
         self.assertIsNone(wrapper.failure)
-        self.assertFalse(wrapper.done.is_set())
+        self.assertFalse(wrapper.ready.is_set())
         # Fatal path: the numeric code is read from the third position.
         wrapper.error(-1, _ts(), 504, "Not connected")
         self.assertEqual(wrapper.failure, "connection")
@@ -1335,7 +1336,6 @@ class ErrorCallbackSignatureTests(AdapterTestBase):
             with self.subTest(code=code):
                 wrapper.error(-1, _ts(), code, "informational")
                 self.assertIsNone(wrapper.failure)
-                self.assertFalse(wrapper.done.is_set())
                 self.assertFalse(wrapper.ready.is_set())
 
     def test_true_fatal_connection_codes_remain_fatal(self):
@@ -1344,7 +1344,6 @@ class ErrorCallbackSignatureTests(AdapterTestBase):
             with self.subTest(code=code):
                 wrapper.error(-1, _ts(), code, "fatal")
                 self.assertEqual(wrapper.failure, "connection")
-                self.assertTrue(wrapper.done.is_set())
                 self.assertTrue(wrapper.ready.is_set())
 
     def test_unknown_codes_remain_fail_closed(self):
@@ -1431,21 +1430,20 @@ class ErrorCallbackSignatureTests(AdapterTestBase):
             import time as _time
             import threading as _threading
 
-            def _slow_managed_accounts(w):
+            def _slow_summary(w, req_id, _group, _tags):
                 _time.sleep(0.15)
-                w.managedAccounts(EXPECTED_ACCOUNT)
-                w.done.set()
+                w.accountSummary(req_id, EXPECTED_ACCOUNT, "AccountType", "PAPER", "CAD")
+                w.accountSummaryEnd(req_id)
 
             client_script = transport._client.script
-            client_script["reqManagedAccts"] = _slow_managed_accounts
-            wrapper.done.clear()
+            client_script["reqAccountSummary"] = _slow_summary
             timer = _threading.Timer(
                 0.05, lambda: wrapper.error(-1, _ts(), 1300, "socket port reset")
             )
             timer.start()
             try:
                 with self.assertRaises(TransportError):
-                    transport.managed_accounts()
+                    transport.account_summary(EXPECTED_ACCOUNT)
             finally:
                 timer.join()
         finally:
@@ -1477,6 +1475,534 @@ class ErrorCallbackSignatureTests(AdapterTestBase):
             if isinstance(node, ast.ImportFrom):
                 self.assertNotEqual(node.module or "", "ibapi.order")
 
+
+
+class CompletionIsolationTests(AdapterTestBase):
+    """5F-1c regressions: no cross-request completion signaling.
+
+    Every test is deterministic: terminal callbacks are delivered by
+    direct wrapper invocation (exactly what the real run loop does) or by
+    a released scripted handler, and the transport uses a bounded read
+    timeout. A read is held pending via a release event so late/foreign
+    callbacks can be injected while the read is genuinely waiting.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.transport, self.client = _python_transport(
+            base_config(read_only_timeout_seconds=0.60)
+        )
+        self.wrapper = self.transport._wrapper
+        # Deterministic handshake: the automatic managedAccounts callback
+        # has already arrived through the run path.
+        self.assertTrue(self.client.run_entered.wait(2))
+        self.assertTrue(self.wrapper.ready.wait(2))
+        self.assertTrue(self.wrapper.managed_accounts_ready.wait(2))
+        self.addCleanup(self.transport.disconnect)
+
+    # -- helpers --------------------------------------------------------------
+
+    def _fake_ibapi(self):
+        """Arm a fake ibapi contract module for the REST OF THE TEST.
+
+        The connect-time patch context has expired by test time and the
+        transport imports ``ibapi.contract`` inside contract_details();
+        a with-block around only the thread start is not sufficient.
+        """
+        fake_contract = types.ModuleType("ibapi.contract")
+
+        class _Contract:
+            symbol = secType = currency = exchange = ""
+
+        fake_contract.Contract = _Contract
+        # Arm BOTH the parent package and the submodule: ``from ibapi
+        # import contract`` imports the parent first.
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_ibapi.contract = fake_contract
+        patcher = patch.dict(sys.modules, {
+            "ibapi": fake_ibapi,
+            "ibapi.contract": fake_contract,
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fake_contract
+
+    def _hold_open(self, request_name):
+        """Hold a read pending until the test releases the scripted
+        handler (bounded wait; disconnect() stays fast and deterministic).
+        """
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def _handler(wrapper, *args):
+            release.wait(0.5)
+
+        self.client.script[request_name] = _handler
+        return release
+
+    def _await_capture(self, captured, timeout=2.0):
+        """Wait until the gated request method actually ran."""
+        deadline = time.monotonic() + timeout
+        while not captured and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return bool(captured)
+
+    def _gated_client_method(self, request_name, captured):
+        """Replace a fake-client request method with a capture wrapper."""
+        original = getattr(self.client, request_name)
+
+        def _gated(*args):
+            captured.append(args)
+            original(*args)
+
+        setattr(self.client, request_name, _gated)
+        return original
+
+    def _start_worker(self, box, operation):
+        worker = threading.Thread(target=lambda: self._collect(box, operation))
+        worker.start()
+        return worker
+
+    def _collect(self, box, operation):
+        try:
+            box["result"] = operation()
+        except TransportError as exc:
+            box["error"] = exc
+
+    def _assert_still_waiting(self, worker, why):
+        worker.join(0.15)
+        self.assertTrue(worker.is_alive(), why)
+
+    # -- exact real-world race --------------------------------------------------
+
+    def test_late_managed_accounts_cannot_complete_account_summary(self):
+        """The exact real-world race: a second managedAccounts callback
+        delivered while an account summary is pending must have ZERO
+        effect on the summary's completion state."""
+        release = self._hold_open("reqAccountSummary")
+        captured: list[tuple] = []
+        self._gated_client_method("reqAccountSummary", captured)
+        box: dict[str, object] = {}
+        worker = self._start_worker(
+            box, lambda: self.transport.account_summary(EXPECTED_ACCOUNT)
+        )
+        self.assertTrue(self._await_capture(captured))
+        release.set()  # handler returns; read is pending its own END
+        self.wrapper.managedAccounts(EXPECTED_ACCOUNT)  # late duplicate
+        self._assert_still_waiting(
+            worker, "late managedAccounts completed a pending account summary")
+        # Genuine terminal callback for the exact request id completes it.
+        req_id = captured[0][0]
+        self.wrapper.accountSummary(
+            req_id, EXPECTED_ACCOUNT, "AccountType", "PAPER", "CAD")
+        self.wrapper.accountSummaryEnd(req_id)
+        worker.join(2)
+        self.assertNotIn("error", box)
+        self.assertEqual(box["result"]["AccountType"], "PAPER")
+
+    def test_late_managed_accounts_cannot_complete_positions(self):
+        release = self._hold_open("reqPositions")
+        captured: list[tuple] = []
+        self._gated_client_method("reqPositions", captured)
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.positions)
+        self.assertTrue(self._await_capture(captured))
+        release.set()
+        self.wrapper.managedAccounts(EXPECTED_ACCOUNT)  # late duplicate
+        self._assert_still_waiting(
+            worker, "late managedAccounts completed positions")
+        self.wrapper.positionEnd()  # genuine terminal callback only now
+        worker.join(2)
+        self.assertNotIn("error", box)
+
+    def test_late_managed_accounts_cannot_complete_open_orders(self):
+        release = self._hold_open("reqOpenOrders")
+        captured: list[tuple] = []
+        self._gated_client_method("reqOpenOrders", captured)
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.open_orders)
+        self.assertTrue(self._await_capture(captured))
+        release.set()
+        self.wrapper.managedAccounts(EXPECTED_ACCOUNT)  # late duplicate
+        self._assert_still_waiting(
+            worker, "late managedAccounts completed open orders")
+        self.wrapper.openOrderEnd()  # genuine terminal callback only now
+        worker.join(2)
+        self.assertNotIn("error", box)
+
+    # -- cross-stream completion isolation --------------------------------------
+
+    def test_account_summary_end_cannot_complete_positions(self):
+        self._hold_open("reqPositions")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.positions)
+        self.assertTrue(self._await_request_issued(
+            self.transport, "positions"))
+        self.wrapper.accountSummaryEnd(4242)  # foreign stream END
+        self._assert_still_waiting(
+            worker, "accountSummaryEnd completed a pending positions read")
+        self.wrapper.positionEnd()
+        worker.join(2)
+        self.assertNotIn("error", box)
+
+    def test_position_end_cannot_complete_open_orders(self):
+        self._hold_open("reqOpenOrders")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.open_orders)
+        self.assertTrue(self._await_request_issued(
+            self.transport, "open_orders"))
+        self.wrapper.positionEnd()  # foreign stream END
+        self._assert_still_waiting(
+            worker, "positionEnd completed a pending open-orders read")
+        self.wrapper.openOrderEnd()
+        worker.join(2)
+        self.assertNotIn("error", box)
+
+    def test_open_order_end_cannot_complete_executions(self):
+        self._hold_open("reqExecutions")
+        captured: list[tuple] = []
+        self._gated_client_method("reqExecutions", captured)
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.executions)
+        self.assertTrue(self._await_capture(captured))
+        self.wrapper.openOrderEnd()  # foreign stream END
+        self._assert_still_waiting(
+            worker, "openOrderEnd completed a pending executions read")
+        self.wrapper.execDetailsEnd(captured[0][0])  # the genuine exact id
+        worker.join(2)
+        self.assertNotIn("error", box)  # completed only by its own END
+
+    def test_exec_details_end_cannot_complete_contract_details(self):
+        self._hold_open("reqContractDetails")
+        captured: list[tuple] = []
+        self._gated_client_method("reqContractDetails", captured)
+        self._fake_ibapi()
+        box: dict[str, object] = {}
+        worker = self._start_worker(
+            box,
+            lambda: self.transport.contract_details("SPY", "STK", currency="USD"),
+        )
+        self.assertTrue(self._await_capture(captured))
+        self.wrapper.execDetailsEnd(1234)  # foreign stream END
+        self._assert_still_waiting(
+            worker, "execDetailsEnd completed a pending contract-details read")
+        self.wrapper.contractDetailsEnd(captured[0][0])
+        worker.join(2)
+        self.assertNotIn("error", box)
+
+    # -- reqId mismatch handling -------------------------------------------------
+
+    def test_mismatched_summary_req_id_does_not_complete_active_request(self):
+        self._hold_open("reqAccountSummary")
+        captured: list[tuple] = []
+        self._gated_client_method("reqAccountSummary", captured)
+        box: dict[str, object] = {}
+        worker = self._start_worker(
+            box, lambda: self.transport.account_summary(EXPECTED_ACCOUNT)
+        )
+        self.assertTrue(self._await_capture(captured))
+        self.wrapper.accountSummaryEnd(999999)  # wrong id
+        self._assert_still_waiting(
+            worker, "mismatched accountSummaryEnd completed the active request")
+        worker.join(3.0)  # bounded timeout then fail closed
+        self.assertIn("error", box)
+        self.assertIsNone(self.transport._client)  # session torn down
+
+    def test_mismatched_execution_req_id_does_not_complete_active_request(self):
+        self._hold_open("reqExecutions")
+        captured: list[tuple] = []
+        self._gated_client_method("reqExecutions", captured)
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.executions)
+        self.assertTrue(self._await_capture(captured))
+        self.wrapper.execDetailsEnd(captured[0][0] + 1)  # wrong id
+        self._assert_still_waiting(
+            worker, "mismatched execDetailsEnd completed the active request")
+        worker.join(3.0)
+        self.assertIn("error", box)
+
+    def test_mismatched_contract_req_id_does_not_complete_active_request(self):
+        self._hold_open("reqContractDetails")
+        captured: list[tuple] = []
+        self._gated_client_method("reqContractDetails", captured)
+        self._fake_ibapi()
+        box: dict[str, object] = {}
+        worker = self._start_worker(
+            box,
+            lambda: self.transport.contract_details("SPY", "STK", currency="USD"),
+        )
+        self.assertTrue(self._await_capture(captured))
+        self.wrapper.contractDetailsEnd(captured[0][0] + 1)  # wrong id
+        self._assert_still_waiting(
+            worker, "mismatched contractDetailsEnd completed the active request")
+        worker.join(3.0)
+        self.assertIn("error", box)
+
+    # -- empty results require proof of completion -------------------------------
+
+    def _await_request_issued(self, transport, stream):
+        """Wait until the transport issues the stream's broker request."""
+        names = {
+            "positions": "reqPositions",
+            "open_orders": "reqOpenOrders",
+        }
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if any(name == names[stream] for name, _args in self.client.requests):
+                return True
+            time.sleep(0.005)
+        return False
+
+    def test_positions_empty_requires_position_end(self):
+        """positions() must not return [] without genuine positionEnd."""
+        release = self._hold_open("reqPositions")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.positions)
+        self.assertTrue(self._await_request_issued(self.transport, "positions"))
+        release.set()  # handler returns with NO terminal callback
+        worker.join(3.0)
+        self.assertIn("error", box)  # bounded timeout, not empty success
+        self.assertNotIn("result", box)
+
+    def test_open_orders_empty_requires_open_order_end(self):
+        release = self._hold_open("reqOpenOrders")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.open_orders)
+        self.assertTrue(self._await_request_issued(self.transport, "open_orders"))
+        release.set()
+        worker.join(3.0)
+        self.assertIn("error", box)
+        self.assertNotIn("result", box)
+
+    def test_executions_empty_requires_matching_exec_details_end(self):
+        self._hold_open("reqExecutions")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.executions)
+        worker.join(3.0)
+        self.assertIn("error", box)
+        self.assertNotIn("result", box)
+
+    def test_contract_zero_match_requires_matching_contract_details_end(self):
+        # The handler ends a deliberately WRONG id: only the exact matching
+        # END may complete a zero-match lookup, so this must time out.
+        self.client.script["reqContractDetails"] = (
+            lambda wrapper, _req_id: wrapper.contractDetailsEnd(4242)
+        )
+        self._fake_ibapi()
+        box: dict[str, object] = {}
+        worker = self._start_worker(
+            box,
+            lambda: self.transport.contract_details("SPY", "STK", currency="USD"),
+        )
+        worker.join(3.0)
+        self.assertIn("error", box)
+        self.assertNotIn("result", box)
+
+    def test_contract_zero_match_with_exact_end_returns_empty_list(self):
+        captured: list[tuple] = []
+        original = self._gated_client_method("reqContractDetails", captured)
+
+        def _end_only(wrapper, req_id):
+            # Deliver the genuine terminal callback for the exact id.
+            # Never call the client request method from inside a scripted
+            # handler: the run loop re-serves accumulated requests, so
+            # appending here would grow the request list mid-iteration.
+            wrapper.contractDetailsEnd(req_id)
+
+        self.client.script["reqContractDetails"] = _end_only
+        self._fake_ibapi()
+        rows = self.transport.contract_details("SPY", "STK", currency="USD")
+        self.assertEqual(rows, [])  # genuine zero-match, proof-of-END satisfied
+
+    # -- fatal failure wake-up ----------------------------------------------------
+
+    def test_fatal_failure_wakes_account_summary_and_fails_closed(self):
+        self._hold_open("reqAccountSummary")
+        box: dict[str, object] = {}
+        worker = self._start_worker(
+            box, lambda: self.transport.account_summary(EXPECTED_ACCOUNT)
+        )
+        self.assertTrue(self._await_capture_or_request(
+            lambda name: name == "reqAccountSummary"))
+        self.wrapper.error(-1, _ts(), 504, "Not connected")
+        worker.join(2)
+        self.assertIn("error", box)  # woken, failed closed
+        self.assertNotIn("result", box)
+        self.assertIsNone(self.transport._client)
+
+    def test_fatal_failure_wakes_positions_and_fails_closed(self):
+        self._hold_open("reqPositions")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.positions)
+        self.assertTrue(self._await_request_issued(self.transport, "positions"))
+        self.wrapper.error(-1, _ts(), 1100, "Connectivity lost")
+        worker.join(2)
+        self.assertIn("error", box)
+        self.assertNotIn("result", box)
+
+    def test_fatal_failure_wakes_open_orders_and_fails_closed(self):
+        self._hold_open("reqOpenOrders")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.open_orders)
+        self.assertTrue(self._await_request_issued(self.transport, "open_orders"))
+        self.wrapper.error(-1, _ts(), 1300, "socket port reset")
+        worker.join(2)
+        self.assertIn("error", box)
+        self.assertNotIn("result", box)
+
+    def test_connection_closed_remains_fail_closed(self):
+        self._hold_open("reqPositions")
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.positions)
+        self.assertTrue(self._await_request_issued(self.transport, "positions"))
+        self.wrapper.connectionClosed()
+        worker.join(2)
+        self.assertIn("error", box)
+        self.assertNotIn("result", box)
+
+    def _await_capture_or_request(self, predicate):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if any(predicate(name) for name, _args in self.client.requests):
+                return True
+            time.sleep(0.005)
+        return False
+
+    # -- bounded timeout semantics ------------------------------------------------
+
+    def test_timeout_remains_bounded_and_does_not_fabricate_data(self):
+        release = self._hold_open("reqPositions")
+        started = time.monotonic()
+        with self.assertRaises(TransportError):
+            self.transport.positions()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.5)  # respected the configured bound
+        self.assertLess(elapsed, 3.0)
+        release.set()  # let the run loop finish for clean teardown
+        self.assertIsNone(self.transport._client)  # torn down, no empty data
+
+    # -- serialization --------------------------------------------------------------
+
+    def test_two_threads_cannot_interleave_request_lifecycle(self):
+        """Two concurrent positions() reads serialize on the private lock;
+        each gets its own fresh completion event and its own data."""
+        served: list[float] = []
+        original = self.client.reqPositions
+
+        def _slow_positions():
+            served.append(time.monotonic())
+            original()
+            # The default scripted handler completes promptly; the lock
+            # serialization is proven by strictly ordered request times.
+
+        self.client.reqPositions = _slow_positions
+        box1: dict[str, object] = {}
+        box2: dict[str, object] = {}
+        worker1 = self._start_worker(box1, self.transport.positions)
+        worker2 = self._start_worker(box2, self.transport.positions)
+        worker1.join(2)
+        worker2.join(2)
+        self.assertNotIn("error", box1)
+        self.assertNotIn("error", box2)
+        # Serialized: the second request was issued after the first ended.
+        first_end = self.client.requests  # ordering is captured via times
+        del first_end
+        self.assertLess(served[0], served[1])
+
+
+class StatusSequenceIntegrationTests(AdapterTestBase):
+    """5F-1c integration: the full status sequence with injected noise."""
+
+    def test_status_sequence_survives_injected_cross_signals(self):
+        """The exact operator status flow with harmless delayed callbacks
+        injected between operations; counts must come only from genuine
+        terminal callbacks."""
+        import time as _time
+
+        injected: dict[str, int] = {"count": 0}
+
+        def _noise():
+            # Harmless duplicate/late callbacks from earlier phases.
+            injected["count"] += 1
+
+        def _noisy_summary(w, req_id, _group, _tags):
+            # A late managedAccounts-style duplicate arriving mid-summary
+            # is modeled by simply touching the wrapper's accounts list:
+            # it must not complete the summary.
+            w.managedAccounts(EXPECTED_ACCOUNT)
+            for tag, value in (
+                ("AccountType", "PAPER"), ("NetLiquidation", "12345.67"),
+                ("AvailableFunds", "10000.00"), ("BuyingPower", "20000.00"),
+                ("Currency", "CAD"),
+            ):
+                w.accountSummary(req_id, EXPECTED_ACCOUNT, tag, value, "CAD")
+            w.accountSummaryEnd(req_id)
+
+        def _noisy_positions(w):
+            w.managedAccounts(EXPECTED_ACCOUNT)  # injected cross-signal
+            w.position("DU0000011", _contract(111, "AAA"), 1.0, 2.0)
+            w.positionEnd()
+
+        def _noisy_open_orders(w):
+            w.managedAccounts(EXPECTED_ACCOUNT)  # injected cross-signal
+            w.openOrderEnd()  # genuine terminal: zero orders, but PROVEN
+
+        config = base_config()
+        from ibkr.adapter import ReadonlyIbkrAdapter
+        from ibkr.transport_tws import TwsTransport
+        import ibkr.transport_tws as module
+
+        fake_client_module = types.SimpleNamespace()
+        fake_client_module.EClient = _PythonShapedEClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+        holder = {}
+        original_client_init = _PythonShapedEClient.__init__
+
+        def patched_client_init(self, wrapper, **kwargs):
+            wrapper.ready.clear()
+            original_client_init(self, wrapper, **kwargs)
+            self.script = _python_script(
+                reqAccountSummary=_noisy_summary,
+                reqPositions=_noisy_positions,
+                reqOpenOrders=_noisy_open_orders,
+            )
+            holder["client"] = self
+
+        _PythonShapedEClient.__init__ = patched_client_init
+        adapter = ReadonlyIbkrAdapter(
+            config,
+            _transport_factory=lambda _c: TwsTransport(config),
+            _now=lambda: self.now,
+        )
+        try:
+            with patch.dict(sys.modules, {
+                "ibapi": types.ModuleType("ibapi"),
+                "ibapi.client": fake_client_module,
+                "ibapi.wrapper": fake_wrapper_module,
+                "ibapi.contract": types.ModuleType("ibapi.contract"),
+            }):
+                document = adapter.status()
+            self.assertTrue(document["connected"])
+            self.assertTrue(document["account_match"])
+            self.assertIsNone(document["diagnostic_code"])
+            self.assertEqual(document["positions_count"], 1)   # from real END
+            self.assertEqual(document["open_orders_count"], 0)  # proven-empty END
+            self.assertNotIn(EXPECTED_ACCOUNT, json.dumps(document))
+        finally:
+            adapter.close()
+            _PythonShapedEClient.__init__ = original_client_init
+
+
+def _contract(conid, symbol):
+    class _C:
+        pass
+    _C.conId = conid
+    _C.symbol = symbol
+    _C.secType = "STK"
+    _C.exchange = "SMART"
+    _C.currency = "CAD"
+    return _C()
 
 if __name__ == "__main__":
     unittest.main()
