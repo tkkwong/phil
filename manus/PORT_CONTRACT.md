@@ -511,3 +511,61 @@ Diagnostics follow the Patch 5E-5a closed vocabulary: `not-configured`, `connect
 ### Patch 5F-1a: official Python transport lifecycle
 
 Real PAPER smoke against the operator's installed official API (ibapi 10.50.2) proved that the Python `EClient` surface is `connect(host, port, clientId)`, `run()`, `disconnect()`, `isConnected()` and has no `eConnect`; Patch 5F-1's initial `eConnect` call was a lifecycle defect copied from the C++/Java style API naming. The transport now uses the official Python sequence exactly: `connect` (which creates and starts the reader), one bounded daemon thread running `client.run()` per connected transport to process the incoming message queue and invoke wrapper callbacks, and `disconnect()` (which ends the loop; the thread join is bounded). A successful TCP connect alone is not sufficient: every read waits, bounded, for the official initial-handshake callback `nextValidId` delivered through the message-processing path; its payload is discarded (readiness indication only, never an order id authority). Readiness timeout, connect failure, and run-loop death all disconnect and fail closed with the existing bounded diagnostics; no reconnect loop and no retry storm exist. Offline regressions model the real Python client shape (connect/run/disconnect/isConnected, deliberately no eConnect; callbacks occur only through the run path) so this defect cannot recur.
+
+### Patch 5E-6: decision provenance and offline shadow/replay
+
+``manus.decision_provenance`` is the typed, versioned, append-only decision
+audit boundary for the guarded PAPER workflow. Storage is one fixed JSONL file
+under the existing external runtime root
+(``%LOCALAPPDATA%\phil-manus\provenance\decision_provenance.jsonl``), never
+inside the repository and never in the protected ``journal/`` files. The
+schema is ``decision-provenance/v1`` and the frozen-input schema is
+``decision-frozen-input/v1``.
+
+- **Single writer / single owner**: only ``manus.paper_apply`` (the existing
+  final decision-transition owner) appends operational provenance, under the
+  fixed ``provenance-writer`` lock from ``manus.paper_locks``. The inspector
+  and every replay/shadow path are strictly read-only.
+- **Deterministic identity**: ``decision_id`` is the SHA-256 of a canonical
+  binding of execution mode, stage, phase, action, cycle identity
+  (``packet_id``), intent/market/event identity, and the frozen-input hash.
+  A given frozen decision always produces the same ``decision_id``.
+- **Idempotency/integrity semantics**:
+  (A) same ``decision_id`` with an identical canonical record is an idempotent
+  no-op; (B) the same ``decision_id`` with different canonical content fails
+  closed with ``ProvenanceWriteError``; (C) existing records are never edited
+  or replaced; (D) no truncate/rewrite ever occurs.
+- **Frozen input**: ``decision_provenance.frozen_input`` builds the canonical
+  decision-input snapshot (candidate/market/event identity, outcome,
+  end-date, category, research estimate and disposition, entry policy,
+  open-position and packet state). Its canonical JSON SHA-256 is stable under
+  key reordering and changes on any decision-relevant field change.
+- **Fail-closed provenance**: for an actionable bet, the ``attempt`` record is
+  written before ``record_candidate_paper_placement``. If provenance
+  persistence fails, the placement is refused with the bounded code
+  ``provenance-write-failed`` and no ledger mutation occurs.
+- **Trade / no-trade / rejected** are explicit bounded actions; no-trade and
+  rejection are complete records, never missing data. Existing
+  ``skip_reason`` and ``rejection_code`` values are retained verbatim in
+  ``reason_code`` / ``placement_rejection_code``; nothing is renamed.
+- **Truthful provenance**: ``research_model_id`` stays ``null`` unless
+  supplied; profile comes only from staged run metadata; ``event_id`` stays
+  ``null`` when genuinely unresolved; ``code_revision`` is ``null`` because
+  the operator runtime is not a VCS checkout. No identity is ever guessed.
+- **Replay/shadow** (``manus.shadow_replay``) is read-only: the pure
+  ``evaluate_frozen_decision`` evaluator mirrors the existing guarded order
+  (insufficient-cash -> risk-cap-event -> max-open-positions ->
+  duplicate-market-outcome -> packet-position-cap -> category-position-cap ->
+  entry-price-out-of-bounds -> spread-too-wide -> edge-below-threshold ->
+  non-bet disposition) and produces identical decisions from identical
+  inputs. Replay/shadow never append provenance, never touch journals,
+  operational state, the scanner network APIs, research transport,
+  ``paper_apply``, or the broker adapter, and never fetch live data.
+  ``replayability_status`` reports the bounded vocabulary
+  ``replayable`` / ``replay-input-incomplete`` / ``provenance-unavailable``.
+- **Shadow engines** are typed callables on the frozen input
+  (``shadow_replay.ShadowEngine``). The repository bundles no engine, so no
+  JEV/AI implementation, network call, or key handling can occur; future
+  engines plug in behind explicit operator authorization.
+- **Zero import side effects**: importing the new modules performs no I/O,
+  network, thread, credential, or directory creation.

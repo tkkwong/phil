@@ -355,3 +355,19 @@ def acquire_journal_writer_lock(
         timeout_seconds=timeout_seconds,
         _lock_root=_lock_root,
     )
+
+
+def acquire_provenance_writer_lock(
+    *,
+    nonblocking: bool = True,
+    timeout_seconds: float | None = None,
+    _lock_root: pathlib.Path | None = None,
+) -> PaperLock:
+    """Acquire the fixed append-only decision-provenance writer boundary."""
+    return _acquire(
+        "provenance-writer",
+        purpose="manus-decision-provenance",
+        nonblocking=nonblocking,
+        timeout_seconds=timeout_seconds,
+        _lock_root=_lock_root,
+    )
