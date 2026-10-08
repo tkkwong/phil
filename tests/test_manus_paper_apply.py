@@ -851,6 +851,145 @@ class PaperApplyTestsMixin:
             self.assertNotIn(forbidden, source)
 
 
+class ProvenanceIntegrationTests(PaperApplyTestsMixin, unittest.TestCase):
+    """5E-6: guarded decisions produce typed, append-only provenance records."""
+
+    def _provenance_records(self):
+        from manus import decision_provenance as dp
+        root = self.staging_root.parent / "decision-provenance"
+        return dp.read_decision_records(_provenance_root=root)
+
+    def test_successful_bet_appends_attempt_and_final_trade_records(self):
+        from manus import decision_provenance as dp
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.52)):
+            result = self.call()
+        self.assertEqual(result["application_state"], "completed-placement")
+        records = self._provenance_records()
+        self.assertEqual(len(records), 2)
+        attempt = [r for r in records if r["decision_phase"] == "attempt"]
+        final = [r for r in records if r["decision_phase"] == "final"]
+        self.assertEqual(len(attempt), 1)
+        self.assertEqual(len(final), 1)
+        self.assertEqual(attempt[0]["decision_action"], "trade")
+        self.assertEqual(attempt[0]["decision_stage"], "placement")
+        self.assertTrue(attempt[0]["placement_attempted"])
+        self.assertEqual(final[0]["placement_result"], "placed")
+        # Truthful provenance: the guarded fill payload has no same-snapshot
+        # bid, so the midpoint stays null rather than guessing one from the
+        # ask; edge is carried verbatim from the guarded payload.
+        self.assertIsNone(final[0]["market_probability"])
+        self.assertEqual(final[0]["edge"], 0.1)
+        self.assertNotEqual(final[0]["decision_id"], attempt[0]["decision_id"])
+        self.assertIsNotNone(final[0]["forecast_id"])
+        self.assertEqual(final[0]["placement_result"], "placed")
+        for record in records:
+            self.assertTrue(dp.verify_record_sha256(record))
+
+    def test_no_trade_disposition_appends_single_no_trade_record(self):
+        intent = self.intent(disposition="no-edge")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.52)):
+            result = self.call()
+        self.assertEqual(result["application_state"], "completed-no-placement")
+        records = self._provenance_records()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["decision_action"], "no-trade")
+        self.assertEqual(record["decision_stage"], "decision-policy")
+        self.assertEqual(record["decision_phase"], "final")
+        self.assertFalse(record["placement_attempted"])
+        self.assertEqual(record["reason_code"], "no-edge")
+
+    def test_forecast_rejection_appends_rejected_record_with_code(self):
+        self.stage()
+        with patch.object(
+            forecast_core.pmapi,
+            "gamma_market",
+            side_effect=OSError("gamma down"),
+        ):
+            with self.assertRaisesRegex(paper_apply.PaperApplyError, "Guarded forecast rejected"):
+                self.call()
+        records = self._provenance_records()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["decision_action"], "rejected")
+        self.assertEqual(record["decision_stage"], "forecast")
+        self.assertEqual(record["reason_code"], "market-data-unavailable")
+        self.assertFalse(record["placement_attempted"])
+
+    def test_placement_rejection_appends_rejected_record_with_trusted_code(self):
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.61)):
+            self.call()
+        records = self._provenance_records()
+        self.assertEqual(len(records), 2)
+        final = [r for r in records if r["decision_phase"] == "final"][0]
+        self.assertEqual(final["decision_action"], "rejected")
+        self.assertEqual(final["decision_stage"], "placement")
+        self.assertEqual(final["reason_code"], "spread-too-wide")
+        self.assertEqual(final["placement_rejection_code"], "spread-too-wide")
+        self.assertTrue(final["placement_attempted"])
+
+    def test_provenance_failure_fails_closed_before_placement(self):
+        from manus import decision_provenance as dp
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        ledger_before = self.ledger_path.read_bytes() if self.ledger_path.exists() else b""
+        with self.public_market(prices=(0.50, 0.52)), \
+             patch.object(
+                 dp, "append_decision_record",
+                 side_effect=dp.ProvenanceWriteError("Fixed decision provenance root is unavailable"),
+             ):
+            with self.assertRaises(paper_apply.PaperApplyError) as caught:
+                self.call()
+        self.assertEqual(caught.exception.code, "provenance-write-failed")
+        self.assertEqual(
+            self.ledger_path.read_bytes() if self.ledger_path.exists() else b"",
+            ledger_before,
+        )
+        records = self._provenance_records()
+        self.assertEqual(records, [])
+
+    def test_replay_appends_nothing_and_is_read_only(self):
+        from manus import decision_provenance as dp
+        from manus import shadow_replay as sr
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.52)):
+            self.call()
+        records = self._provenance_records()
+        self.assertEqual(len(records), 2)
+        # Operational records carry null price fields (no network I/O in the
+        # observability path), so the bounded replay status is honest:
+        # replay-input-incomplete, never a fabricated replayable claim.
+        self.assertEqual(sr.replayability_status(records[1]), "replay-input-incomplete")
+        with self.assertRaisesRegex(sr.ShadowReplayError, "replay-input-incomplete"):
+            sr.replay_provenance_record(records[1])
+        self.assertEqual(len(self._provenance_records()), 2)
+
+    def test_provenance_records_contain_no_secrets_or_paths(self):
+        intent = self.intent(disposition="bet")
+        self.stage(intent=intent)
+        with self.public_market(prices=(0.50, 0.52)):
+            self.call()
+        root = self.staging_root.parent / "decision-provenance"
+        path = dp_provenance_path = root / "decision_provenance.jsonl"
+        self.assertTrue(path.is_file())
+        text = path.read_text(encoding="utf-8")
+        self.assertNotIn("credential", text)
+        self.assertNotIn(str(self.root), text)
+        self.assertNotIn("api_key", text)
+        self.assertNotIn("Authorization", text)
+
+    def test_dry_run_never_writes_provenance(self):
+        self.stage()
+        self.call(dry_run=True)
+        self.assertEqual(self._provenance_records(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

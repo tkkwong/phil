@@ -161,5 +161,63 @@ class PaperLockTests(unittest.TestCase):
             self.assertTrue(paper_locks.path_is_unsafe_indirection(candidate))
 
 
+
+
+class ProvenanceWriterLockTests(unittest.TestCase):
+    """5E-6: the fixed provenance-writer lock serializes the audit boundary."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = pathlib.Path(self.temporary_directory.name) / "external-locks"
+        self.context = multiprocessing.get_context("spawn")
+
+    def test_provenance_writer_lock_excludes_other_processes(self):
+        with paper_locks.acquire_provenance_writer_lock(
+            nonblocking=True, _lock_root=self.root
+        ):
+            with self.assertRaises(paper_locks.LockUnavailableError):
+                paper_locks.acquire_provenance_writer_lock(
+                    nonblocking=True, _lock_root=self.root
+                )
+
+    def test_provenance_writer_lock_release_permits_reacquisition(self):
+        lock = paper_locks.acquire_provenance_writer_lock(
+            nonblocking=True, _lock_root=self.root
+        )
+        self.assertEqual(lock.name, "provenance-writer")
+        lock.release()
+        with paper_locks.acquire_provenance_writer_lock(
+            nonblocking=True, _lock_root=self.root
+        ):
+            pass
+
+    def test_provenance_writer_lock_is_distinct_from_other_logical_locks(self):
+        with paper_locks.acquire_provenance_writer_lock(
+            nonblocking=True, _lock_root=self.root
+        ):
+            # A different logical lock name does not collide with the
+            # provenance-writer boundary.
+            with paper_locks.acquire_cycle_lock(nonblocking=True, _lock_root=self.root):
+                pass
+
+    def test_provenance_writer_lock_rejects_malformed_metadata_ownership(self):
+        path = self.root / "provenance-writer.lock"
+        path.parent.mkdir(parents=True)
+        path.write_text("malformed stale metadata\n", encoding="utf-8")
+        with paper_locks.acquire_provenance_writer_lock(
+            nonblocking=True, _lock_root=self.root
+        ):
+            pass
+
+    def test_provenance_writer_lock_stored_outside_the_repository(self):
+        with paper_locks.acquire_provenance_writer_lock(
+            nonblocking=True, _lock_root=self.root
+        ) as lock:
+            self.assertNotIn(
+                str(paper_locks._repository_root()), str(lock.path)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

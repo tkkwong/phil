@@ -14,6 +14,7 @@ contract and must not run concurrently against the same journals.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import datetime as dt
 import functools
 import hashlib
@@ -38,7 +39,7 @@ from manus.paper_cycle_guardian import (
 )
 from manus.research_transport import TRANSPORT_REQUEST_SCHEMA_VERSION
 from manus import paper_locks
-
+from manus import decision_provenance
 
 APPLICATION_VERSION = "paper-apply/v1"
 _STAGING_CHILDREN = ("phil-manus", "staging")
@@ -115,6 +116,12 @@ REJECTION_CLASSIFICATIONS = {
     "unclassified": "internal",
 }
 _OPTIONAL_RECEIPT_FIELDS = frozenset({"rejection_code"})
+_PROVENANCE_ROOT_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
+    "manus_apply_provenance_root", default=None
+)
+_PROVENANCE_LOCK_ROOT_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
+    "manus_apply_provenance_lock_root", default=None
+)
 _FORBIDDEN_OPTION_TERMS = frozenset(
     {
         "intent-file",
@@ -374,6 +381,7 @@ def _load_and_validate_staging(
         "fixture_sha256": fixture_sha256,
         "intent_sha256": hashlib.sha256(intent_raw).hexdigest(),
         "receipt_path": receipt_path,
+        "metadata": metadata,
     }
 
 
@@ -687,6 +695,161 @@ def _terminal_result(context: dict[str, Any], receipt: dict[str, Any]) -> dict[s
     )
 
 
+PROVENANCE_CODE = "provenance-write-failed"
+
+
+def _provenance_code(error: BaseException | None) -> str:
+    """Map provenance failure to the existing bounded-error conventions."""
+    if isinstance(error, decision_provenance.ProvenanceWriteError):
+        return PROVENANCE_CODE
+    return "unclassified"
+
+
+def _code_revision() -> str | None:
+    """Truthful code revision: the operator's local runtime is not a VCS checkout."""
+    return None
+
+
+def _bounded_metadata_text(metadata: dict[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    if isinstance(value, str) and value and len(value) <= 128:
+        return value
+    return None
+
+
+def _frozen_input_for(context: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    """Build the frozen decision input at the application decision boundary.
+
+    Every field comes only from the trusted staged fixture/intent, the staged
+    metadata, or read-only local operational state. Unknown identity stays
+    null; no provenance is invented. Live market prices are deliberately not
+    included: reading them here would add network I/O to the observability
+    path, so replay-aware price fields remain null until the guarded record
+    functions return observed values for the placement record.
+    """
+    intent = context["intent"]
+    candidate = context["candidate"]
+    return decision_provenance.frozen_input(
+        candidate_id=intent["candidate_id"],
+        market_id=intent["market_id"],
+        outcome=intent["outcome"],
+        end_date_utc=candidate.get("end_date"),
+        category=intent["category"],
+        estimated_probability=intent["estimated_probability"],
+        forecast_disposition=intent["forecast_disposition"],
+        edge_class=intent.get("edge_class"),
+        rationale=intent.get("rationale"),
+        eligible_candidate_count=1,
+        researchable=True,
+        decision_utc=None,
+    )
+
+
+def _research_provenance(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Truthful research provenance facts from staged run metadata only."""
+    return {
+        "research_task_id": _bounded_metadata_text(metadata, "task_id"),
+        "research_provider": "manus",
+        "research_model_id": None,
+        "research_profile": _bounded_metadata_text(metadata, "resolved_agent_profile"),
+        "prompt_version": None,
+        "prompt_sha256": None,
+        "response_schema_version": _bounded_metadata_text(metadata, "validation_version"),
+    }
+
+
+def _provenance_record(
+    context: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    recorded_at_utc: str,
+    forecast_id: str | None,
+    placement_id: str | None,
+    action: str,
+    stage: str,
+    phase: str,
+    reason_code: str | None,
+    disposition: str | None,
+    market_probability: float | None,
+    edge: float | None,
+    placement_attempted: bool,
+    placement_result: str | None,
+    placement_rejection_code: str | None,
+    frozen: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one PAPER decision-provenance record from durable context facts."""
+    intent = context["intent"]
+    research = _research_provenance(metadata)
+    placement_attempted = bool(placement_attempted)
+    result = placement_result
+    if placement_result is not None and not isinstance(placement_result, str):
+        result = None
+    return decision_provenance.build_decision_record(
+        execution_mode="PAPER",
+        recorded_at_utc=recorded_at_utc,
+        code_revision=_code_revision(),
+        # The existing cycle owner is the fixture packet; its deterministic
+        # packet_id is the stable cycle identity available at this boundary.
+        cycle_id=context["packet"]["packet_id"],
+        candidate_id=intent["candidate_id"],
+        market_id=intent["market_id"],
+        event_id=context.get("event_id"),
+        source_intent_id=intent["intent_id"],
+        research_task_id=research["research_task_id"],
+        forecast_id=forecast_id,
+        research_provider=research["research_provider"],
+        research_model_id=research["research_model_id"],
+        research_profile=research["research_profile"],
+        prompt_version=research["prompt_version"],
+        prompt_sha256=research["prompt_sha256"],
+        response_schema_version=research["response_schema_version"],
+        frozen=frozen,
+        decision_action=action,
+        decision_stage=stage,
+        decision_phase=phase,
+        reason_code=reason_code,
+        disposition=disposition,
+        estimated_probability=intent["estimated_probability"],
+        market_probability=market_probability,
+        edge=edge,
+        requested_notional=None,
+        placement_attempted=placement_attempted,
+        placement_result=result,
+        placement_rejection_code=placement_rejection_code,
+    )
+
+
+def _append_provenance_record(record: dict[str, Any]) -> None:
+    """Append one provenance record; idempotent replays are no-ops."""
+    # The fixed provenance-writer lock serializes the shared append-only
+    # audit boundary across concurrent guarded applications.
+    with paper_locks.acquire_provenance_writer_lock(
+        nonblocking=False,
+        timeout_seconds=JOURNAL_WRITER_LOCK_WAIT_SECONDS,
+        _lock_root=_PROVENANCE_LOCK_ROOT_CONTEXT.get(),
+    ):
+        decision_provenance.append_decision_record(record, _provenance_root=_PROVENANCE_ROOT_CONTEXT.get())
+
+
+def _midpoint_probability(placed: dict[str, Any]) -> float | None:
+    """Deterministic market probability from the guarded fill snapshot.
+
+    The payload carries the exact ask ("filled_at") and, when the protected
+    core supplied one, the same-snapshot bid ("best_bid_at_entry"); the
+    deterministic midpoint of that observed book is the market probability.
+    When the snapshot has no bid, provenance stays null rather than
+    guessing a probability from the ask alone.
+    """
+    ask = placed.get("filled_at")
+    bid = placed.get("best_bid_at_entry")
+    if (
+        isinstance(ask, (int, float)) and not isinstance(ask, bool)
+        and isinstance(bid, (int, float)) and not isinstance(bid, bool)
+    ):
+        return round(((float(ask) + float(bid)) / 2), 4)
+    return None
+
+
 def _with_paper_application_locks(function):
     """Serialize one intent receipt and the shared Manus journal-writer path.
 
@@ -721,7 +884,15 @@ def _with_paper_application_locks(function):
                     timeout_seconds=JOURNAL_WRITER_LOCK_WAIT_SECONDS,
                     _lock_root=lock_root,
                 ):
-                    return function(fixture_path, intent_id, dry_run=False, **kwargs)
+                    provenance_root = staging_root.parent / "decision-provenance" if lock_root_value is None else lock_root.parent / "decision-provenance"
+                    provenance_lock_root = provenance_root.parent
+                    root_token = _PROVENANCE_ROOT_CONTEXT.set(provenance_root)
+                    lock_token = _PROVENANCE_LOCK_ROOT_CONTEXT.set(provenance_lock_root)
+                    try:
+                        return function(fixture_path, intent_id, dry_run=False, **kwargs)
+                    finally:
+                        _PROVENANCE_ROOT_CONTEXT.reset(root_token)
+                        _PROVENANCE_LOCK_ROOT_CONTEXT.reset(lock_token)
         except paper_locks.LockUnavailableError:
             raise PaperApplyError(
                 "PAPER application is already running or journal writer is busy; no mutation was performed"
@@ -823,6 +994,29 @@ def run(
                 )
             except PaperApplyError:
                 pass
+            try:
+                rejected_record = _provenance_record(
+                    context,
+                    context["metadata"],
+                    recorded_at_utc=_utc_timestamp(_now),
+                    forecast_id=None,
+                    placement_id=None,
+                    action="rejected",
+                    stage="forecast",
+                    phase="final",
+                    reason_code=_bounded_rejection_code(exc),
+                    disposition=disposition,
+                    market_probability=None,
+                    edge=None,
+                    placement_attempted=False,
+                    placement_result=None,
+                    placement_rejection_code=None,
+                    frozen=_frozen_input_for(context, context["metadata"]),
+                )
+                _append_provenance_record(rejected_record)
+            except decision_provenance.ProvenanceWriteError:
+                # The durable receipt already records the rejection truthfully.
+                pass
             raise
         forecast_id = recorded.get("forecast", {}).get("recorded")
         if not isinstance(forecast_id, str) or not forecast_id:
@@ -854,6 +1048,29 @@ def run(
         receipt = _transition_receipt(
             receipt_path, receipt, "completed-no-placement", now=_now, forecast_id=forecast["id"]
         )
+        try:
+            no_trade_record = _provenance_record(
+                context,
+                context["metadata"],
+                recorded_at_utc=_utc_timestamp(_now),
+                forecast_id=forecast["id"],
+                placement_id=None,
+                action="no-trade",
+                stage="decision-policy",
+                phase="final",
+                reason_code=disposition,
+                disposition=disposition,
+                market_probability=None,
+                edge=None,
+                placement_attempted=False,
+                placement_result=None,
+                placement_rejection_code=None,
+                frozen=_frozen_input_for(context, context["metadata"]),
+            )
+            _append_provenance_record(no_trade_record)
+        except decision_provenance.ProvenanceWriteError:
+            # The durable receipt already records the no-trade outcome.
+            pass
         return _result(
             context, receipt=receipt, forecast_status=forecast_status, placement_status="not-eligible-disposition"
         )
@@ -868,7 +1085,35 @@ def run(
 
     if receipt["state"] != "forecast-recorded":
         raise PaperApplyError("Bet application receipt is not ready for guarded placement")
+    frozen = _frozen_input_for(context, context["metadata"])
     receipt = _transition_receipt(receipt_path, receipt, "placement-pending", now=_now, forecast_id=forecast["id"])
+    try:
+        attempt_record = _provenance_record(
+            context,
+            context["metadata"],
+            recorded_at_utc=_utc_timestamp(_now),
+            forecast_id=forecast["id"],
+            placement_id=None,
+            action="trade",
+            stage="placement",
+            phase="attempt",
+            reason_code=None,
+            disposition=disposition,
+            market_probability=None,
+            edge=None,
+            placement_attempted=True,
+            placement_result="pending",
+            placement_rejection_code=None,
+            frozen=frozen,
+        )
+        _append_provenance_record(attempt_record)
+    except decision_provenance.ProvenanceWriteError as exc:
+        # Fail closed: an actionable PAPER decision never proceeds without
+        # durable pre-placement provenance. No ledger mutation occurs.
+        raise PaperApplyError(
+            "Decision provenance could not be written; guarded placement refused",
+            code=PROVENANCE_CODE,
+        ) from exc
     try:
         placed = _record_placement(
             context,
@@ -884,10 +1129,61 @@ def run(
             )
         except PaperApplyError:
             raise PaperApplyError("Guarded PAPER placement rejected; receipt state requires reconciliation") from None
+        try:
+            rejected_record = _provenance_record(
+                context,
+                context["metadata"],
+                recorded_at_utc=_utc_timestamp(_now),
+                forecast_id=forecast["id"],
+                placement_id=None,
+                action="rejected",
+                stage="placement",
+                phase="final",
+                reason_code=rejected.get("rejection_code"),
+                disposition=disposition,
+                market_probability=None,
+                edge=None,
+                placement_attempted=True,
+                placement_result="rejected",
+                placement_rejection_code=rejected.get("rejection_code"),
+                frozen=frozen,
+            )
+            _append_provenance_record(rejected_record)
+        except decision_provenance.ProvenanceWriteError:
+            # The durable receipt already records the bounded rejection
+            # truthfully; observability failure cannot corrupt it.
+            pass
         return _result(context, receipt=rejected, forecast_status=forecast_status, placement_status="rejected")
-    placement_id = placed.get("placement", {}).get("placed")
+    placement_result_payload = placed.get("placement", {})
+    placement_id = placement_result_payload.get("placed")
     if not isinstance(placement_id, str) or not placement_id:
         raise PaperApplyError("Guarded PAPER placement returned an invalid placement id")
+    try:
+        placed_record = _provenance_record(
+            context,
+            context["metadata"],
+            recorded_at_utc=_utc_timestamp(_now),
+            forecast_id=forecast["id"],
+            placement_id=placement_id,
+            action="trade",
+            stage="placement",
+            phase="final",
+            reason_code=None,
+            disposition=disposition,
+            # The filled price is the ask; the deterministic market
+            # probability is the midpoint derived from the same snapshot.
+            market_probability=_midpoint_probability(placement_result_payload),
+            edge=placement_result_payload.get("edge"),
+            placement_attempted=True,
+            placement_result="placed",
+            placement_rejection_code=None,
+            frozen=frozen,
+        )
+        _append_provenance_record(placed_record)
+    except decision_provenance.ProvenanceWriteError:
+        # The placement is durable and authoritative; the operator-visible
+        # state must still report the successful placement truthfully.
+        pass
     try:
         receipt = _transition_receipt(
             receipt_path, receipt, "completed-placement", now=_now,
