@@ -735,7 +735,7 @@ class ContractByConidTests(AdapterTestBase):
             with self.subTest(bad=bad):
                 with self.assertRaises(diagnostics.AdapterError) as caught:
                     adapter.lookup_contract_by_conid(bad)
-                self.assertEqual(caught.exception.code, "contract-not-found")
+                self.assertEqual(caught.exception.code, "invalid-broker-response")
         # No transport call of any kind was made: validation precedes I/O.
         self.assertEqual(transport.calls, [])
 

@@ -329,13 +329,14 @@ class ReadonlyIbkrAdapter:
         negatives fail closed). Cardinality is exact: zero matches raise
         ``contract-not-found``, one match returns the same normalized
         projection as ``lookup_contract``, and more than one raises
-        ``contract-ambiguous`` — never first-wins. Like every public read,
-        it goes through ``_verified_session`` so the account allowlist is
-        always enforced. No order object is constructed and no raw broker
-        object escapes.
+        ``contract-ambiguous`` — never first-wins. A malformed conid
+        (bool, non-int, zero, negative) raises ``invalid-broker-response``
+        BEFORE any broker I/O. Like every public read, it goes through
+        ``_verified_session`` so the account allowlist is always enforced.
+        No order object is constructed and no raw broker object escapes.
         """
         if isinstance(conid, bool) or not isinstance(conid, int) or conid <= 0:
-            self._raise("contract-not-found")
+            self._raise("invalid-broker-response")
 
         def reader(transport, connected) -> dict[str, Any] | None:
             del connected  # allowlist already enforced by _verified_session
