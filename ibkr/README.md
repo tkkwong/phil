@@ -78,6 +78,11 @@ bounded diagnostic; there is no reconnect loop and no retry storm.
   `contract-not-found`, ambiguous → `contract-ambiguous`, malformed →
   `invalid-broker-response`. No Polymarket→IBKR mapping is performed and
   no order object is ever constructed.
+- `lookup_contract_by_conid(conid)` — 5F-2a conId-primary contract identity
+  read; zero matches → `contract-not-found`, ambiguous →
+  `contract-ambiguous`, invalid conid → `invalid-broker-response`. The sole
+  lookup authority for `verify_ibkr_contract`; no Polymarket→IBKR mapping is
+  performed and no order object is ever constructed.
 - `interface`, `close()`, context-manager support.
 
 There is deliberately no placeOrder/submit/cancel/modify/exercise/transfer
@@ -124,8 +129,8 @@ Real-money execution remains prohibited.
 - Registry: `config/ibkr_instrument_mappings.json`, schema `ibkr-instrument-mappings/v1`. The committed production registry is EMPTY; add a mapping only by explicit operator review and PR, never by inference from market questions.
 - Targets: STK only in 5F-2. `conid` (positive integer) is the primary broker identity; `sec_type`, `symbol`, and `currency` are mandatory, and `exchange`, `primary_exchange`, `local_symbol`, `trading_class` are retained and cross-checked when configured.
 - Exposure: explicit `direction` (long/short) and `relationship` (DIRECT_UNDERLYING, POSITIVE_PROXY, INVERSE_PROXY, HEDGE, OTHER_EXPLICIT_PROXY). Direction is never inferred from Yes/No or instrument naming. A proxy approval authorizes use of the instrument as the configured exposure; it does not imply identical payoff, settlement, expiry, or risk. Source `end_date` is not an IBKR security expiry and creates no exit rule.
-- Verification: `verify_ibkr_contract(mapping, adapter)` performs conId-primary, read-only cross-checking through the unchanged 5F-1 `lookup_contract` surface. It requires exactly one broker match, rejects any configured-field mismatch, and never exposes EClient, ibapi objects, or account identifiers. Run it only from your own machine against your own TWS/Gateway session; this repository's development never contacts a broker.
-- CLI: `python -m ibkr.instrument_mapping --source-file FILE --registry FILE` is a pure, offline inspector. It rejects operational arguments (order, quantity, size, execute, live, arm, cancel, submit, transmit, place, buy, sell, trade, position, real) and has no broker verification command by design; verification stays a Python API so the interactive surface stays minimal.
+- Verification (5F-2a): `verify_ibkr_contract(mapping, adapter)` is conId-primary — its sole lookup call is `adapter.lookup_contract_by_conid(mapping['target']['conid'])`, with `sec_type`, `symbol`, `currency`, and configured optionals cross-checked as metadata. It requires exactly one broker match, fails closed on any configured-field mismatch (`broker-contract-mismatch`), has NO symbol fallback, and never exposes EClient, ibapi objects, or account identifiers. Run it only from your own machine against your own TWS/Gateway session; this repository's development never contacts a broker.
+- CLI (5F-2a): `python -m ibkr.instrument_mapping --source-file FILE --registry FILE` is a pure, offline inspector governed by a CLOSED option allowlist (`-h`, `--help`, `--source-file`, `--registry` only; `allow_abbrev=False`, so no abbreviation is accepted). Any other option — including `--place-order`, `--quantity`, `--size`, `--execute`, `--live`, `--arm`, `--cancel`, `--submit`, `--transmit`, `--buy`, `--sell`, `--trade`, `--position`, `--real` — is rejected by the parser itself; file-path VALUES are opaque and never substring-scanned. Rejections and mapping errors exit nonzero with a bounded operator message, no traceback, and no local source paths, credentials, or account data. It has no broker verification command by design; verification stays a Python API so the interactive surface stays minimal.
 
 CLI example (offline):
 
