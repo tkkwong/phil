@@ -647,6 +647,35 @@ class TwsTransport(ReadonlyTransport):
             wrapper.finish_contract_details(request_id)
             return rows
 
+    def contract_details_by_conid(self, conid: int) -> list[dict[str, Any]]:
+        """Read-only contract-details request addressed by exact conId.
+
+        5F-2a addition alongside (not instead of) ``contract_details``:
+        the official ``ibapi.Contract`` is used privately exactly as the
+        symbol-based method does, with the positive conId as the sole
+        lookup identity (``conId`` set; ``secType``/``exchange`` left
+        unconstrained so the broker resolves exactly the delivered conId).
+        Same scoped request-id operation, same bounded completion, same
+        normalized row shape; no Order, no EClient exposure, no raw
+        Contract/ContractDetails escape, no unrelated refactor.
+        """
+        client, wrapper = self._require_connected()
+        with self._request_lock:
+            request_id = wrapper.next_id()
+            wrapper.begin_contract_details(request_id)
+            from ibapi import contract as ibapi_contract  # type: ignore
+
+            contract = ibapi_contract.Contract()
+            contract.conId = conid
+            client.reqContractDetails(request_id, contract)
+            operation = wrapper.contract_details_operation(request_id)
+            self._complete_or_fail(
+                operation.event, lambda: operation.end_observed, "contract details"
+            )
+            rows = wrapper.contract_matches_snapshot(request_id)
+            wrapper.finish_contract_details(request_id)
+            return rows
+
 
 class _ExecutionFilter:  # pragma: no cover - trivial data holder
     """Bounded execution filter (all recent executions, no side effects)."""

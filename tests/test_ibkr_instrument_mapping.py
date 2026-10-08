@@ -119,26 +119,43 @@ class MappingCodeAssertions:
 
 
 class FakeAdapter:
-    """Fake 5F-1 adapter implementing the same read-only surface used."""
+    """Fake 5F-1 adapter (5F-2a): conId-primary read-only surface.
 
-    def __init__(self, contract=None, error_code=None):
+    ``lookup_contract`` (symbol-based) is a TRIPWIRE that records the
+    attempt and then fails: the verifier must never use it. The only
+    legitimate broker call is ``lookup_contract_by_conid``.
+    """
+
+    def __init__(self, contract=None, error_code=None, conid_matches=None):
         self.contract = contract
         self.error_code = error_code
+        self.conid_matches = conid_matches
         self.calls = []
+        self.conid_calls = []
 
     def lookup_contract(self, symbol, sec_type, *, currency=None, exchange=None):
         self.calls.append(
             {"symbol": symbol, "sec_type": sec_type, "currency": currency, "exchange": exchange}
         )
+        raise AssertionError("symbol lookup must never be used")
+
+    def lookup_contract_by_conid(self, conid):
+        self.conid_calls.append(conid)
         if self.error_code is not None:
             raise AdapterError(self.error_code)
-        if self.contract is None:
-            raise AdapterError("contract-not-found")
-        if isinstance(self.contract, list):
-            if len(self.contract) == 1:
-                return self.contract[0]
+        if self.conid_matches is not None:
+            matches = self.conid_matches
+        elif self.contract is None:
+            matches = []
+        elif isinstance(self.contract, list):
+            matches = self.contract
+        else:
+            matches = [self.contract]
+        if len(matches) > 1:
             raise AdapterError("contract-ambiguous")
-        return dict(self.contract)
+        if not matches:
+            raise AdapterError("contract-not-found")
+        return dict(matches[0])
 
 
 def broker_contract(**changes):
@@ -384,7 +401,7 @@ class PureRegistryTests(MappingCodeAssertions, unittest.TestCase):
 
 
 class BrokerVerificationTests(MappingCodeAssertions, unittest.TestCase):
-    """Instruction items 1-12: verification against a fake 5F-1 adapter only."""
+    """5F-2a items: conId-primary verification against a fake 5F-1 adapter."""
 
     def entry(self):
         return make_entry()
@@ -395,17 +412,24 @@ class BrokerVerificationTests(MappingCodeAssertions, unittest.TestCase):
         self.assertEqual(result["verification"]["status"], "verified")
         self.assertEqual(result["verification"]["adapter_version"], ADAPTER_VERSION)
         self.assertEqual(result["ibkr"]["conid"], 433489712)
-        self.assertEqual(adapter.calls, [
-            {"symbol": "FIXTUREETF", "sec_type": "STK", "currency": "USD", "exchange": None}
-        ])
+        # The ONLY broker call is the exact conId lookup.
+        self.assertEqual(adapter.conid_calls, [433489712])
+        # The symbol-based lookup tripwire was never triggered.
+        self.assertEqual(adapter.calls, [])
 
     def test_02_no_broker_result_fails_not_found(self):
         with self.expect_code("broker-contract-not-found"):
             im.verify_ibkr_contract(self.entry(), FakeAdapter(contract=None))
 
     def test_03_multiple_broker_results_fail_ambiguous(self):
+        matches = [
+            broker_contract(),
+            broker_contract(exchange="SMART", trading_class="FIXTUREETF2"),
+        ]
         with self.expect_code("broker-contract-ambiguous"):
-            im.verify_ibkr_contract(self.entry(), FakeAdapter(contract=[]))
+            im.verify_ibkr_contract(
+                self.entry(), FakeAdapter(conid_matches=matches)
+            )
 
     def test_04_wrong_conid_fails_mismatch(self):
         with self.expect_code("broker-contract-mismatch"):
@@ -457,6 +481,34 @@ class BrokerVerificationTests(MappingCodeAssertions, unittest.TestCase):
         with self.expect_code("broker-contract-mismatch"):
             im.verify_ibkr_contract(self.entry(), FakeAdapter(error_code="broker-data-unavailable"))
 
+    def test_10b_conid_is_sole_lookup_authority_and_no_symbol_fallback(self):
+        # The symbol tripwire proves conId is the sole lookup argument and
+        # that no symbol fallback exists in either direction.
+        good = FakeAdapter(contract=broker_contract())
+        result = im.verify_ibkr_contract(self.entry(), good)
+        self.assertEqual(result["verification"]["status"], "verified")
+        self.assertEqual(good.calls, [])  # symbol path never used
+        # Reverse: by-conId lookup fails even though symbol lookup would
+        # succeed — the verifier must fail closed, never fall back.
+        class _SymbolWouldSucceed(FakeAdapter):
+            def lookup_contract(self, symbol, sec_type, *, currency=None, exchange=None):
+                return broker_contract()  # symbol path would "work"
+
+        with self.expect_code("broker-contract-not-found"):
+            im.verify_ibkr_contract(self.entry(), _SymbolWouldSucceed(error_code="contract-not-found"))
+
+    def test_10c_invalid_conid_targets_fail_closed_before_any_broker_call(self):
+        for bad in (None, 0, -5, True, "433489712"):
+            entry = make_entry()
+            entry["target"]["conid"] = bad
+            entry["entry_sha256"] = im.entry_sha256(
+                {k: entry[k] for k in ("mapping_id", "status", "source", "target", "exposure", "operator_note")}
+            )
+            with self.subTest(bad=bad):
+                # Schema rejection (mapping-invalid) — the broker is never touched.
+                with self.expect_code("mapping-invalid"):
+                    im.verify_ibkr_contract(entry, FakeAdapter(contract=broker_contract()))
+
     def test_11_account_id_never_enters_result(self):
         result = im.verify_ibkr_contract(self.entry(), FakeAdapter(contract=broker_contract()))
         self.assertNotIn("account", json.dumps(result))
@@ -468,6 +520,11 @@ class BrokerVerificationTests(MappingCodeAssertions, unittest.TestCase):
         self.assertNotIn("Contract", text)
         self.assertNotIn("ibapi", text)
         self.assertNotIn("ContractDetails", text)
+
+    def test_12b_lookup_contract_method_is_never_referenced_by_verifier(self):
+        source = inspect.getsource(im.verify_ibkr_contract)
+        self.assertNotIn("lookup_contract(", source.replace("lookup_contract_by_conid(", ""))
+        self.assertIn("lookup_contract_by_conid", source)
 
     def test_disabled_mapping_cannot_be_verified(self):
         with self.expect_code("mapping-invalid"):
@@ -593,12 +650,11 @@ class SafetyAndIsolationTests(MappingCodeAssertions, unittest.TestCase):
         self.assertFalse(modules & {"socket", "urllib", "requests", "subprocess", "ibapi"})
 
     def test_verification_only_uses_lookup_contract_surface(self):
+        """5F-2a: verification uses ONLY the exact conId read surface."""
         adapter = FakeAdapter(contract=broker_contract())
         im.verify_ibkr_contract(make_entry(), adapter)
-        # Only the read-only lookup_contract method was touched.
-        self.assertEqual(list(adapter.calls), [
-            {"symbol": "FIXTUREETF", "sec_type": "STK", "currency": "USD", "exchange": None}
-        ])
+        self.assertEqual(adapter.conid_calls, [433489712])
+        self.assertEqual(adapter.calls, [])  # symbol lookup never attempted
 
     def test_resolution_performs_no_filesystem_or_network_action(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -624,7 +680,24 @@ class SafetyAndIsolationTests(MappingCodeAssertions, unittest.TestCase):
 
 
 class CliTests(MappingCodeAssertions, unittest.TestCase):
-    """Offline inspection CLI: pure, help-safe, operationally closed."""
+    """Offline inspection CLI (5F-2a): closed option allowlist.
+
+    Only ``-h``/``--help``/``--source-file``/``--registry`` exist. Option
+    VALUES (paths) are opaque and never scanned for words; unknown or
+    forbidden options fail via argparse or the bounded allowlist check;
+    no failure prints a traceback or leaks paths/secrets.
+    """
+
+    def run_cli(self, argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status = im.main(list(argv))
+        except SystemExit as exc:
+            status = 0 if exc.code in (None, 0) else 2
+        return status, out.getvalue(), err.getvalue()
 
     def _files(self, tmp, frozen, registry):
         source_path = pathlib.Path(tmp) / "source.json"
@@ -671,12 +744,43 @@ class CliTests(MappingCodeAssertions, unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("--source-file", out.getvalue())
 
+    def test_short_help_flag_exits_zero(self):
+        status, out, _err = self.run_cli(["-h"])
+        self.assertEqual(status, 0)
+        self.assertIn("--source-file", out)
+
+    def test_valid_inspection_of_paths_containing_operational_words(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            # Path VALUES containing forbidden words must be accepted as
+            # opaque filesystem paths (5F-2a Defect 2).
+            source_path = root / "phil-trade-fixture" / "real-market" / "source.json"
+            registry_path = root / "phil-trade-fixture" / "position-size" / "registry.json"
+            source_path.parent.mkdir(parents=True)
+            registry_path.parent.mkdir(parents=True)
+            source_path.write_text(json.dumps(frozen_source()), encoding="utf-8")
+            registry_path.write_text(
+                json.dumps({"schema_version": im.MAPPING_SCHEMA_VERSION, "mappings": []}),
+                encoding="utf-8",
+            )
+            status, out, err = self.run_cli([
+                "--source-file", str(source_path),
+                "--registry", str(registry_path),
+            ])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(out)["status"], "instrument-unmapped")
+        self.assertEqual(err, "")
+
     def test_forbidden_operational_arguments_are_rejected(self):
+        """5F-2a: execution-style options stay closed via the allowlist."""
         with tempfile.TemporaryDirectory() as tmp:
             source_path, registry_path = self._files(tmp, frozen_source(), {"schema_version": im.MAPPING_SCHEMA_VERSION, "mappings": []})
             for option in (
                 "--place-order",
-                "--order-type",
+                "--buy",
+                "--sell",
+                "--trade",
+                "--position",
                 "--quantity",
                 "--size",
                 "--execute",
@@ -685,12 +789,71 @@ class CliTests(MappingCodeAssertions, unittest.TestCase):
                 "--cancel",
                 "--submit",
                 "--transmit",
+                "--order-type",
+                "--place",
+                "--order",
             ):
                 with self.subTest(option=option):
-                    with self.assertRaises(im.MappingError) as caught:
-                        im.main(["--source-file", source_path, "--registry", registry_path, option])
-                    self.assertEqual(caught.exception.code, "mapping-invalid")
-                    self.assertIn("forbidden operational", str(caught.exception))
+                    status, out, err = self.run_cli([
+                        "--source-file", source_path,
+                        "--registry", registry_path,
+                        option,
+                    ])
+                    self.assertNotEqual(status, 0)
+                    self.assertNotIn("Traceback", err)
+                    self.assertNotIn(source_path, err)
+                    self.assertNotIn(registry_path, err)
+
+    def test_abbreviation_and_unknown_options_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path, registry_path = self._files(tmp, frozen_source(), {"schema_version": im.MAPPING_SCHEMA_VERSION, "mappings": []})
+            for option in ("--source", "--source-fi", "--reg", "--registr", "--unknown-option"):
+                with self.subTest(option=option):
+                    status, _out, err = self.run_cli([
+                        "--source-file", source_path,
+                        "--registry", registry_path,
+                        option,
+                    ])
+                    self.assertNotEqual(status, 0)
+                    self.assertNotIn("Traceback", err)
+
+    def test_invalid_source_file_fails_bounded_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path, registry_path = self._files(tmp, frozen_source(), {"schema_version": im.MAPPING_SCHEMA_VERSION, "mappings": []})
+            pathlib.Path(source_path).write_text("{not json", encoding="utf-8")
+            status, _out, err = self.run_cli([
+                "--source-file", source_path, "--registry", registry_path,
+            ])
+            self.assertNotEqual(status, 0)
+            self.assertNotIn("Traceback", err)
+            self.assertNotIn(source_path, err)
+            # No credentials/account data ever appear.
+            self.assertNotIn("DU", err)
+
+    def test_missing_source_file_fails_bounded_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _source_path, registry_path = self._files(
+                tmp, frozen_source(), {"schema_version": im.MAPPING_SCHEMA_VERSION, "mappings": []}
+            )
+            missing = str(pathlib.Path(tmp) / "no-such-file.json")
+            status, _out, err = self.run_cli([
+                "--source-file", missing, "--registry", registry_path,
+            ])
+            self.assertNotEqual(status, 0)
+            self.assertNotIn("Traceback", err)
+            self.assertNotIn(missing, err)
+
+    def test_invalid_registry_fails_bounded_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path, _registry_path = self._files(tmp, frozen_source(), {"schema_version": im.MAPPING_SCHEMA_VERSION, "mappings": []})
+            bad_registry = pathlib.Path(tmp) / "bad-registry.json"
+            bad_registry.write_text("{not json", encoding="utf-8")
+            status, _out, err = self.run_cli([
+                "--source-file", source_path, "--registry", str(bad_registry),
+            ])
+            self.assertNotEqual(status, 0)
+            self.assertNotIn("Traceback", err)
+            self.assertNotIn(str(bad_registry), err)
 
     def test_no_broker_verify_command_exists(self):
         parser = im.build_parser()

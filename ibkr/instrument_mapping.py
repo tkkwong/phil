@@ -8,8 +8,12 @@ hash-verified registry, and every failure mode is bounded and fail-closed.
 
 Pure registry operations are fully offline: no network, no filesystem write,
 no broker call, no journal access. The only broker interaction this package
-permits is the existing 5F-1 read-only ``lookup_contract`` surface, reused
-unchanged; no transport is created here and EClient is never exposed.
+permits is the 5F-1 read-only contract surface, and verification is
+conId-PRIMARY (5F-2a): the sole broker lookup authority is the
+operator-approved conId via ``lookup_contract_by_conid``. Symbol, secType,
+currency, and exchange are metadata assertions cross-checked AFTER the exact
+conId lookup — never a lookup key — and there is no symbol fallback. No
+transport is created here and EClient is never exposed.
 """
 from __future__ import annotations
 
@@ -122,32 +126,6 @@ _MAX_SYMBOL = 32
 _MAX_CURRENCY = 8
 _MAX_NOTE = 512
 _MAX_OUTCOMES = 16
-
-# CLI operational-term forbidlist (mirrors repository conventions).
-_FORBIDDEN_CLI_TERMS = frozenset(
-    {
-        "place",
-        "order",
-        "quantity",
-        "size",
-        "execute",
-        "live",
-        "arm",
-        "cancel",
-        "submit",
-        "transmit",
-        "sell",
-        "buy",
-        "position",
-        "trade",
-        "real",
-    }
-)
-
-CLI_HELP_HINT = (
-    "help is not an operational capability and is never rejected"
-)
-
 
 class MappingError(ValueError):
     """Raised for any bounded mapping failure.
@@ -442,15 +420,16 @@ def _resolution(
 
 
 def verify_ibkr_contract(mapping_entry: dict[str, Any], adapter: Any) -> dict[str, Any]:
-    """Read-only broker verification reusing the 5F-1 adapter unchanged.
+    """Read-only conId-primary broker verification (5F-2a).
 
-    conId is the primary broker identity: the configured conid must match
-    the single returned contract exactly, and every configured identity
-    field (sec_type, symbol, currency, plus each configured optional field)
-    must agree. Zero/ambiguous matches and any mismatch fail closed with
-    bounded codes. The adapter is used strictly through its existing
-    read-only ``lookup_contract`` surface; no transport, EClient, or ibapi
-    object is created, exposed, or returned.
+    The ONLY broker lookup authority is the operator-approved conId via the
+    5F-1 read-only ``lookup_contract_by_conid`` surface. Symbol, secType,
+    currency, and the configured optional exchange fields are metadata
+    ASSERTIONS cross-checked against the single returned contract after the
+    exact conId lookup; they are never a lookup key, and there is NO symbol
+    fallback: any lookup failure closes without retrying by symbol. Zero or
+    ambiguous matches and any mismatch fail closed with bounded codes. No
+    transport, EClient, or ibapi object is created, exposed, or returned.
     """
     try:
         entry = validate_entry(mapping_entry)
@@ -459,20 +438,8 @@ def verify_ibkr_contract(mapping_entry: dict[str, Any], adapter: Any) -> dict[st
     if entry["status"] != "active":
         raise MappingError("mapping-invalid", "only active mappings can be broker-verified")
     target = entry["target"]
-    lookup = {
-        "symbol": target["symbol"],
-        "sec_type": target["sec_type"],
-        "currency": target["currency"],
-    }
-    if target["exchange"] is not None:
-        lookup["exchange"] = target["exchange"]
     try:
-        contract = adapter.lookup_contract(
-            lookup["symbol"],
-            lookup["sec_type"],
-            currency=lookup["currency"],
-            exchange=lookup.get("exchange"),
-        )
+        contract = adapter.lookup_contract_by_conid(target["conid"])
     except AdapterError as exc:
         code = {
             "contract-not-found": "broker-contract-not-found",
@@ -516,9 +483,18 @@ def verify_ibkr_contract(mapping_entry: dict[str, Any], adapter: Any) -> dict[st
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Closed-option CLI parser (5F-2a).
+
+    The ONLY supported options are ``-h``/``--help``, ``--source-file``,
+    and ``--registry``. ``allow_abbrev=False`` keeps prefix abbreviations
+    from sneaking through, and argparse rejects every unknown option with
+    its bounded usage error. Option VALUES (filesystem paths) are opaque
+    data: they are never scanned for words.
+    """
     parser = argparse.ArgumentParser(
         prog="python -m ibkr.instrument_mapping",
         description="Offline, read-only exact source-market → IBKR mapping inspector",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--source-file",
@@ -534,27 +510,67 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _reject_forbidden_options(arguments: list[str]) -> None:
-    for argument in arguments:
-        if argument in {"-h", "--help"}:
-            # Help is not an operational capability (5E-6a convention).
+    """Kept for backwards compatibility; now a closed-allowlist check.
+
+    Only exact option NAMES from the closed allowlist are inspected.
+    Values of ``--source-file``/``--registry`` are opaque filesystem paths
+    and are never scanned. Unknown options raise ``MappingError`` here so
+    programmatic callers get the bounded code; ``main`` handles both this
+    and argparse's own usage errors with identical bounded hygiene.
+    """
+    allowlist = {"-h", "--help", "--source-file", "--registry"}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in allowlist:
+            # Skip a consumed value so an exact-match path can never be
+            # mistaken for an option (values are opaque data).
+            if argument in ("--source-file", "--registry") and index + 1 < len(arguments):
+                index += 2
+                continue
+            index += 1
             continue
-        lowered = argument.lower()
-        for term in _FORBIDDEN_CLI_TERMS:
-            if term in lowered:
-                raise MappingError("mapping-invalid", f"forbidden operational argument: {term}")
+        if argument.startswith("-"):
+            raise MappingError("mapping-invalid", "unsupported option; only -h, --help, --source-file, and --registry are available")
+        index += 1
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    _reject_forbidden_options(arguments)
     parser = build_parser()
-    options = parser.parse_args(arguments)
-    with open(options.source_file, "r", encoding="utf-8") as handle:
-        frozen_source = json.load(handle)
-    registry = load_registry(options.registry)
-    document = resolve_mapping(frozen_source, registry)
+    try:
+        _reject_forbidden_options(arguments)
+        options = parser.parse_args(arguments)
+        with open(options.source_file, "r", encoding="utf-8") as handle:
+            frozen_source = json.load(handle)
+    except json.JSONDecodeError:
+        print("error: source file is not valid JSON", file=sys.stderr)
+        return 2
+    except OSError:
+        print("error: a required input file could not be read", file=sys.stderr)
+        return 2
+    except MappingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except SystemExit as exc:
+        return _exit_code(exc.code)
+    try:
+        registry = load_registry(options.registry)
+        document = resolve_mapping(frozen_source, registry)
+    except MappingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(canonical_json(document))
     return 0
+
+
+def _exit_code(code):
+    """Bounded argparse SystemExit translation (never a traceback)."""
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 2
 
 
 if __name__ == "__main__":  # pragma: no cover

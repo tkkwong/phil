@@ -56,6 +56,10 @@ class ReadonlyTransport:
     ) -> list[dict[str, Any]]:  # pragma: no cover - interface
         raise NotImplementedError
 
+    def contract_details_by_conid(self, conid: int) -> list[dict[str, Any]]:
+        """Read-only exact-conId contract details (5F-2a)."""
+        raise NotImplementedError
+
 
 def default_transport_factory(config: dict[str, Any]) -> ReadonlyTransport:
     """Return the official-interface transport for the configured endpoint.

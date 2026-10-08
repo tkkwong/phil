@@ -177,6 +177,11 @@ class _FakeTransport:
         self.calls.append("contract_details")
         return [dict(row) for row in self.contract_rows]
 
+    def contract_details_by_conid(self, conid):
+        self.calls.append(("contract_details_by_conid", conid))
+        matches = [row for row in self.contract_rows if row.get("conid") == conid]
+        return [dict(row) for row in matches]
+
 
 class AdapterTestBase(unittest.TestCase):
     def setUp(self):
@@ -278,11 +283,13 @@ class MutationCapabilityTests(AdapterTestBase):
             if not name.startswith("_") and name not in dir(unittest.TestCase)
         ]
         # The complete public surface must be exactly this closed set.
+        # 5F-2a adds exactly one read-only member: lookup_contract_by_conid.
         self.assertEqual(
             sorted(public),
             sorted([
                 "account_summary", "close", "executions", "interface",
-                "lookup_contract", "open_orders", "positions", "status",
+                "lookup_contract", "lookup_contract_by_conid", "open_orders",
+                "positions", "status",
             ]),
         )
         lowered = [name.lower() for name in public]
@@ -331,18 +338,21 @@ class MutationCapabilityTests(AdapterTestBase):
         adapter.open_orders()
         adapter.executions()
         adapter.lookup_contract("SPY", "STK")
+        adapter.lookup_contract_by_conid(444)
         # Invariants: every operation reconnects a fresh verified session
         # (connect + managed_accounts first) and closes it afterwards.
         self.assertEqual(transport.calls[0], "connect")
-        self.assertEqual(transport.calls.count("connect"), 6)
-        self.assertEqual(transport.calls.count("disconnect"), 6)
+        self.assertEqual(transport.calls.count("connect"), 7)
+        self.assertEqual(transport.calls.count("disconnect"), 7)
         for index, call in enumerate(transport.calls):
             if call == "connect":
                 self.assertEqual(transport.calls[index + 1], "managed_accounts")
             if call == "disconnect":
-                self.assertTrue(transport.calls[index - 1] in (
+                previous = transport.calls[index - 1]
+                previous_name = previous[0] if isinstance(previous, tuple) else previous
+                self.assertTrue(previous_name in (
                     "account_summary", "positions", "open_orders",
-                    "executions", "contract_details",
+                    "executions", "contract_details", "contract_details_by_conid",
                 ))
         self.assertFalse(transport.connected)
 
@@ -356,8 +366,9 @@ class MutationCapabilityTests(AdapterTestBase):
         self.assertEqual(
             sorted(members),
             sorted([
-                "account_summary", "connect", "contract_details", "disconnect",
-                "executions", "managed_accounts", "open_orders", "positions",
+                "account_summary", "connect", "contract_details",
+                "contract_details_by_conid", "disconnect", "executions",
+                "managed_accounts", "open_orders", "positions",
             ]),
         )
 
@@ -670,6 +681,72 @@ class ContractDiscoveryTests(AdapterTestBase):
         adapter, transport = self.adapter()
         adapter.lookup_contract("SPY", "STK")
         self.assertEqual(transport.calls, ["connect", "managed_accounts", "contract_details", "disconnect"])
+
+
+class ContractByConidTests(AdapterTestBase):
+    """5F-2a: exact read-only conId lookup surface."""
+
+    def test_exact_conid_lookup_succeeds_with_normalized_projection(self):
+        adapter, _ = self.adapter()
+        record = adapter.lookup_contract_by_conid(444)
+        self.assertEqual(
+            sorted(record),
+            sorted([
+                "conid", "symbol", "local_symbol", "sec_type", "exchange",
+                "primary_exchange", "currency", "expiry", "strike", "right",
+                "multiplier", "trading_class",
+            ]),
+        )
+        self.assertEqual(record["conid"], 444)
+        self.assertEqual(record["symbol"], "SPY")
+
+    def test_conid_lookup_uses_verified_session_allowlist_boundary(self):
+        transport = _FakeTransport()
+        adapter, _ = self.adapter(transport, accounts=["DU9999999"])
+        with self.assertRaises(diagnostics.AdapterError) as caught:
+            adapter.lookup_contract_by_conid(444)
+        self.assertEqual(caught.exception.code, "unexpected-account")
+        # The allowlist failure precedes any broker contract I/O.
+        self.assertNotIn(
+            ("contract_details_by_conid", 444),
+            transport.calls,
+        )
+
+    def test_zero_conid_matches_fail_not_found(self):
+        adapter, _ = self.adapter()
+        with self.assertRaises(diagnostics.AdapterError) as caught:
+            adapter.lookup_contract_by_conid(999999)
+        self.assertEqual(caught.exception.code, "contract-not-found")
+
+    def test_multiple_conid_matches_fail_ambiguous_never_first(self):
+        class _AmbiguousTransport(_FakeTransport):
+            def contract_details_by_conid(self, conid):
+                return [_FakeTransport().contract_rows[0] for _ in range(2)]
+
+        adapter, _ = self.adapter(_AmbiguousTransport())
+        with self.assertRaises(diagnostics.AdapterError) as caught:
+            adapter.lookup_contract_by_conid(444)
+        self.assertEqual(caught.exception.code, "contract-ambiguous")
+
+    def test_invalid_conid_fails_before_broker_io(self):
+        transport = _FakeTransport()
+        adapter, _ = self.adapter(transport)
+        for bad in (True, False, 0, -1, "444", 4.0, None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(diagnostics.AdapterError) as caught:
+                    adapter.lookup_contract_by_conid(bad)
+                self.assertEqual(caught.exception.code, "contract-not-found")
+        # No transport call of any kind was made: validation precedes I/O.
+        self.assertEqual(transport.calls, [])
+
+    def test_conid_lookup_never_constructs_order_or_exposes_transport(self):
+        adapter, transport = self.adapter()
+        record = adapter.lookup_contract_by_conid(444)
+        self.assertEqual(record["conid"], 444)
+        self.assertEqual(
+            transport.calls,
+            ["connect", "managed_accounts", ("contract_details_by_conid", 444), "disconnect"],
+        )
 
 
 class IsolationTests(AdapterTestBase):
@@ -1212,6 +1289,8 @@ class PythonLifecycleTests(AdapterTestBase):
                 self.assertNotIn(str(name), ("placeOrder", "cancelOrder", "exerciseOptions"))
 
     def test_adapter_public_surface_unchanged_after_lifecycle_fix(self):
+        # 5F-2a: the closed surface gains exactly one read-only member,
+        # lookup_contract_by_conid; nothing else changes.
         public = [
             name for name in dir(ReadonlyIbkrAdapter)
             if not name.startswith("_") and name not in dir(unittest.TestCase)
@@ -1220,7 +1299,8 @@ class PythonLifecycleTests(AdapterTestBase):
             sorted(public),
             sorted([
                 "account_summary", "close", "executions", "interface",
-                "lookup_contract", "open_orders", "positions", "status",
+                "lookup_contract", "lookup_contract_by_conid", "open_orders",
+                "positions", "status",
             ]),
         )
 
