@@ -321,6 +321,38 @@ class ReadonlyIbkrAdapter:
 
         return self._read("lookup_contract", reader)
 
+    def lookup_contract_by_conid(self, conid: int) -> dict[str, Any] | None:
+        """Read-only exact conId contract lookup (5F-2a).
+
+        conId is the sole lookup identity: exactly one positive integer,
+        validated BEFORE any broker I/O (bool is not an int here; zero and
+        negatives fail closed). Cardinality is exact: zero matches raise
+        ``contract-not-found``, one match returns the same normalized
+        projection as ``lookup_contract``, and more than one raises
+        ``contract-ambiguous`` — never first-wins. A malformed conid
+        (bool, non-int, zero, negative) raises ``invalid-broker-response``
+        BEFORE any broker I/O. Like every public read, it goes through
+        ``_verified_session`` so the account allowlist is always enforced.
+        No order object is constructed and no raw broker object escapes.
+        """
+        if isinstance(conid, bool) or not isinstance(conid, int) or conid <= 0:
+            self._raise("invalid-broker-response")
+
+        def reader(transport, connected) -> dict[str, Any] | None:
+            del connected  # allowlist already enforced by _verified_session
+            matches = transport.contract_details_by_conid(conid)
+            if not matches:
+                self._raise("contract-not-found")
+            if len(matches) > 1:
+                self._raise("contract-ambiguous")
+            best = matches[0]
+            record: dict[str, Any] = {}
+            for field in _CONTRACT_FIELDS:
+                record[field] = best.get(field)
+            return record
+
+        return self._read("lookup_contract_by_conid", reader)
+
     def close(self) -> None:
         """Close the private session, if one is open."""
         self._close_quietly()

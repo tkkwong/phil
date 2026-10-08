@@ -569,3 +569,71 @@ schema is ``decision-provenance/v1`` and the frozen-input schema is
   engines plug in behind explicit operator authorization.
 - **Zero import side effects**: importing the new modules performs no I/O,
   network, thread, credential, or directory creation.
+
+### Patch 5F-2: exact source-market → IBKR instrument mapping
+
+5F-2 adds `ibkr/instrument_mapping.py`: a pure, offline, operator-controlled bridge between exact source prediction-market identities and explicitly approved IBKR instruments. Resolution is exact-key lookup only — provider + market_id + event_id + outcome — against a versioned registry (`config/ibkr_instrument_mappings.json`, schema `ibkr-instrument-mappings/v1`). There is no question-text, slug, category, ticker, similarity, LLM, or search-based mapping of any kind, and every failure is bounded: `instrument-mapped`, `instrument-unmapped`, `source-binding-mismatch`, `unsupported-security-type`, `broker-contract-not-found`, `broker-contract-ambiguous`, `broker-contract-mismatch`, `mapping-invalid`, `mapping-ambiguous`.
+
+The registry is deterministic JSON-serializable data. Each entry carries an operator-authored `mapping_id`, a hash-bound `status` (only `active` resolves), the exact source binding with a `source_binding_sha256` semantic fingerprint (provider, market_id, event_id, outcome, expected outcomes, expected end date — never volatile market data), the IBKR target identity (`conid` primary; `sec_type`, `symbol`, `currency` mandatory; `exchange`, `primary_exchange`, `local_symbol`, `trading_class` retained and cross-checked when configured), and an explicit `exposure` of `direction` (long/short) plus `relationship` (DIRECT_UNDERLYING, POSITIVE_PROXY, INVERSE_PROXY, HEDGE, OTHER_EXPLICIT_PROXY). Direction and relationship come only from the approved entry: Yes never implies long, No never implies short, and inverse proxies are never inferred. `entry_sha256` = SHA-256 of the canonical entry; reordering keys does not change it, changing conid/direction/relationship/source does.
+
+Duplicate active exact source routes are rejected (`mapping-ambiguous`); duplicate mapping_id fails closed; unknown fields fail closed everywhere. The first asset-class scope is STK only; other secTypes fail closed as intentional risk reduction before 5F-3. The committed production registry is EMPTY — an empty registry is a valid state, and any real source resolves `instrument-unmapped` rather than a guessed mapping.
+
+Broker verification (`verify_ibkr_contract(mapping, adapter)`) reuses the unchanged 5F-1 read-only `lookup_contract` surface: conId is the primary identity, exactly one match is required, and every configured identity field is cross-checked against the returned normalized contract. No transport is created, EClient is never exposed, no ibapi object leaves the 5F-1 boundary, and no account identifier enters any result. Real Windows/TWS verification is the operator's separate read-only acceptance step; the verifier is unit-tested with fakes only.
+
+The shipped CLI (`python -m ibkr.instrument_mapping inspect --source-file F --registry F` via `--source-file`/`--registry`) is pure and offline; broker verification intentionally remains a Python API to avoid widening the interactive surface. The CLI rejects operational terms (place, order, quantity, size, execute, live, arm, cancel, submit, transmit, and related) while `-h`/`--help` remain available. No existing PAPER flow imports this module: `manus.research_transport`, `manus.paper_runner`, `manus.paper_apply`, `manus.scheduled_paper`, and `core/*` are unchanged, journals and provenance are untouched, and 5F-2 defines typed mapping facts (`mapping_id`, `mapping_sha256`, `source_binding_sha256`, conid/sec_type/symbol/currency, direction, relationship) that 5F-3 can later bind into execution provenance without changing 5E-6 records.
+
+## 5F-2a — conId-primary broker verification + closed CLI allowlist
+
+**Scope.** 5F-2a hardens the 5F-2 seam in two operator-review directions and touches
+nothing else: (1) broker verification becomes genuinely conId-primary through a
+narrow read-only 5F-1 extension, (2) the mapping CLI's substring safety filter is
+replaced by a closed option allowlist with bounded error hygiene.
+
+**conId-primary verification.**
+- `ibkr/transport_tws.py` gains ONE private method, `contract_details_by_conid(conid)`,
+  mirroring the existing `contract_details()` lifecycle exactly: account verification,
+  scoped request-id operation, bounded `_complete_or_fail` timeouts, per-stream
+  completion sync, normalized rows, no raw ibapi objects escaping, no Order surface,
+  no refactoring of unrelated transport code. The private request uses an ibapi
+  Contract with only `conId` (plus exchange) set.
+- `ibkr/adapter.py` gains ONE method, `lookup_contract_by_conid(conid)`, preserving
+  `lookup_contract(...)` unchanged. It validates the conid (bool/non-int/<=0 →
+  `invalid-broker-response` BEFORE any broker I/O), goes through the same
+  `_verified_session()` account allowlist boundary as every other 5F-1 read, and maps
+  cardinality: 0 → `contract-not-found`, 1 → normalized `_CONTRACT_FIELDS` projection,
+  >1 → `contract-ambiguous`. The conId contract identity is returned first and never
+  derived from a symbol lookup.
+- `verify_ibkr_contract(mapping, adapter)` calls ONLY
+  `adapter.lookup_contract_by_conid(mapping["target"]["conid"])`. There is NO symbol
+  fallback in either direction: a fake adapter whose symbol lookup raises and whose
+  conId lookup succeeds verifies successfully, while an adapter whose conId lookup
+  fails fails closed even when a symbol lookup would have succeeded. After the conId
+  read, `conid`, `sec_type`, `symbol`, and `currency` plus configured optionals
+  (`exchange`, `primary_exchange`, `local_symbol`, `trading_class`) are cross-checked
+  as metadata; any mismatch → `broker-contract-mismatch` and the verifier fails closed.
+- Broker verification remains a Python API only. The CLI has no verification command.
+  Real TWS/Gateway verification is operator-only, on the operator's machine, after
+  operator review of this PR.
+
+**Closed CLI allowlist.**
+- The mapping CLI accepts exactly `-h`, `--help`, `--source-file FILE`, and
+  `--registry FILE`. The parser is built with `allow_abbrev=False`, so option
+  abbreviation (`--source-f`, `--reg`, ...) is rejected.
+- The previous substring safety filter (which scanned argument VALUES, rejecting
+  legitimate path names containing "trade"/"real"/"position"/"size") is REMOVED.
+  File-path VALUES are opaque and never scanned. All previously forbidden options
+  (`--place-order`, `--quantity`, `--size`, `--execute`, `--live`, `--arm`,
+  `--cancel`, `--submit`, `--transmit`, `--place`, `--buy`, `--sell`, `--trade`,
+  `--position`, `--real`) are rejected by the parser itself — they are simply outside
+  the closed allowlist.
+- Error hygiene: parser and mapping rejections exit nonzero with a bounded operator
+  message; `MappingError` and `AdapterError` are caught in `main()`; there is no
+  Python traceback for a normal CLI rejection, and no local source paths, credentials,
+  or account identifiers appear in any error output. `--help` exits 0; a successful
+  inspection exits 0 with bounded JSON.
+
+**Invariants preserved.** PAPER only; no order placement or cancel ever (static audit
+re-run clean); the production registry `config/ibkr_instrument_mappings.json` remains
+EMPTY; `journal/forecasts.jsonl` and `journal/ledger.jsonl` remain byte-identical;
+Windows compatibility (pathlib, UTF-8, no Unix-only semantics); all 5F-1/5F-2 test
+coverage preserved with the IBKR suite extended, not weakened.
