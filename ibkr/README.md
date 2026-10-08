@@ -116,3 +116,21 @@ remain correct and unchanged. The planned gate order continues: 5F-1
 (read-only boundary) → 5E-6 decision provenance → 5F-2 exact instrument
 mapping → later PAPER execution behind separate hard controls.
 Real-money execution remains prohibited.
+
+### Patch 5F-2: exact instrument mapping (offline, operator-approved)
+
+`ibkr/instrument_mapping.py` maps an exact source prediction-market identity (provider + market_id + event_id + outcome, plus a `source_binding_sha256` fingerprint over expected outcomes and end date) to an operator-approved IBKR instrument. Resolution is registry lookup only; there are no textual, fuzzy, similarity, LLM, or search heuristics, and unmapped sources fail closed to `instrument-unmapped`.
+
+- Registry: `config/ibkr_instrument_mappings.json`, schema `ibkr-instrument-mappings/v1`. The committed production registry is EMPTY; add a mapping only by explicit operator review and PR, never by inference from market questions.
+- Targets: STK only in 5F-2. `conid` (positive integer) is the primary broker identity; `sec_type`, `symbol`, and `currency` are mandatory, and `exchange`, `primary_exchange`, `local_symbol`, `trading_class` are retained and cross-checked when configured.
+- Exposure: explicit `direction` (long/short) and `relationship` (DIRECT_UNDERLYING, POSITIVE_PROXY, INVERSE_PROXY, HEDGE, OTHER_EXPLICIT_PROXY). Direction is never inferred from Yes/No or instrument naming. A proxy approval authorizes use of the instrument as the configured exposure; it does not imply identical payoff, settlement, expiry, or risk. Source `end_date` is not an IBKR security expiry and creates no exit rule.
+- Verification: `verify_ibkr_contract(mapping, adapter)` performs conId-primary, read-only cross-checking through the unchanged 5F-1 `lookup_contract` surface. It requires exactly one broker match, rejects any configured-field mismatch, and never exposes EClient, ibapi objects, or account identifiers. Run it only from your own machine against your own TWS/Gateway session; this repository's development never contacts a broker.
+- CLI: `python -m ibkr.instrument_mapping --source-file FILE --registry FILE` is a pure, offline inspector. It rejects operational arguments (order, quantity, size, execute, live, arm, cancel, submit, transmit, place, buy, sell, trade, position, real) and has no broker verification command by design; verification stays a Python API so the interactive surface stays minimal.
+
+CLI example (offline):
+
+```
+python -m ibkr.instrument_mapping --source-file frozen_source.json --registry config/ibkr_instrument_mappings.json
+```
+
+The production registry contains zero mappings in 5F-2. Resolving any real source market against it returns `instrument-unmapped` — the intended safe state before 5F-3 introduces broker PAPER execution.
