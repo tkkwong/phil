@@ -404,6 +404,10 @@ def _reject_forbidden_options(arguments: list[str], parser: "argparse.ArgumentPa
     import argparse
 
     for argument in arguments:
+        # Help is not an operational mutation capability: argparse's own help
+        # flags (including after a subcommand) must reach argparse untouched.
+        if argument in {"-h", "--help"}:
+            continue
         if not argument.startswith("--"):
             continue
         option = argument[2:].split("=", 1)[0].lower().replace("_", "-")

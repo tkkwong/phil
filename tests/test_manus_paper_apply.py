@@ -52,6 +52,7 @@ def _concurrent_apply_worker(
     forecast_path,
     ledger_path,
     lock_root,
+    provenance_root,
     hold_forecast,
     forecast_started,
     release_forecast,
@@ -90,6 +91,7 @@ def _concurrent_apply_worker(
                 _forecast_path=pathlib.Path(forecast_path),
                 _ledger_path=pathlib.Path(ledger_path),
                 _lock_root=pathlib.Path(lock_root),
+                _provenance_root=pathlib.Path(provenance_root),
                 _now=lambda: NOW,
                 _placement_now=NOW,
             )
@@ -104,6 +106,7 @@ def _concurrent_bet_apply_worker(
     forecast_path,
     ledger_path,
     lock_root,
+    provenance_root,
     hold_placement,
     placement_started,
     release_placement,
@@ -164,6 +167,7 @@ def _concurrent_bet_apply_worker(
                 _forecast_path=pathlib.Path(forecast_path),
                 _ledger_path=pathlib.Path(ledger_path),
                 _lock_root=pathlib.Path(lock_root),
+                _provenance_root=pathlib.Path(provenance_root),
                 _now=lambda: NOW,
                 _placement_now=NOW,
             )
@@ -185,6 +189,9 @@ class PaperApplyTestsMixin:
         self.staging_root = self.root / "external-staging"
         self.forecast_path = self.root / "forecasts.jsonl"
         self.ledger_path = self.root / "ledger.jsonl"
+        # Isolated provenance root for the production seam; real
+        # %LOCALAPPDATA% storage is never touched by tests.
+        self.provenance_root = self.root / "external-provenance"
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -252,6 +259,7 @@ class PaperApplyTestsMixin:
             _staging_root=self.staging_root,
             _forecast_path=self.forecast_path,
             _ledger_path=self.ledger_path,
+            _provenance_root=self.provenance_root,
             _now=lambda: NOW,
             _placement_now=NOW,
             **kwargs,
@@ -469,6 +477,7 @@ class PaperApplyTestsMixin:
             str(self.forecast_path),
             str(self.ledger_path),
             str(lock_root),
+            str(self.provenance_root),
         )
         first = context.Process(
             target=_concurrent_apply_worker,
@@ -518,6 +527,7 @@ class PaperApplyTestsMixin:
             str(self.forecast_path),
             str(self.ledger_path),
             str(lock_root),
+            str(self.provenance_root),
         )
         first = context.Process(
             target=_concurrent_bet_apply_worker,
@@ -856,8 +866,7 @@ class ProvenanceIntegrationTests(PaperApplyTestsMixin, unittest.TestCase):
 
     def _provenance_records(self):
         from manus import decision_provenance as dp
-        root = self.staging_root.parent / "decision-provenance"
-        return dp.read_decision_records(_provenance_root=root)
+        return dp.read_decision_records(_provenance_root=self.provenance_root)
 
     def test_successful_bet_appends_attempt_and_final_trade_records(self):
         from manus import decision_provenance as dp
@@ -971,12 +980,12 @@ class ProvenanceIntegrationTests(PaperApplyTestsMixin, unittest.TestCase):
         self.assertEqual(len(self._provenance_records()), 2)
 
     def test_provenance_records_contain_no_secrets_or_paths(self):
+        from manus import decision_provenance
         intent = self.intent(disposition="bet")
         self.stage(intent=intent)
         with self.public_market(prices=(0.50, 0.52)):
             self.call()
-        root = self.staging_root.parent / "decision-provenance"
-        path = dp_provenance_path = root / "decision_provenance.jsonl"
+        path = decision_provenance._provenance_path(self.provenance_root)
         self.assertTrue(path.is_file())
         text = path.read_text(encoding="utf-8")
         self.assertNotIn("credential", text)

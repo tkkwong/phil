@@ -9,6 +9,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 import uuid
 
 from manus import decision_provenance as dp
@@ -298,6 +299,147 @@ class ProvenanceRootTests(unittest.TestCase):
         self.assertNotIn("httpx", source)
         self.assertNotIn("socket", source)
         self.assertNotIn("subprocess", source)
+
+
+
+
+class ProvenanceWriterLockOwnershipTests(unittest.TestCase):
+    """5E-6a: append_decision_record is the single provenance-writer owner.
+
+    The lock/verify/append sequence must happen exactly once per append, with
+    no nested or reentrant acquisition anywhere, and parallel writers must
+    stay serialized by the fixed OS lock.
+    """
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary_directory.name) / "prov"
+        self.calls = []
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _append(self, record):
+        return dp.append_decision_record(record, _provenance_root=self.root)
+
+    def _read(self):
+        return dp.read_decision_records(_provenance_root=self.root)
+
+    def test_append_acquires_provenance_writer_lock_exactly_once(self):
+        import manus.paper_locks as paper_locks_module
+        original = dp.paper_locks.acquire_provenance_writer_lock
+
+        def counting_acquire(*args, **kwargs):
+            self.calls.append("acquire")
+            return original(*args, **kwargs)
+
+        record = _record()
+        with unittest.mock.patch.object(dp.paper_locks, "acquire_provenance_writer_lock", side_effect=counting_acquire):
+            self.assertEqual(self._append(record), "appended")
+        self.assertEqual(self.calls, ["acquire"])
+        self.assertEqual(len(self._read()), 1)
+
+    def test_identical_idempotent_append_stays_safe(self):
+        record = _record()
+        self.assertEqual(self._append(record), "appended")
+        self.assertEqual(self._append(record), "idempotent")
+        self.assertEqual(len(self._read()), 1)
+
+    def test_conflicting_same_decision_id_remains_fail_closed(self):
+        record = _record()
+        self._append(record)
+        conflicting = _record(reason_code="wide-spread-veto")
+        with self.assertRaisesRegex(dp.ProvenanceWriteError, "integrity conflict"):
+            self._append(conflicting)
+        self.assertEqual(len(self._read()), 1)
+
+    def test_parallel_writers_remain_serialized(self):
+        import multiprocessing
+
+        record = _record()
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        common = (_record, str(self.root))
+        processes = [
+            context.Process(target=_append_worker, args=common + (results,))
+            for _ in range(4)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(30)
+            self.assertEqual(process.exitcode, 0)
+        outcomes = [results.get(timeout=5) for _ in range(4)]
+        # The fixed OS lock serializes writers: exactly one process performs
+        # the single real append; every other process either cannot enter
+        # while the lock is held ("blocked") or acquires the lock afterward
+        # and deterministically finds the identical record ("idempotent").
+        # Which process wins is timing-dependent, not asserted.
+        self.assertEqual(outcomes.count("appended"), 1)
+        # Whether a loser reports "blocked" (lock held at its attempt) or
+        # "idempotent" (it acquired the lock after the winner released it and
+        # deterministically matched the record) is timing-dependent; both
+        # prove serialization with no duplicate or lost record.
+        losers = [outcome for outcome in outcomes if outcome != "appended"]
+        self.assertEqual(len(losers), 3)
+        self.assertTrue(
+            all(outcome in {"blocked", "idempotent"} for outcome in losers),
+            f"unexpected parallel outcomes: {losers}",
+        )
+        self.assertEqual(len(self._read()), 1)
+
+    def test_failed_lock_acquisition_raises_bounded_write_error(self):
+        import manus.paper_locks as locks
+        record = _record()
+        def unavailable(*args, **kwargs):
+            raise locks.LockUnavailableError("held")
+        with unittest.mock.patch.object(dp.paper_locks, "acquire_provenance_writer_lock", side_effect=unavailable):
+            with self.assertRaisesRegex(dp.ProvenanceWriteError, "writer lock is unavailable"):
+                self._append(record)
+        # No file was created by the failed attempt.
+        self.assertFalse((self.root / "decision_provenance.jsonl").exists())
+
+    def test_no_reentrant_acquisition_is_required(self):
+        # A non-reentrant second acquisition inside an already-held lock must
+        # be unnecessary: the append path holds the lock exactly once (proven
+        # by the exactly-once test) and never nests.
+        import manus.paper_locks as locks
+        record = _record()
+        def deny_reentry(*args, **kwargs):
+            if self.calls:
+                raise locks.LockUnavailableError("nested acquisition attempted")
+            self.calls.append("acquire")
+            return locks._acquire(
+                "provenance-writer",
+                purpose="manus-decision-provenance",
+                nonblocking=True,
+                timeout_seconds=None,
+                _lock_root=self.root.parent / "locks",
+            )
+        with unittest.mock.patch.object(dp.paper_locks, "acquire_provenance_writer_lock", side_effect=deny_reentry):
+            self.assertEqual(self._append(record), "appended")
+        self.assertEqual(self.calls, ["acquire"])
+
+
+def _append_worker(record_factory, provenance_root, results):
+    """Spawn target: one competing append against the shared log.
+
+    Reports one of: "appended", "blocked" (writer lock held by a peer),
+    or "error:<detail>" for anything unexpected.
+    """
+    try:
+        outcome = dp.append_decision_record(
+            record_factory(), _provenance_root=pathlib.Path(provenance_root)
+        )
+        results.put(outcome)
+    except dp.ProvenanceWriteError as exc:
+        message = str(exc)
+        if "writer lock is unavailable" in message:
+            results.put("blocked")
+        elif "integrity conflict" in message:
+            results.put("conflict")
+        else:
+            results.put(f"error:{message}")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 
 from manus import decision_provenance as dp
 from manus import shadow_replay as sr
@@ -338,6 +339,95 @@ class StaticIsolationTests(unittest.TestCase):
             missing = pathlib.Path(tmp) / "missing.json"
             with self.assertRaises(SystemExit):
                 sr.main(["replay", "--frozen-input", str(missing)])
+
+
+
+
+class ShadowReplayCliHelpTests(unittest.TestCase):
+    """5E-6a: help is not an operational mutation capability.
+
+    Every help path exits 0 and performs no filesystem or network action,
+    while unknown and forbidden operational options still fail closed.
+    """
+
+    def _run(self, arguments):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status = sr.main(arguments)
+        except SystemExit as exit_status:
+            # argparse prints help text and exits; a zero exit is success.
+            if exit_status.code not in (None, 0):
+                raise
+            status = 0
+        return status, out.getvalue(), err.getvalue()
+
+    def test_top_level_help_exits_zero(self):
+        status, out, _ = self._run(["--help"])
+        self.assertEqual(status, 0)
+        self.assertIn("replay", out)
+        self.assertIn("shadow", out)
+
+    def test_replay_help_exits_zero(self):
+        status, out, _ = self._run(["replay", "--help"])
+        self.assertEqual(status, 0)
+        self.assertIn("--frozen-input", out)
+
+    def test_shadow_help_exits_zero(self):
+        status, out, _ = self._run(["shadow", "--help"])
+        self.assertEqual(status, 0)
+        self.assertIn("--frozen-input", out)
+
+    def test_unknown_option_exits_nonzero(self):
+        with self.assertRaises(SystemExit):
+            sr.main(["--unknown-opt"])
+
+    def test_forbidden_broker_or_write_options_exit_nonzero(self):
+        for option in ("--place-order", "--real-mode", "--journal-ledger", "--ibkr", "--trade"):
+            with self.subTest(option=option):
+                with self.assertRaises(SystemExit):
+                    sr.main(["replay", "--frozen-input", "x.json", option])
+
+    def test_replay_has_no_placement_option(self):
+        parser = sr.build_parser()
+        replay_options = {
+            option
+            for action in parser._subparsers._group_actions[0].choices["replay"]._actions
+            for option in action.option_strings
+        }
+        self.assertNotIn("--placement", replay_options)
+        self.assertNotIn("--place", replay_options)
+        with self.assertRaises(SystemExit):
+            sr.main(["replay", "--placement", "x"])
+
+    def test_shadow_has_no_placement_option(self):
+        parser = sr.build_parser()
+        shadow_options = {
+            option
+            for action in parser._subparsers._group_actions[0].choices["shadow"]._actions
+            for option in action.option_strings
+        }
+        self.assertNotIn("--placement", shadow_options)
+        self.assertNotIn("--place", shadow_options)
+        with self.assertRaises(SystemExit):
+            sr.main(["shadow", "--placement", "x"])
+
+    def test_help_performs_no_filesystem_or_network_mutation(self):
+        import manus.shadow_replay as module
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = pathlib.Path(tmp) / "marker.jsonl"
+            calls = []
+            original_replay = module.replay
+            def spy_replay(frozen, engine=None):
+                calls.append("replay")
+                return original_replay(frozen, engine)
+            with unittest.mock.patch.object(module, "replay", side_effect=spy_replay):
+                status, _, _ = self._run(["replay", "--help"])
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, [])
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

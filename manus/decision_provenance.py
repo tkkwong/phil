@@ -36,7 +36,7 @@ from manus.paper_cycle_guardian import _canonical_json
 
 DECISION_PROVENANCE_SCHEMA_VERSION = "decision-provenance/v1"
 FROZEN_INPUT_SCHEMA_VERSION = "decision-frozen-input/v1"
-
+PROVENANCE_DIRECTORY_NAME = "provenance"
 PROVENANCE_CHILDREN = ("phil-manus", "provenance")
 PROVENANCE_FILENAME = "decision_provenance.jsonl"
 
@@ -530,9 +530,11 @@ def verify_record_sha256(record: dict[str, Any]) -> bool:
 def resolve_provenance_root(_provenance_root: pathlib.Path | None = None) -> pathlib.Path:
     """Resolve the fixed external provenance root without creating it.
 
-    Production is fixed at ``%LOCALAPPDATA%\\phil-manus\\provenance`` beside
-    the existing runner and staging roots; the private argument is a test
-    seam only.
+    Production is fixed at ``%LOCALAPPDATA%\\phil-manus\\provenance`` — the
+    single canonical production provenance root, built from
+    ``PROVENANCE_DIRECTORY_NAME`` so every caller (operational writer, default
+    reader, counters, future inspector, replay-by-record) resolves to the
+    same log. The private argument is a test seam only.
     """
     if _provenance_root is not None:
         root = pathlib.Path(_provenance_root)

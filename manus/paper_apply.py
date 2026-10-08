@@ -119,9 +119,6 @@ _OPTIONAL_RECEIPT_FIELDS = frozenset({"rejection_code"})
 _PROVENANCE_ROOT_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
     "manus_apply_provenance_root", default=None
 )
-_PROVENANCE_LOCK_ROOT_CONTEXT: contextvars.ContextVar = contextvars.ContextVar(
-    "manus_apply_provenance_lock_root", default=None
-)
 _FORBIDDEN_OPTION_TERMS = frozenset(
     {
         "intent-file",
@@ -821,14 +818,11 @@ def _provenance_record(
 
 def _append_provenance_record(record: dict[str, Any]) -> None:
     """Append one provenance record; idempotent replays are no-ops."""
-    # The fixed provenance-writer lock serializes the shared append-only
-    # audit boundary across concurrent guarded applications.
-    with paper_locks.acquire_provenance_writer_lock(
-        nonblocking=False,
-        timeout_seconds=JOURNAL_WRITER_LOCK_WAIT_SECONDS,
-        _lock_root=_PROVENANCE_LOCK_ROOT_CONTEXT.get(),
-    ):
-        decision_provenance.append_decision_record(record, _provenance_root=_PROVENANCE_ROOT_CONTEXT.get())
+    # decision_provenance.append_decision_record is the single owner of the
+    # fixed provenance-writer lock (it locks, reads, verifies idempotency or
+    # conflict, then appends). paper_apply must not acquire the same writer
+    # lock around it.
+    decision_provenance.append_decision_record(record, _provenance_root=_PROVENANCE_ROOT_CONTEXT.get())
 
 
 def _midpoint_probability(placed: dict[str, Any]) -> float | None:
@@ -884,15 +878,19 @@ def _with_paper_application_locks(function):
                     timeout_seconds=JOURNAL_WRITER_LOCK_WAIT_SECONDS,
                     _lock_root=lock_root,
                 ):
-                    provenance_root = staging_root.parent / "decision-provenance" if lock_root_value is None else lock_root.parent / "decision-provenance"
-                    provenance_lock_root = provenance_root.parent
+                    # The canonical production provenance root is owned by
+                    # decision_provenance.resolve_provenance_root; the test
+                    # seam keeps offline fixtures isolated from real storage.
+                    provenance_root = (
+                        pathlib.Path(kwargs["_provenance_root"])
+                        if kwargs.get("_provenance_root") is not None
+                        else decision_provenance.resolve_provenance_root()
+                    )
                     root_token = _PROVENANCE_ROOT_CONTEXT.set(provenance_root)
-                    lock_token = _PROVENANCE_LOCK_ROOT_CONTEXT.set(provenance_lock_root)
                     try:
                         return function(fixture_path, intent_id, dry_run=False, **kwargs)
                     finally:
                         _PROVENANCE_ROOT_CONTEXT.reset(root_token)
-                        _PROVENANCE_LOCK_ROOT_CONTEXT.reset(lock_token)
         except paper_locks.LockUnavailableError:
             raise PaperApplyError(
                 "PAPER application is already running or journal writer is busy; no mutation was performed"
@@ -912,6 +910,7 @@ def run(
     _staging_root: pathlib.Path | None = None,
     _forecast_path: pathlib.Path | None = None,
     _ledger_path: pathlib.Path | None = None,
+    _provenance_root: pathlib.Path | None = None,
     _now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
     _placement_now: dt.datetime | None = None,
     _lock_root: pathlib.Path | None = None,
@@ -921,7 +920,9 @@ def run(
     Underscore arguments are test seams only. The production CLI exposes only
     ``--fixture``, ``--intent-id``, and ``--dry-run``. ``_lock_root`` is an
     internal test seam; production derives a fixed sibling lock root from the
-    fixed external staging root.
+    fixed external staging root. ``_provenance_root`` is a test seam only;
+    production always resolves the single canonical provenance root owned by
+    decision_provenance.resolve_provenance_root.
     """
     staging_root = _resolve_staging_root() if _staging_root is None else pathlib.Path(_staging_root)
     context = _load_and_validate_staging(fixture_path, intent_id, staging_root)

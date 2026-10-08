@@ -127,6 +127,9 @@ class PaperRunnerTests(unittest.TestCase):
         self.staging_root = self.root / "external-staging"
         self.forecast_path = self.root / "forecasts.jsonl"
         self.ledger_path = self.root / "ledger.jsonl"
+        # Isolated provenance root for the production seam; real
+        # %LOCALAPPDATA% storage is never touched by tests.
+        self.provenance_root = self.root / "external-provenance"
         self.calls: dict[str, list] = {"scan": [], "research": [], "apply": []}
         self.application_outputs: list[dict] = []
         self.spawn_context = multiprocessing.get_context("spawn")
@@ -663,6 +666,7 @@ class PaperRunnerTests(unittest.TestCase):
                 _forecast_path=self.forecast_path,
                 _ledger_path=self.ledger_path,
                 _lock_root=self.lock_root,
+                _provenance_root=self.provenance_root,
                 _now=lambda: NOW,
                 _placement_now=NOW,
             )
@@ -805,7 +809,8 @@ class PaperRunnerTests(unittest.TestCase):
             return paper_apply.run(
                 fixture_path, intent_id, _staging_root=self.staging_root,
                 _forecast_path=self.forecast_path, _ledger_path=self.ledger_path,
-                _lock_root=self.lock_root, _now=lambda: NOW, _placement_now=NOW,
+                _lock_root=self.lock_root, _provenance_root=self.provenance_root,
+                _now=lambda: NOW, _placement_now=NOW,
             )
 
         result = self.run_runner(research=self._staged_research(), application=error_receipt_apply, budget=0)
