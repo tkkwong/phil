@@ -60,6 +60,17 @@ class ReadonlyTransport:
         """Read-only exact-conId contract details (5F-2a)."""
         raise NotImplementedError
 
+    def submit_order(self, **_kwargs: Any) -> dict[str, Any]:  # pragma: no cover - interface
+        """Deliberately NOT part of the read-only transport interface (5F-3a).
+
+        This stub exists only so the interface's negative boundary can be
+        asserted in tests: the read-only transport surface has no order
+        submission capability. It always raises; the PAPER execution
+        transport is a separate private class in ``ibkr.paper_transport``
+        and never replaces ``ReadonlyTransport`` on the adapter.
+        """
+        raise NotImplementedError
+
 
 def default_transport_factory(config: dict[str, Any]) -> ReadonlyTransport:
     """Return the official-interface transport for the configured endpoint.

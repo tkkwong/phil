@@ -59,6 +59,13 @@ _RUN_JOIN_TIMEOUT_SECONDS = 5.0
 # no text parsing, no broad 21xx suppression, unknown codes stay fatal).
 _BENIGN_INFORMATIONAL_CODES = frozenset({2104, 2106, 2107, 2108, 2158})
 
+# The same fatal numeric-code policy as ``error`` below, named at module
+# level so the PAPER execution wrapper (Patch 5F-3a) can classify an
+# order-scoped error without duplicating the vocabulary. Behavior of the
+# read-only error path is unchanged.
+_FATAL_CONNECTION_CODES = frozenset({502, 504, 1100, 1101, 1102, 1300})
+_FATAL_SESSION_CODES = frozenset({508, 510, 511, 540, 542})
+
 
 class _ScopedOperation:
     """Completion state for exactly one request-id-scoped read.
@@ -277,9 +284,9 @@ class _CollectingWrapper:
             # Documented connection-status notifications; not fatal, not
             # readiness-ending, processing continues.
             return
-        if errorCode in (502, 504, 1100, 1101, 1102, 1300):
+        if errorCode in _FATAL_CONNECTION_CODES:
             self._signal_fatal("connection")
-        elif errorCode in (508, 510, 511, 540, 542):
+        elif errorCode in _FATAL_SESSION_CODES:
             self._signal_fatal("session")
 
     def connectionClosed(self) -> None:  # noqa: N802
@@ -325,6 +332,7 @@ class _CollectingWrapper:
         # broker; no Order is ever constructed by this module.
         row = {
             "order_id": getattr(order, "orderId", _orderId),
+            "order_ref": getattr(order, "orderRef", None),
             "conid": getattr(contract, "conId", None),
             "symbol": getattr(contract, "symbol", None),
             "sec_type": getattr(contract, "secType", None),
@@ -350,6 +358,7 @@ class _CollectingWrapper:
         row = {
             "exec_id": getattr(execution, "execId", None),
             "order_id": getattr(execution, "orderId", None),
+            "order_ref": getattr(execution, "orderRef", None),
             "conid": getattr(contract, "conId", None),
             "symbol": getattr(contract, "symbol", None),
             "sec_type": getattr(contract, "secType", None),
@@ -427,15 +436,11 @@ class TwsTransport(ReadonlyTransport):
         # Deferred official import: no side effects at module import time.
         try:
             from ibapi import client as ibapi_client  # type: ignore
-            from ibapi import wrapper as ibapi_wrapper  # type: ignore
         except Exception as exc:  # pragma: no cover - environment-specific
             raise TransportError("official ibapi package is unavailable") from exc
 
-        class _BoundWrapper(_CollectingWrapper, ibapi_wrapper.EWrapper):
-            pass
-
         timeout = float(config.get("read_only_timeout_seconds", 10.0))
-        self._wrapper = _BoundWrapper(timeout)
+        self._wrapper = self._build_wrapper(timeout)
         self._client = ibapi_client.EClient(self._wrapper)
         try:
             # Official Python API connection: creates and starts the reader.
@@ -463,6 +468,22 @@ class TwsTransport(ReadonlyTransport):
         except TransportError:
             self.disconnect()
             raise
+
+    def _build_wrapper(self, timeout: float) -> "_CollectingWrapper":
+        """Construct the collector wrapper (private subclass seam, 5F-3a).
+
+        The read-only transport always builds exactly the same collector as
+        before; behavior is unchanged. The PAPER execution transport
+        (``ibkr.paper_transport``) overrides ONLY this method to install its
+        own collector subclass, so ``connect``'s proven lifecycle needs no
+        duplication.
+        """
+        from ibapi import wrapper as ibapi_wrapper  # type: ignore
+
+        class _ModuleBoundWrapper(_CollectingWrapper, ibapi_wrapper.EWrapper):
+            pass
+
+        return _ModuleBoundWrapper(timeout)
 
     def _process_messages(self) -> None:
         """Official message-processing loop (bounded daemon thread)."""

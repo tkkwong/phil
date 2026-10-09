@@ -637,3 +637,17 @@ re-run clean); the production registry `config/ibkr_instrument_mappings.json` re
 EMPTY; `journal/forecasts.jsonl` and `journal/ledger.jsonl` remain byte-identical;
 Windows compatibility (pathlib, UTF-8, no Unix-only semantics); all 5F-1/5F-2 test
 coverage preserved with the IBKR suite extended, not weakened.
+
+## Patch 5F-3a — explicitly armed IBKR PAPER execution boundary (operator-approved)
+
+The PAPER-only IBKR submission boundary is an ADDITIONAL operational truth source for Phil decisions, with these boundary properties:
+
+- `placeOrder` exists ONLY inside `ibkr/paper_transport.py` (private `TwsPaperExecutionTransport`), the only module constructing an `ibapi.order.Order`. `ReadonlyIbkrAdapter` and all other transports remain incapable of broker mutation; no cancel/modify/exercise/transfer/LIVE path exists anywhere.
+- The executor (`ibkr/paper_execution.py`) is NOT importable from the automated pipeline: `manus/paper_runner.py`, `manus/paper_apply.py`, and `scheduled_paper_task.py` must never import `ibkr.paper_execution` or `ibkr.paper_transport` (tested). This is a manually invoked boundary only.
+- Submission requires, in strict order, ALL of: current-invocation `--arm-paper`; exact `--confirm-execution-id`; valid closed-schema execution intent (`ibkr-paper-execution-intent/v1`); operator config `environment == "PAPER"` (declared label only; ports/prefixes are never consulted); approved mapping hash equal to the intent's `mapping_sha256`; no prior receipt for that execution id (uncertain ⇒ fail closed, never retried; submitted ⇒ duplicate rejected); fresh conId re-verification through the 5F-2 read-only verifier; no broker evidence already carrying the deterministic `order_ref` (`phil5f3-<32hex>`).
+- Order identity is broker-authoritative: the `nextValidId` handshake seed (retained only inside the paper wrapper; the read-only wrapper still discards it) is used as the order id and never invented by Phil.
+- Hard construction envelope: STK/USD/SMART, long→BUY only (short ⇒ `paper-short-not-supported`; never inferred from Yes/No outcomes), LMT, DAY, whole shares, `outsideRth=False`, `transmit=True` fixed, absolute Decimal USD 100.00 notional cap, no float monetary input.
+- Exactly one durable `submission-attempted` receipt is appended BEFORE `placeOrder`; outcomes are `acknowledged`/`rejected`/`uncertain` with a bounded wait and per-order correlation; NO retry of any kind exists.
+- Receipts: append-only, idempotent-per-`event_id`, `record_sha256`-verified JSONL under the fixed external root `%LOCALAPPDATA%\phil-manus\ibkr-paper-execution`, serialized by a new fixed writer lock (`paper-execution-writer`); they preserve the decision→mapping→intent→orderRef chain and never contain raw account ids, secrets, config paths, or broker error text. Existing protected journals are NOT modified by this boundary.
+- Read-only additions for reconciliation: normalized `open_orders()`/`executions()` rows gained an `order_ref` field (additive only; semantics of existing fields unchanged), and the read-only transport interface gained a deliberately always-raising `submit_order` stub so the closed boundary is test-assertable.
+- CLI is closed-option (`allow_abbrev=False`): `submit` with `--intent-file`, `--mapping-file`, `--confirm-execution-id`, `--arm-paper`; no live/real/force/override/retry/transmit/market/sell/short flags; failures are bounded (no traceback, no path/secret leakage).

@@ -369,6 +369,9 @@ class MutationCapabilityTests(AdapterTestBase):
                 "account_summary", "connect", "contract_details",
                 "contract_details_by_conid", "disconnect", "executions",
                 "managed_accounts", "open_orders", "positions",
+                # 5F-3a: the negative stub exists so the closed boundary is
+                # assertable; it always raises and grants no capability.
+                "submit_order",
             ]),
         )
 
@@ -617,7 +620,9 @@ class NormalizationTests(AdapterTestBase):
             sorted(rows[0]),
             sorted(["account_id_masked", "order_id", "conid", "symbol", "sec_type",
                     "exchange", "currency", "action", "total_quantity",
-                    "limit_price", "order_type", "status"]),
+                    "limit_price", "order_type", "status",
+                    # 5F-3a: orderRef observability for reconciliation.
+                    "order_ref"]),
         )
         original = json.loads(json.dumps(transport.open_order_rows))
         adapter.open_orders()
@@ -630,7 +635,9 @@ class NormalizationTests(AdapterTestBase):
         self.assertEqual(
             sorted(rows[0]),
             sorted(["account_id_masked", "exec_id", "order_id", "conid", "symbol",
-                    "sec_type", "exchange", "side", "quantity", "price", "time"]),
+                    "sec_type", "exchange", "side", "quantity", "price", "time",
+                    # 5F-3a: orderRef observability for reconciliation.
+                    "order_ref"]),
         )
         original = json.loads(json.dumps(transport.execution_rows))
         adapter.executions()
@@ -2083,6 +2090,138 @@ def _contract(conid, symbol):
     _C.exchange = "SMART"
     _C.currency = "CAD"
     return _C()
+
+
+class PaperOrderRefObservabilityTests(AdapterTestBase):
+    """5F-3a: orderRef observability in normalized reads (additive only)."""
+
+    def test_open_orders_include_order_ref_when_present(self):
+        transport = _FakeTransport()
+        transport.open_order_rows[0]["order_ref"] = "phil5f3-" + "a" * 32
+        adapter, _ = self.adapter(transport)
+        rows = adapter.open_orders()
+        self.assertEqual(rows[0]["order_ref"], "phil5f3-" + "a" * 32)
+
+    def test_open_orders_order_ref_is_none_when_absent(self):
+        adapter, _ = self.adapter()
+        rows = adapter.open_orders()
+        self.assertIsNone(rows[0]["order_ref"])
+
+    def test_executions_include_order_ref_when_present(self):
+        transport = _FakeTransport()
+        transport.execution_rows[0]["order_ref"] = "phil5f3-" + "b" * 32
+        adapter, _ = self.adapter(transport)
+        rows = adapter.executions()
+        self.assertEqual(rows[0]["order_ref"], "phil5f3-" + "b" * 32)
+
+    def test_reads_stay_read_only_after_addition(self):
+        transport = _FakeTransport()
+        adapter, _ = self.adapter(transport)
+        adapter.open_orders()
+        adapter.executions()
+        self.assertNotIn("place_order", transport.calls)
+
+
+class ReadOnlyTransportNegativeBoundaryTests(AdapterTestBase):
+    """5F-3a: the read-only interface grants NO submission capability."""
+
+    def test_readonly_transport_interface_submit_order_always_raises(self):
+        from ibkr.transport import ReadonlyTransport
+
+        self.assertTrue(hasattr(ReadonlyTransport, "submit_order"))
+        # The interface stub always raises; no fake may paper over it.
+        stub = ReadonlyTransport()
+        with self.assertRaises(NotImplementedError):
+            stub.submit_order()
+
+    def test_paper_transport_module_is_not_imported_by_readonly_path(self):
+        # The read-only adapter/transport machinery never touches the paper
+        # execution transport.
+        import ibkr.adapter as adapter_module
+        import ibkr.transport_tws as transport_module
+
+        self.assertNotIn("paper_transport", vars(adapter_module))
+        self.assertNotIn("paper_transport", vars(transport_module))
+
+
+class PaperExecutionWrapperTests(AdapterTestBase):
+    """5F-3a: the paper wrapper adds only bounded order-evidence capture."""
+
+    def _paper_transport(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        config = base_config()
+        transport = TwsPaperExecutionTransport(config)
+        return transport
+
+    def test_paper_wrapper_is_a_collector_subclass(self):
+        from ibkr.paper_transport import _PaperExecutionWrapper
+        from ibkr.transport_tws import _CollectingWrapper
+
+        self.assertTrue(issubclass(_PaperExecutionWrapper, _CollectingWrapper))
+
+    def test_next_valid_id_is_retained_by_paper_wrapper(self):
+        from ibkr.paper_transport import _PaperExecutionWrapper
+
+        wrapper = _PaperExecutionWrapper(timeout=1.0)
+        wrapper.nextValidId(4242)
+        self.assertEqual(wrapper.next_valid_order_id, 4242)
+        self.assertTrue(wrapper.ready.is_set())
+
+    def test_begin_watch_capture_and_finish_order_cycle(self):
+        from ibkr.paper_transport import _PaperExecutionWrapper
+
+        wrapper = _PaperExecutionWrapper(timeout=1.0)
+        wrapper.begin_order_watch(7)
+        wrapper.orderStatus(7, "Submitted", 0.0, 1, 0.0, 0, 0, 0.0, 19, "")
+        outcome = wrapper.order_outcome(7)
+        self.assertEqual(outcome["status"], "Submitted")
+        wrapper.finish_order_watch(7)
+        self.assertEqual(wrapper.order_outcome(7)["status"], None)
+
+    def test_unwatched_order_callbacks_are_ignored_by_paper_layer(self):
+        from ibkr.paper_transport import _PaperExecutionWrapper
+
+        wrapper = _PaperExecutionWrapper(timeout=1.0)
+        wrapper.orderStatus(99, "Filled", 1.0, 0, 0.0, 0, 0, 0.0, 19, "")
+        self.assertEqual(wrapper.order_events, {})
+
+    def test_order_scoped_error_maps_rejection_code(self):
+        from ibkr.paper_transport import _PaperExecutionWrapper
+
+        wrapper = _PaperExecutionWrapper(timeout=1.0)
+        wrapper.begin_order_watch(5)
+        wrapper.error(5, _ts(), 110, "rejected by broker")
+        outcome = wrapper.order_outcome(5)
+        self.assertEqual(outcome["status"], "Rejected")
+        self.assertEqual(outcome["broker_code"], 110)
+
+    def test_order_scoped_error_does_not_break_readonly_session(self):
+        from ibkr.paper_transport import _PaperExecutionWrapper
+
+        wrapper = _PaperExecutionWrapper(timeout=1.0)
+        wrapper.nextValidId(19)
+        wrapper.begin_order_watch(5)
+        wrapper.error(5, _ts(), 110, "rejected")
+        wrapper.finish_order_watch(5)
+        wrapper.error(-1, _ts(), 2158, "inactive farm")
+        self.assertIsNone(wrapper.failure)
+
+    def test_place_paper_order_requires_connected_wrapper(self):
+        transport = self._paper_transport()
+        self.addCleanup(transport.disconnect)
+        with self.assertRaises(TransportError):
+            transport.place_paper_order(
+                target={"conid": 111},
+                action="BUY",
+                quantity=1,
+                limit_price="10.00",
+                order_ref="phil5f3-" + "c" * 32,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 if __name__ == "__main__":
     unittest.main()
