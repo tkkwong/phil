@@ -970,7 +970,11 @@ class StaticArchitectureTests(unittest.TestCase):
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute) and node.attr == attr_name:
-                    hits.append(str(relative))
+                    # Windows yields backslash separators; normalize to
+                    # POSIX at the collection point so the exact assertion
+                    # below compares the same string on every platform.
+                    normalized = relative.as_posix()
+                    hits.append(normalized)
         return sorted(set(hits))
 
     def test_place_order_ast_only_in_paper_transport(self):
@@ -993,7 +997,10 @@ class StaticArchitectureTests(unittest.TestCase):
                     module = getattr(node, "module", "") or ""
                     names = [alias.name for alias in node.names]
                     if "ibapi.order" in module or "order" in names and module.startswith("ibapi"):
-                        hits.append(str(relative))
+                        # Normalize to POSIX at the collection point (see
+                        # _ast_attribute_files); never str(relative).
+                        normalized = relative.as_posix()
+                        hits.append(normalized)
         self.assertEqual(hits, ["ibkr/paper_transport.py"])
 
     def test_cancel_global_cancel_exercise_zero_invocations(self):
@@ -1418,7 +1425,9 @@ class IsolationTests(unittest.TestCase):
             tree = ast.parse(source)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute) and node.attr == "placeOrder":
-                    module_name = str(relative)
+                    # Windows yields backslash separators; normalize to
+                    # POSIX at the collection point, then compare exactly.
+                    module_name = relative.as_posix()
                     if module_name != "ibkr/paper_transport.py" and "tests" not in relative.parts:
                         offenders.append(module_name)
         self.assertEqual(offenders, [])
