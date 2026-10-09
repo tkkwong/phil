@@ -10,10 +10,12 @@ import copy
 import hashlib
 import io
 import json
+import os
 import pathlib
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
@@ -997,6 +999,368 @@ class StaticArchitectureTests(unittest.TestCase):
     def test_cancel_global_cancel_exercise_zero_invocations(self):
         for attr in ("cancelOrder", "reqGlobalCancel", "exerciseOptions"):
             self.assertEqual(self._ast_attribute_files(attr), [], attr)
+
+
+class WriteSessionCleanupTests(unittest.TestCase):
+    """5F-3a2: the write-capable TWS session is disconnected on EVERY
+    outcome path, exactly once, and a disconnect failure never masks the
+    original result or error.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, transport):
+        return make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_disconnect_attempted_after_acknowledged_success(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_broker_rejection(self):
+        transport = _FakePaperTransport(fail="rejected")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_account_mismatch(self):
+        transport = _FakePaperTransport(managed_accounts=["DU9999999"])
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_uncertain_timeout(self):
+        transport = _FakePaperTransport(fail="uncertain")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_generic_submission_error(self):
+        class _GenericErrorTransport(_FakePaperTransport):
+            def place_paper_order(self, **kwargs):
+                _ = kwargs.get("expected_account_id")
+                self.calls.append("place_paper_order")
+                self.calls.append("managed_accounts")
+                raise pe.PaperSubmissionError("paper-session-failed")
+        transport = _GenericErrorTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_unexpected_exception(self):
+        transport = _FakePaperTransport(fail="unexpected")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-uncertain")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_failure_does_not_mask_result_or_error(self):
+        class _DisconnectFailsTransport(_FakePaperTransport):
+            def disconnect(self):
+                self.calls.append("disconnect")
+                raise RuntimeError("disconnect crashed")
+        transport = _DisconnectFailsTransport()
+        executor = self.executor(transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        # A NEW execution (fresh intent, new execution id) with a rejected
+        # outcome must still surface the ORIGINAL rejection code even
+        # though disconnect itself fails.
+        new_intent, new_execution_id = pe.load_intent(
+            document=base_intent(decision_id="decision-2026-10-08-b2")
+        )
+        transport2 = _DisconnectFailsTransport(fail="rejected")
+        executor2 = self.executor(transport2)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor2.submit(new_intent, self.mapping_entry, arm=True, confirm_execution_id=new_execution_id)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+
+    def test_disconnect_attempted_after_failed_connect(self):
+        class _ConnectFailTransport(_FakePaperTransport):
+            def connect(self, config):
+                self.calls.append("connect")
+                raise RuntimeError("connection lost")
+        transport = _ConnectFailTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+
+class RejectedExecutionOneShotTests(unittest.TestCase):
+    """5F-3a2: a broker-rejected execution_id stays one-shot; a repeated
+    invocation with the SAME execution id must stop BEFORE placement.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def test_rejected_execution_id_never_places_again(self):
+        first = _FakePaperTransport(fail="rejected")
+        executor = make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=first,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        types = [record["event_type"] for record in records]
+        self.assertIn("submission-attempted", types)
+        self.assertIn("submission-rejected", types)
+        second = _FakePaperTransport()
+        executor2 = make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=second,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor2.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        self.assertEqual(second.calls, [])
+        self.assertEqual(second.place_calls, [])
+
+
+class CrossProcessClaimTests(unittest.TestCase):
+    """5F-3a2: a REAL cross-process regression at the executor level.
+
+    Two concurrently started WORKER PROCESSES (separate OS processes,
+    Windows spawn compatible) use the same execution id, same execution
+    root, and same lock root, synchronized by a file barrier so both
+    attempt submission concurrently. The placement boundary is a durable
+    interprocess marker: each successful placement leaves exactly one
+    marker file. Expected total place calls across BOTH processes:
+    exactly 1. The losing worker must fail closed BEFORE placement with a
+    bounded claimed/duplicate result.
+    """
+
+    WORKER_SOURCE = """
+import json
+import os
+import pathlib
+import sys
+import time
+
+def main() -> int:
+    payload_path = sys.argv[1]
+    barrier_path = sys.argv[2]
+    result_path = sys.argv[3]
+
+    repository_root = pathlib.Path(os.environ["PHIL_REPO_ROOT"])
+    sys.path.insert(0, str(repository_root))
+    from ibkr import paper_execution as pe
+
+    payload = json.loads(pathlib.Path(payload_path).read_text(encoding="utf-8"))
+    execution_root = pathlib.Path(payload["execution_root"])
+    lock_root = pathlib.Path(payload["lock_root"])
+    placement_root = pathlib.Path(payload["placement_root"])
+    intent = json.loads(pathlib.Path(payload["intent_path"]).read_text(encoding="utf-8"))
+    mapping = json.loads(pathlib.Path(payload["mapping_path"]).read_text(encoding="utf-8"))
+
+    class _InterprocessReadOnlyAdapter:
+        def __init__(self, payload):
+            self.calls = []
+        def close(self):
+            pass
+        def lookup_contract_by_conid(self, conid):
+            self.calls.append(("lookup_contract_by_conid", conid))
+            return {
+                "conid": conid, "symbol": "FIXTUREETF", "local_symbol": "FIXTUREETF",
+                "sec_type": "STK", "exchange": None, "primary_exchange": "ARCX",
+                "currency": "USD", "expiry": None, "strike": None, "right": None,
+                "multiplier": None, "trading_class": "FIXTUREETF",
+            }
+        def open_orders(self):
+            self.calls.append("open_orders")
+            return []
+        def executions(self):
+            self.calls.append("executions")
+            return []
+
+    class _InterprocessPlacementTransport:
+        def __init__(self):
+            self.calls = []
+        def connect(self, config):
+            self.calls.append("connect")
+        def disconnect(self):
+            self.calls.append("disconnect")
+        def managed_accounts(self):
+            self.calls.append("managed_accounts")
+            return [payload["expected_account"]]
+        def place_paper_order(self, **kwargs):
+            # Durable interprocess placement marker (one file per call);
+            # the file NAME carries the worker identity so a double place
+            # can be counted exactly.
+            placement_root.mkdir(parents=True, exist_ok=True)
+            marker = placement_root / ("placed-" + payload["worker"] + ".json")
+            marker.write_text(json.dumps({"order_ref": kwargs["order_ref"]}), encoding="utf-8")
+            self.calls.append("place_paper_order")
+            return {
+                "order_id": 101,
+                "order_ref": kwargs["order_ref"],
+                "outcome": {"status": "acknowledged", "broker_status": "Submitted", "order_ref": kwargs["order_ref"]},
+            }
+
+    executor = pe.IbkrPaperExecutor(
+        payload["config"],
+        _read_adapter_factory=lambda _config: _InterprocessReadOnlyAdapter(payload),
+        _paper_transport_factory=lambda _config: _InterprocessPlacementTransport(),
+        _execution_root=execution_root,
+        _lock_root=lock_root,
+        _now=lambda _t: None,
+    )
+
+    # File barrier: announce readiness, then wait until BOTH workers are
+    # present before attempting submission concurrently.
+    ready = pathlib.Path(barrier_path) / (payload["worker"] + ".ready")
+    barrier_dir = pathlib.Path(barrier_path)
+    barrier_dir.mkdir(parents=True, exist_ok=True)
+    ready.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if len(list(barrier_dir.glob("*.ready"))) >= 2:
+            break
+        time.sleep(0.01)
+
+    try:
+        document = executor.submit(intent, mapping, arm=True, confirm_execution_id=payload["execution_id"])
+        outcome = {"status": "success", "result_status": document["status"]}
+    except pe.ExecutionError as exc:
+        outcome = {"status": "error", "code": exc.code}
+    except Exception as exc:
+        outcome = {"status": "worker-crash", "error": type(exc).__name__}
+    pathlib.Path(result_path).write_text(json.dumps(outcome), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmp_path = pathlib.Path(self.tmp.name)
+        self.execution_root = self.tmp_path / "exec"
+        self.lock_root = self.tmp_path / "locks"
+        self.placement_root = self.tmp_path / "placements"
+        self.barrier_root = self.tmp_path / "barrier"
+        self.results_root = self.tmp_path / "results"
+        intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.intent = intent
+        self.mapping_entry = make_entry()
+
+    def _run_pair(self, run_name: str) -> list[dict]:
+        run_dir = self.tmp_path / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        intent_path = run_dir / "intent.json"
+        mapping_path = run_dir / "mapping.json"
+        intent_path.write_text(json.dumps(self.intent), encoding="utf-8")
+        mapping_path.write_text(json.dumps(self.mapping_entry), encoding="utf-8")
+        worker_path = run_dir / "phil_5f3a2_worker.py"
+        worker_path.write_text(self.WORKER_SOURCE, encoding="utf-8")
+
+        environment = dict(os.environ)
+        environment["PHIL_REPO_ROOT"] = str(REPOSITORY_ROOT)
+        outcomes: list[dict] = []
+        for index in range(2):
+            result_path = self.results_root / f"{run_name}-{index}.json"
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "worker": f"worker-{index}",
+                "execution_root": str(self.execution_root),
+                "lock_root": str(self.lock_root),
+                "placement_root": str(self.placement_root),
+                "intent_path": str(intent_path),
+                "mapping_path": str(mapping_path),
+                "expected_account": EXPECTED_ACCOUNT,
+                "execution_id": self.execution_id_value,
+                "config": dict(BASE_CONFIG, config_path=str(run_dir / f"config-{index}.json")),
+            }
+            payload_path = run_dir / f"payload-{index}.json"
+            payload_path.write_text(json.dumps(payload), encoding="utf-8")
+            # NOTE: both processes are started as close together as the
+            # harness allows; each waits at the file barrier until BOTH
+            # are ready, so the two claims genuinely race.
+            import subprocess
+            completed = subprocess.Popen(
+                [sys.executable, str(worker_path), str(payload_path), str(self.barrier_root), str(result_path)],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            outcomes.append({"_process": completed, "_result_path": result_path})
+        deadline = time.monotonic() + 90
+        collected: list[dict] = []
+        for entry in outcomes:
+            process = entry["_process"]
+            try:
+                _, stderr = process.communicate(timeout=90)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=30)
+                raise AssertionError(f"worker process timed out; stderr={process.stderr}")
+            if process.returncode != 0:
+                raise AssertionError(f"worker process failed rc={process.returncode}; stderr={stderr.decode('utf-8', 'replace')}")
+            collected.append(json.loads(entry["_result_path"].read_text(encoding="utf-8")))
+        return collected
+
+    def test_two_processes_same_execution_id_exactly_one_place(self):
+        outcomes = self._run_pair("run1")
+        self.assertEqual(len(outcomes), 2)
+        successes = [outcome for outcome in outcomes if outcome["status"] == "success"]
+        duplicates = [
+            outcome for outcome in outcomes
+            if outcome["status"] == "error"
+            and outcome["code"] in ("execution-already-submitted", "execution-already-claimed", "execution-uncertain")
+        ]
+        self.assertEqual(len(successes), 1, outcomes)
+        self.assertEqual(len(duplicates), 1, outcomes)
+        # Exactly ONE placement across BOTH real processes.
+        markers = list(self.placement_root.glob("placed-*.json"))
+        self.assertEqual(len(markers), 1, markers)
+
+    def test_loser_never_reaches_placement(self):
+        outcomes = self._run_pair("run2")
+        losers = [outcome for outcome in outcomes if outcome["status"] == "error"]
+        self.assertEqual(len(losers), 1)
+        # The losing worker returned a bounded duplicate/claimed result.
+        self.assertIn(losers[0]["code"], ("execution-already-submitted", "execution-already-claimed", "execution-uncertain"))
+        # The durable claim exists exactly once for this execution id.
+        records = state.read_receipts(_execution_root=self.execution_root)
+        attempted = [record for record in records if record["event_type"] == "submission-attempted"]
+        self.assertEqual(len(attempted), 1)
 
 
 class IsolationTests(unittest.TestCase):

@@ -113,6 +113,7 @@ class ExecutionError(RuntimeError):
             "paper-short-not-supported",
             "unsupported-order-parameter",
             "notional-cap-exceeded",
+            "execution-already-claimed",
             "execution-already-submitted",
             "execution-uncertain",
             "duplicate-broker-evidence",
@@ -370,10 +371,13 @@ class IbkrPaperExecutor:
         config = self._config()
         _paper_environment_gate(config)
         self._verify_mapping_hash(intent, mapping_entry)
+        # Early optimization only; the authoritative idempotency boundary
+        # is the atomic claim below, which re-checks state under the claim
+        # lock before any placement can proceed.
         self._reject_known_execution_state(computed_execution_id)
         verification = self._reverify_contract(mapping_entry)
         self._reject_broker_evidence_duplicate(order_ref(computed_execution_id))
-        receipt_seed = self._record_submission_attempt(
+        receipt_seed = self._claim_submission_attempt(
             intent=intent,
             execution_id=computed_execution_id,
             order_ref=order_ref(computed_execution_id),
@@ -498,6 +502,77 @@ class IbkrPaperExecutor:
             raise ExecutionError("receipt-write-failed", str(exc)) from None
         return record
 
+    def _claim_submission_attempt(
+        self,
+        *,
+        intent: dict[str, Any],
+        execution_id: str,
+        order_ref: str,
+    ) -> dict[str, Any]:
+        """Atomically claim this execution_id (5F-3a2) and return the
+        durable ``submission-attempted`` receipt.
+
+        Under one fixed cross-process lock the state module re-checks
+        EVERY prior record for this exact execution id and, only if the
+        execution is unclaimed, appends one durable ``submission-attempted``
+        record. Only this process receives ``claimed`` and may continue
+        toward placement; a concurrent process receives a bounded
+        already-claimed/uncertain result and stops BEFORE any placement.
+        Ownership is by execution_id alone, never by event_id idempotency
+        or timestamp coincidence.
+        """
+        config = self._config()
+        target = intent["target"]
+        order = intent["order"]
+        try:
+            record = state.build_receipt(
+                event_type="submission-attempted",
+                execution_id=execution_id,
+                intent_sha256=_sha256(state.canonical_json(intent)),
+                decision_id=intent["decision_id"],
+                mapping_id=intent["mapping_id"],
+                mapping_sha256=intent["mapping_sha256"],
+                source_binding_sha256=intent["source_binding_sha256"],
+                order_ref=order_ref,
+                account_id_masked=mask_account(str(config["expected_account_id"])),
+                target={
+                    "conid": target["conid"],
+                    "symbol": target["symbol"],
+                    "sec_type": target["sec_type"],
+                    "currency": target["currency"],
+                    "exchange": target["exchange"],
+                },
+                order={
+                    "action": order["action"],
+                    "quantity": order["quantity"],
+                    "order_type": order["order_type"],
+                    "limit_price": order["limit_price"],
+                    "tif": order["tif"],
+                    "outside_rth": order["outside_rth"],
+                },
+                broker={"client_id": config["client_id"], "order_id": None, "perm_id": None, "status": None},
+                reason_code=None,
+                recorded_at_utc=None,
+            )
+            outcome = state.claim_submission_attempt(
+                record,
+                _execution_root=self._execution_root,
+                _lock_root=self._lock_root,
+            )
+        except state.ExecutionStateError as exc:
+            if exc.code == "execution-already-claimed":
+                raise ExecutionError(
+                    "execution-already-submitted", "execution already claimed by another attempt; never re-place"
+                ) from None
+            if exc.code == "execution-uncertain":
+                raise ExecutionError(
+                    "execution-uncertain", "prior submission outcome is uncertain; no auto-retry"
+                ) from None
+            raise ExecutionError("receipt-write-failed", str(exc)) from None
+        if outcome != "claimed":  # pragma: no cover - defensive
+            raise ExecutionError("execution-already-submitted", "execution claim was not granted")
+        return record
+
     def _record_outcome(
         self,
         *,
@@ -547,8 +622,90 @@ class IbkrPaperExecutor:
             transport = self._paper_transport_factory(self._config())
         except Exception:
             raise ExecutionError("paper-transport-unavailable", "paper execution transport is unavailable") from None
+        disconnect_attempted = False
         try:
             transport.connect(self._config())
+            try:
+                evidence = transport.place_paper_order(
+                    target=target,
+                    action=order["action"],
+                    quantity=order["quantity"],
+                    limit_price=order["limit_price"],
+                    order_ref=order_ref,
+                    expected_account_id=str(self._config()["expected_account_id"]),
+                )
+            except PaperSubmissionError as exc:
+                if exc.code == "paper-order-rejected":
+                    self._record_outcome(
+                        attempt_record=receipt_seed,
+                        event_type="submission-rejected",
+                        reason_code="paper-order-rejected",
+                        broker={
+                            "client_id": self._config()["client_id"],
+                            "order_id": None,
+                            "perm_id": None,
+                            "status": "Rejected",
+                        },
+                    )
+                    raise ExecutionError("paper-order-rejected", "paper order was rejected by the broker") from None
+                if exc.code == "paper-account-mismatch":
+                    # The write session's account allowlist failed BEFORE
+                    # any order-id allocation or placement: the broker
+                    # never saw the order, so there is no broker-state
+                    # uncertainty. Fail closed with the bounded code and
+                    # no outcome receipt.
+                    raise ExecutionError("paper-account-mismatch", "write session account does not match the expected account") from None
+                self._record_outcome(
+                    attempt_record=receipt_seed,
+                    event_type="submission-uncertain",
+                    reason_code=exc.code,
+                    broker={"client_id": self._config()["client_id"], "order_id": None, "perm_id": None, "status": None},
+                )
+                raise ExecutionError(exc.code, "paper submission outcome is uncertain") from None
+            except Exception:
+                self._record_outcome(
+                    attempt_record=receipt_seed,
+                    event_type="submission-uncertain",
+                    reason_code="paper-submission-uncertain",
+                    broker={"client_id": self._config()["client_id"], "order_id": None, "perm_id": None, "status": None},
+                )
+                raise ExecutionError("paper-submission-uncertain", "paper submission outcome is uncertain") from None
+            order_id = evidence["order_id"]
+            outcome = evidence["outcome"]
+            status = outcome.get("status")
+            broker_evidence = {
+                "client_id": self._config()["client_id"],
+                "order_id": order_id,
+                "perm_id": None,
+                "status": outcome.get("broker_status"),
+            }
+            if status in ("acknowledged", "done"):
+                self._record_outcome(
+                    attempt_record=receipt_seed,
+                    event_type="acknowledged",
+                    reason_code=None,
+                    broker=broker_evidence,
+                )
+                result_status = "acknowledged"
+            else:
+                self._record_outcome(
+                    attempt_record=receipt_seed,
+                    event_type="submission-uncertain",
+                    reason_code=outcome.get("code", "paper-submission-uncertain"),
+                    broker={
+                        "client_id": self._config()["client_id"],
+                        "order_id": order_id,
+                        "perm_id": None,
+                        "status": None,
+                    },
+                )
+                raise ExecutionError(
+                    outcome.get("code", "paper-submission-uncertain"), "paper submission outcome is uncertain"
+                )
+        except ExecutionError:
+            # Inner placement handling already produced the bounded,
+            # final outcome; cleanup happens in ``finally``.
+            raise
         except AdapterError:
             self._record_outcome(
                 attempt_record=receipt_seed,
@@ -558,6 +715,10 @@ class IbkrPaperExecutor:
             )
             raise
         except Exception:
+            # The inner placement handler already translated
+            # PaperSubmissionError and unexpected placement crashes into
+            # bounded ExecutionErrors; only a bare connect-path failure
+            # reaches this handler.
             self._record_outcome(
                 attempt_record=receipt_seed,
                 event_type="submission-uncertain",
@@ -565,94 +726,18 @@ class IbkrPaperExecutor:
                 broker={"client_id": self._config()["client_id"], "order_id": None, "perm_id": None, "status": None},
             )
             raise ExecutionError("paper-session-failed", "paper transport connection failed") from None
-        try:
-            evidence = transport.place_paper_order(
-                target=target,
-                action=order["action"],
-                quantity=order["quantity"],
-                limit_price=order["limit_price"],
-                order_ref=order_ref,
-                expected_account_id=str(self._config()["expected_account_id"]),
-            )
-        except PaperSubmissionError as exc:
-            if exc.code == "paper-order-rejected":
-                self._record_outcome(
-                    attempt_record=receipt_seed,
-                    event_type="submission-rejected",
-                    reason_code="paper-order-rejected",
-                    broker={
-                        "client_id": self._config()["client_id"],
-                        "order_id": None,
-                        "perm_id": None,
-                        "status": "Rejected",
-                    },
-                )
-                raise ExecutionError("paper-order-rejected", "paper order was rejected by the broker") from None
-            if exc.code == "paper-account-mismatch":
-                # The write session's account allowlist failed BEFORE any
-                # order-id allocation or placement: the broker never saw
-                # the order, so there is no broker-state uncertainty. Fail
-                # closed with the bounded code and no outcome receipt.
-                raise ExecutionError("paper-account-mismatch", "write session account does not match the expected account") from None
-            self._record_outcome(
-                attempt_record=receipt_seed,
-                event_type="submission-uncertain",
-                reason_code=exc.code,
-                broker={"client_id": self._config()["client_id"], "order_id": None, "perm_id": None, "status": None},
-            )
-            raise ExecutionError(exc.code, "paper submission outcome is uncertain") from None
-        except Exception:
-            self._record_outcome(
-                attempt_record=receipt_seed,
-                event_type="submission-uncertain",
-                reason_code="paper-submission-uncertain",
-                broker={"client_id": self._config()["client_id"], "order_id": None, "perm_id": None, "status": None},
-            )
-            raise ExecutionError("paper-submission-uncertain", "paper submission outcome is uncertain") from None
-        order_id = evidence["order_id"]
-        outcome = evidence["outcome"]
-        status = outcome.get("status")
-        broker_evidence = {
-            "client_id": self._config()["client_id"],
-            "order_id": order_id,
-            "perm_id": None,
-            "status": outcome.get("broker_status"),
-        }
-        if status == "acknowledged":
-            self._record_outcome(
-                attempt_record=receipt_seed,
-                event_type="acknowledged",
-                reason_code=None,
-                broker=broker_evidence,
-            )
-            result_status = "acknowledged"
-        elif status == "done":
-            self._record_outcome(
-                attempt_record=receipt_seed,
-                event_type="acknowledged",
-                reason_code=None,
-                broker=broker_evidence,
-            )
-            result_status = "acknowledged"
-        else:
-            self._record_outcome(
-                attempt_record=receipt_seed,
-                event_type="submission-uncertain",
-                reason_code=outcome.get("code", "paper-submission-uncertain"),
-                broker={
-                    "client_id": self._config()["client_id"],
-                    "order_id": order_id,
-                    "perm_id": None,
-                    "status": None,
-                },
-            )
-            raise ExecutionError(
-                outcome.get("code", "paper-submission-uncertain"), "paper submission outcome is uncertain"
-            )
-        try:
-            transport.disconnect()
-        except Exception:
-            pass
+        finally:
+            # 5F-3a2: the write-capable TWS session is disconnected on
+            # EVERY outcome path (acknowledged, done, rejected, account
+            # mismatch, timeout, uncertain, unexpected exception, and a
+            # partial connection), exactly once, best effort. A cleanup
+            # failure never masks the original result or error.
+            if not disconnect_attempted:
+                disconnect_attempted = True
+                try:
+                    transport.disconnect()
+                except Exception:
+                    pass
         return {
             "schema_version": EXECUTION_RESULT_SCHEMA_VERSION,
             "execution_id": execution_id,

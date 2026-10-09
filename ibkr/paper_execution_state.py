@@ -375,3 +375,89 @@ def append_receipt(
     except paper_locks.LockError:
         raise ExecutionStateError("receipt-write-failed", "Execution receipt writer lock is unavailable") from None
     return "appended"
+
+
+# Closed claim-classification vocabulary for the atomic execution claim.
+CLAIM_CODES = frozenset(
+    {
+        "execution-already-claimed",
+        "execution-uncertain",
+        "receipt-write-failed",
+    }
+)
+
+# Bounded wait for the claim lock. The lock covers only the durable
+# claim (no broker I/O inside), so a short bounded wait is safe: a
+# concurrent claimant serializes here and then observes the prior claim
+# in its own authoritative re-check.
+CLAIM_LOCK_WAIT_SECONDS = 30.0
+
+
+def claim_submission_attempt(
+    record: dict[str, Any],
+    *,
+    _execution_root: pathlib.Path | None = None,
+    _lock_root: pathlib.Path | None = None,
+) -> str:
+    """Atomically claim ONE execution_id for placement (Patch 5F-3a2).
+
+    Under ONE fixed cross-process OS lock the claim operation
+
+    1. resolves and validates the external execution receipt root,
+    2. reads and integrity-validates the whole existing receipt log,
+    3. inspects EVERY record for the exact ``execution_id``,
+    4. classifies the existing execution state, and
+    5. either fails closed (bounded code) or appends exactly one durable
+       ``submission-attempted`` record (fsynced before the lock releases).
+
+    Only a caller receiving ``"claimed"`` owns the execution and may
+    continue toward broker placement. Ownership is by ``execution_id``
+    alone: it never depends on ``event_id`` idempotency, timestamps, or
+    clock behavior, so two concurrent attempts can never both place.
+
+    The lock covers ONLY this durable claim: no network call, contract
+    verification, broker evidence query, TWS connection, or
+    acknowledgement wait happens under it.
+    """
+    if not isinstance(record, dict) or not verify_record_sha256(record):
+        raise ExecutionStateError("receipt-write-failed", "Execution receipt integrity failed")
+    if record.get("event_type") != "submission-attempted":
+        raise ExecutionStateError("intent-invalid", "execution claim requires a submission-attempted record")
+    execution_id = record.get("execution_id")
+    _require_identifier(execution_id, "execution_id")
+    canonical = canonical_json(record)
+    root = resolve_execution_root(_execution_root)
+    path = _receipt_path(root)
+    lock_root = (
+        pathlib.Path(_lock_root)
+        if _lock_root is not None
+        else root.parent / "locks"
+    )
+    try:
+        with paper_locks._acquire(
+            WRITER_LOCK_NAME,
+            purpose="ibkr-paper-execution-claim",
+            nonblocking=False,
+            timeout_seconds=CLAIM_LOCK_WAIT_SECONDS,
+            _lock_root=lock_root,
+        ):
+            # Authoritative state re-check INSIDE the claim lock.
+            existing = read_receipts(_execution_root=_execution_root)
+            for prior in existing:
+                if prior.get("execution_id") != execution_id:
+                    continue
+                if prior.get("event_type") == "submission-uncertain":
+                    raise ExecutionStateError(
+                        "execution-uncertain",
+                        "prior submission outcome is uncertain; no auto-retry",
+                    )
+                raise ExecutionStateError(
+                    "execution-already-claimed",
+                    "execution id is already claimed or completed; never re-place",
+                )
+            _atomic_append(path, canonical)
+    except paper_locks.LockUnavailableError:
+        raise ExecutionStateError("receipt-write-failed", "Execution claim lock is unavailable") from None
+    except paper_locks.LockError:
+        raise ExecutionStateError("receipt-write-failed", "Execution claim lock is unavailable") from None
+    return "claimed"

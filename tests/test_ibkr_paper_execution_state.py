@@ -200,5 +200,93 @@ class ReceiptLockTests(unittest.TestCase):
         self.assertTrue(all(result in ("appended", "idempotent") for result in results))
 
 
+class ExecutionClaimTests(unittest.TestCase):
+    """5F-3a2: the atomic cross-process execution claim."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+
+    def claim(self, record):
+        return state.claim_submission_attempt(record, _execution_root=self.root, _lock_root=self.lock_root)
+
+    def test_first_claim_returns_claimed_and_persists_one_attempted_record(self):
+        record = state.build_receipt(**base_receipt())
+        self.assertEqual(self.claim(record), "claimed")
+        records = state.read_receipts(_execution_root=self.root)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["event_type"], "submission-attempted")
+
+    def test_second_claim_same_execution_id_fails_closed_already_claimed(self):
+        record = state.build_receipt(**base_receipt())
+        self.assertEqual(self.claim(record), "claimed")
+        with self.assertRaises(state.ExecutionStateError) as caught:
+            self.claim(record)
+        self.assertEqual(caught.exception.code, "execution-already-claimed")
+        # No second record was appended.
+        records = state.read_receipts(_execution_root=self.root)
+        self.assertEqual(len(records), 1)
+
+    def test_prior_uncertain_record_makes_claim_fail_closed_uncertain(self):
+        uncertain = state.build_receipt(
+            **base_receipt(event_type="submission-uncertain", reason_code="paper-submission-timeout",
+                           broker={"client_id": 19, "order_id": 11, "perm_id": None, "status": None})
+        )
+        state.append_receipt(uncertain, _execution_root=self.root, _lock_root=self.lock_root)
+        record = state.build_receipt(**base_receipt())
+        with self.assertRaises(state.ExecutionStateError) as caught:
+            self.claim(record)
+        self.assertEqual(caught.exception.code, "execution-uncertain")
+        records = state.read_receipts(_execution_root=self.root)
+        self.assertEqual(len(records), 1)
+
+    def test_prior_outcome_record_for_execution_id_blocks_claim(self):
+        acknowledged = state.build_receipt(
+            **base_receipt(event_type="acknowledged",
+                           broker={"client_id": 19, "order_id": 11, "perm_id": 77, "status": "Submitted"})
+        )
+        state.append_receipt(acknowledged, _execution_root=self.root, _lock_root=self.lock_root)
+        record = state.build_receipt(**base_receipt())
+        with self.assertRaises(state.ExecutionStateError) as caught:
+            self.claim(record)
+        self.assertEqual(caught.exception.code, "execution-already-claimed")
+
+    def test_claim_rejects_non_attempted_event_type(self):
+        record = state.build_receipt(
+            **base_receipt(event_type="acknowledged",
+                           broker={"client_id": 19, "order_id": 11, "perm_id": 77, "status": "Submitted"})
+        )
+        with self.assertRaises(state.ExecutionStateError) as caught:
+            self.claim(record)
+        self.assertEqual(caught.exception.code, "intent-invalid")
+
+    def test_claim_rejects_integrity_broken_record(self):
+        record = state.build_receipt(**base_receipt())
+        record["record_sha256"] = "0" * 64
+        with self.assertRaises(state.ExecutionStateError) as caught:
+            self.claim(record)
+        self.assertEqual(caught.exception.code, "receipt-write-failed")
+
+    def test_corrupt_existing_log_blocks_claim_fail_closed(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / state.RECEIPT_FILENAME).write_bytes(b"corrupt\n")
+        record = state.build_receipt(**base_receipt())
+        with self.assertRaises(state.ExecutionStateError) as caught:
+            self.claim(record)
+        self.assertEqual(caught.exception.code, "receipt-write-failed")
+
+    def test_claim_lock_never_held_during_long_operations(self):
+        # Structural proof: the claim implementation performs no network,
+        # adapter, or transport calls; it uses only the state module's
+        # own file/lock machinery. (The executor-level cross-process test
+        # in tests.test_ibkr_paper_execution proves the placement race.)
+        import inspect
+        source = inspect.getsource(state.claim_submission_attempt)
+        for banned in ("requests", "urllib", "socket", "connect(", "place_order"):
+            self.assertNotIn(banned, source)
+
+
 if __name__ == "__main__":
     unittest.main()
