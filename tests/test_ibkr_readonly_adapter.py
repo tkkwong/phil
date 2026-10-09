@@ -369,9 +369,6 @@ class MutationCapabilityTests(AdapterTestBase):
                 "account_summary", "connect", "contract_details",
                 "contract_details_by_conid", "disconnect", "executions",
                 "managed_accounts", "open_orders", "positions",
-                # 5F-3a: the negative stub exists so the closed boundary is
-                # assertable; it always raises and grants no capability.
-                "submit_order",
             ]),
         )
 
@@ -2125,14 +2122,29 @@ class PaperOrderRefObservabilityTests(AdapterTestBase):
 class ReadOnlyTransportNegativeBoundaryTests(AdapterTestBase):
     """5F-3a: the read-only interface grants NO submission capability."""
 
-    def test_readonly_transport_interface_submit_order_always_raises(self):
+    def test_readonly_surfaces_have_no_mutation_methods(self):
+        # 5F-3a1: structural ABSENCE, not merely an exception. The
+        # read-only capability interfaces must not even carry
+        # mutation-named vocabulary.
         from ibkr.transport import ReadonlyTransport
+        from ibkr.transport_tws import TwsTransport
+        from ibkr.adapter import ReadonlyIbkrAdapter
 
-        self.assertTrue(hasattr(ReadonlyTransport, "submit_order"))
-        # The interface stub always raises; no fake may paper over it.
-        stub = ReadonlyTransport()
-        with self.assertRaises(NotImplementedError):
-            stub.submit_order()
+        for surface in (ReadonlyTransport, TwsTransport, ReadonlyIbkrAdapter):
+            self.assertFalse(hasattr(surface, "submit_order"), surface)
+            self.assertFalse(hasattr(surface, "place_paper_order"), surface)
+            self.assertFalse(hasattr(surface, "place_order"), surface)
+            self.assertFalse(hasattr(surface, "submit"), surface)
+            self.assertFalse(hasattr(surface, "transmit"), surface)
+            self.assertFalse(hasattr(surface, "cancel"), surface)
+
+    def test_mutation_method_exists_only_on_paper_transport(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        self.assertTrue(hasattr(TwsPaperExecutionTransport, "place_paper_order"))
+        self.assertFalse(hasattr(TwsPaperExecutionTransport, "submit_order"))
+        self.assertFalse(hasattr(TwsPaperExecutionTransport, "cancel_order"))
+        self.assertFalse(hasattr(TwsPaperExecutionTransport, "place_order"))
 
     def test_paper_transport_module_is_not_imported_by_readonly_path(self):
         # The read-only adapter/transport machinery never touches the paper
@@ -2207,6 +2219,76 @@ class PaperExecutionWrapperTests(AdapterTestBase):
         wrapper.error(-1, _ts(), 2158, "inactive farm")
         self.assertIsNone(wrapper.failure)
 
+    def test_place_paper_order_verifies_write_session_account(self):
+        """5F-3a1: the connected paper transport itself enforces the exact
+        account allowlist via its own managed_accounts stream BEFORE any
+        placement (order-id allocation / placeOrder).
+        """
+        from ibkr.paper_transport import TwsPaperExecutionTransport, PaperSubmissionError
+
+        class _AccountScriptClient(_PythonShapedEClient):
+            # The automatic handshake delivery is overridden below via the
+            # wrapper; instead serve a different account on the managed
+            # accounts stream.
+            pass
+
+        config = base_config()
+        paper = TwsPaperExecutionTransport(config)
+        holder = {}
+        from ibkr import transport_tws as module
+
+        fake_client_module = types.SimpleNamespace()
+        fake_client_module.EClient = _PythonShapedEClient
+        fake_wrapper_module = types.SimpleNamespace()
+        fake_wrapper_module.EWrapper = type("EWrapper", (), {})
+        original_client_init = _PythonShapedEClient.__init__
+        account_holder = {"account": "DU9999999"}  # NOT the expected account
+
+        def patched_client_init(self, wrapper, **kwargs):
+            wrapper.ready.clear()
+            original_client_init(self, wrapper, **kwargs)
+            # Override the run-loop handshake account delivery.
+            def run_with_account():
+                self.run_entered.set()
+                self.readiness_delay and time.sleep(self.readiness_delay)
+                self.wrapper.nextValidId(19)
+                self.wrapper.managedAccounts(account_holder["account"])
+                while self.socket_connected and not self.run_should_exit.is_set():
+                    self._serve_scripted_requests()
+                    if self.run_should_exit.wait(0.01):
+                        break
+            self.run = run_with_account
+            holder["client"] = self
+
+        _PythonShapedEClient.__init__ = patched_client_init
+        try:
+            with patch.dict(sys.modules, {
+                "ibapi": types.ModuleType("ibapi"),
+                "ibapi.client": fake_client_module,
+                "ibapi.wrapper": fake_wrapper_module,
+                "ibapi.contract": types.ModuleType("ibapi.contract"),
+            }):
+                paper.connect(config)
+            # The write session is connected but holding a WRONG account.
+            with self.assertRaises(PaperSubmissionError) as caught:
+                paper.place_paper_order(
+                    target={"conid": 111},
+                    action="BUY",
+                    quantity=1,
+                    limit_price="10.00",
+                    order_ref="phil5f3-" + "c" * 32,
+                    expected_account_id=EXPECTED_ACCOUNT,
+                )
+            self.assertEqual(caught.exception.code, "paper-account-mismatch")
+            fake_client = holder["client"]
+            requested = [call[0] if isinstance(call, tuple) else call for call in fake_client.requests]
+            self.assertNotIn("placeOrder", requested)
+            # No order watch remained registered after the failed gate.
+            self.assertEqual(paper._wrapper.order_events, {})
+        finally:
+            paper.disconnect()
+            _PythonShapedEClient.__init__ = original_client_init
+
     def test_place_paper_order_requires_connected_wrapper(self):
         transport = self._paper_transport()
         self.addCleanup(transport.disconnect)
@@ -2217,6 +2299,7 @@ class PaperExecutionWrapperTests(AdapterTestBase):
                 quantity=1,
                 limit_price="10.00",
                 order_ref="phil5f3-" + "c" * 32,
+                expected_account_id=EXPECTED_ACCOUNT,
             )
 
 

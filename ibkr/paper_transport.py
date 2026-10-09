@@ -216,6 +216,7 @@ class TwsPaperExecutionTransport(TwsTransport):
         quantity: int,
         limit_price: str,
         order_ref: str,
+        expected_account_id: str,
     ) -> dict[str, Any]:
         """Submit ONE bounded PAPER order and return bounded evidence.
 
@@ -224,12 +225,28 @@ class TwsPaperExecutionTransport(TwsTransport):
         5F-3a envelope: BUY/LMT/DAY, whole shares, outsideRth=False,
         transmit=True, deterministic orderRef. Returns a bounded outcome
         document; never a raw broker object, never broker error text.
+
+        THIS session — the one that owns ``placeOrder`` — independently
+        verifies ``managed_accounts == [expected_account_id]`` BEFORE any
+        order-id allocation or placement, using the accepted 5F-1 account
+        semantics (exactly one account, exactly the configured id; never
+        inferred from a prefix, port, environment, or account type). A
+        prior read-only session's verification grants nothing here.
         """
         client, wrapper = self._require_connected()
         if not isinstance(wrapper, _PaperExecutionWrapper):
             raise TransportError("paper transport wrapper is not armed")
         if self._wrapper is not wrapper:  # pragma: no cover - defensive
             raise TransportError("paper transport wrapper mismatch")
+        if not isinstance(expected_account_id, str) or not expected_account_id:
+            raise PaperSubmissionError("paper-account-mismatch")
+        # Write-session account allowlist (5F-3a1): strictly BEFORE the
+        # broker order-id lifecycle is used for placement.
+        accounts = self.managed_accounts()
+        if not accounts:
+            raise PaperSubmissionError("paper-session-failed")
+        if len(accounts) > 1 or str(accounts[0]) != expected_account_id:
+            raise PaperSubmissionError("paper-account-mismatch")
 
         from ibapi import contract as ibapi_contract  # type: ignore
         from ibapi.order import Order  # type: ignore

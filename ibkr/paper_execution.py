@@ -124,6 +124,7 @@ class ExecutionError(RuntimeError):
             "multiple-accounts",
             "account-mismatch",
             "paper-order-rejected",
+            "paper-account-mismatch",
             "paper-session-failed",
             "paper-submission-timeout",
             "paper-submission-uncertain",
@@ -571,6 +572,7 @@ class IbkrPaperExecutor:
                 quantity=order["quantity"],
                 limit_price=order["limit_price"],
                 order_ref=order_ref,
+                expected_account_id=str(self._config()["expected_account_id"]),
             )
         except PaperSubmissionError as exc:
             if exc.code == "paper-order-rejected":
@@ -586,6 +588,12 @@ class IbkrPaperExecutor:
                     },
                 )
                 raise ExecutionError("paper-order-rejected", "paper order was rejected by the broker") from None
+            if exc.code == "paper-account-mismatch":
+                # The write session's account allowlist failed BEFORE any
+                # order-id allocation or placement: the broker never saw
+                # the order, so there is no broker-state uncertainty. Fail
+                # closed with the bounded code and no outcome receipt.
+                raise ExecutionError("paper-account-mismatch", "write session account does not match the expected account") from None
             self._record_outcome(
                 attempt_record=receipt_seed,
                 event_type="submission-uncertain",

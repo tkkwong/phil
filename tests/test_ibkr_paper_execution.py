@@ -210,13 +210,24 @@ class _FakeReadAdapter:
 
 
 class _FakePaperTransport:
-    """Paper transport fake: records exactly one submission."""
+    """Paper transport fake: records exactly one submission.
 
-    def __init__(self, *, outcome="acknowledged", fail=None):
+    Mirrors the real transport's 5F-3a1 boundary: the write-session
+    account allowlist is enforced INSIDE ``place_paper_order`` BEFORE the
+    submission is recorded, so a failed account gate leaves zero place
+    calls.
+    """
+
+    def __init__(self, *, outcome="acknowledged", fail=None, managed_accounts=None):
         self.outcome = outcome
         self.fail = fail
+        self.managed_account_list = [EXPECTED_ACCOUNT] if managed_accounts is None else list(managed_accounts)
         self.calls: list[str] = []
         self.place_calls: list[dict] = []
+
+    def managed_accounts(self):
+        self.calls.append("managed_accounts")
+        return list(self.managed_account_list)
 
     def connect(self, config):
         self.calls.append("connect")
@@ -227,6 +238,17 @@ class _FakePaperTransport:
 
     def place_paper_order(self, **kwargs):
         self.calls.append("place_paper_order")
+        expected = kwargs.pop("expected_account_id", None)
+        # Write-session account allowlist, enforced BEFORE any placement
+        # evidence is recorded (mirrors TwsPaperExecutionTransport, which
+        # reads its own managed_accounts stream first).
+        self.calls.append("managed_accounts")
+        if not expected:
+            raise pe.PaperSubmissionError("paper-account-mismatch")
+        if not self.managed_account_list:
+            raise pe.PaperSubmissionError("paper-session-failed")
+        if len(self.managed_account_list) > 1 or str(self.managed_account_list[0]) != expected:
+            raise pe.PaperSubmissionError("paper-account-mismatch")
         self.place_calls.append(kwargs)
         if self.fail == "rejected":
             raise pe.PaperSubmissionError("paper-order-rejected", broker_code=110)
@@ -824,6 +846,157 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("arm-confirmation-mismatch", err)
         self.assertNotIn("Traceback", err)
+
+
+class WriteSessionAccountAllowlistTests(unittest.TestCase):
+    """5F-3a1: the session that owns placeOrder independently enforces the
+    exact account allowlist — a prior read-only verification grants nothing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, read_adapter, transport):
+        return make_executor(
+            read_adapter=read_adapter,
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_exact_allowlisted_account_reaches_placement(self):
+        transport = _FakePaperTransport(managed_accounts=[EXPECTED_ACCOUNT])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(len(transport.place_calls), 1)
+        # The write session verified ITS OWN managed accounts (the exact
+        # allowlisted id) inside the placement boundary.
+        self.assertIn("managed_accounts", transport.calls)
+        self.assertEqual(transport.managed_account_list, [EXPECTED_ACCOUNT])
+
+    def test_unexpected_write_session_account_zero_place_calls(self):
+        transport = _FakePaperTransport(managed_accounts=["DU9999999"])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_multiple_write_session_accounts_zero_place_calls(self):
+        transport = _FakePaperTransport(managed_accounts=[EXPECTED_ACCOUNT, "DU0000022"])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_zero_write_session_accounts_zero_place_calls(self):
+        transport = _FakePaperTransport(managed_accounts=[])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_prior_readonly_verification_cannot_authorize_mismatched_write_session(self):
+        # The read adapter verifies the EXACT account successfully; the
+        # write session then reports a DIFFERENT account. The submission
+        # must still fail closed with zero place calls.
+        transport = _FakePaperTransport(managed_accounts=["DU9999999"])
+        read_adapter = _FakeReadAdapter(verify=True)  # verification SUCCEEDS
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        # The read-only verification DID run.
+        self.assertTrue(any(call[0] == "lookup_contract_by_conid" for call in read_adapter.calls if isinstance(call, tuple)))
+        # ...and the write session still never placed anything.
+        self.assertEqual(transport.place_calls, [])
+
+    def test_account_never_inferred_from_prefix_port_or_environment(self):
+        # The gate compares the exact configured account id only; a
+        # different-looking-but-equal-length id fails.
+        transport = _FakePaperTransport(managed_accounts=["DU0000011 "])  # trailing space != exact id
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+
+
+class StaticArchitectureTests(unittest.TestCase):
+    """5F-3a1: structural mutation-capability architecture proof."""
+
+    def test_readonly_surfaces_expose_no_mutation_methods(self):
+        from ibkr.adapter import ReadonlyIbkrAdapter
+        from ibkr.transport import ReadonlyTransport
+        from ibkr.transport_tws import TwsTransport
+
+        self.assertEqual(
+            [name for name in dir(ReadonlyIbkrAdapter) if not name.startswith("_")],
+            sorted(name for name in dir(ReadonlyIbkrAdapter) if not name.startswith("_")),
+        )
+        for surface in (ReadonlyIbkrAdapter, ReadonlyTransport, TwsTransport):
+            for forbidden in ("submit_order", "place_paper_order", "place_order",
+                              "submit", "transmit", "cancel", "cancel_order",
+                              "cancelOrder", "reqGlobalCancel", "exerciseOptions"):
+                self.assertFalse(hasattr(surface, forbidden), (surface, forbidden))
+
+    def test_paper_transport_alone_exposes_place_paper_order(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        self.assertTrue(hasattr(TwsPaperExecutionTransport, "place_paper_order"))
+
+    def _ast_attribute_files(self, attr_name):
+        import ast
+
+        hits = []
+        for path in sorted(REPOSITORY_ROOT.rglob("*.py")):
+            relative = path.relative_to(REPOSITORY_ROOT)
+            if ".git" in relative.parts or "tests" in relative.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == attr_name:
+                    hits.append(str(relative))
+        return sorted(set(hits))
+
+    def test_place_order_ast_only_in_paper_transport(self):
+        self.assertEqual(self._ast_attribute_files("placeOrder"), ["ibkr/paper_transport.py"])
+
+    def test_order_construction_ast_only_in_paper_transport(self):
+        # ibapi.order.Order is referenced (imported and constructed) only
+        # in the paper transport.
+        import ast
+
+        hits = []
+        for path in sorted(REPOSITORY_ROOT.rglob("*.py")):
+            relative = path.relative_to(REPOSITORY_ROOT)
+            if ".git" in relative.parts or "tests" in relative.parts:
+                continue
+            source = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    module = getattr(node, "module", "") or ""
+                    names = [alias.name for alias in node.names]
+                    if "ibapi.order" in module or "order" in names and module.startswith("ibapi"):
+                        hits.append(str(relative))
+        self.assertEqual(hits, ["ibkr/paper_transport.py"])
+
+    def test_cancel_global_cancel_exercise_zero_invocations(self):
+        for attr in ("cancelOrder", "reqGlobalCancel", "exerciseOptions"):
+            self.assertEqual(self._ast_attribute_files(attr), [], attr)
 
 
 class IsolationTests(unittest.TestCase):
