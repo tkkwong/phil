@@ -783,7 +783,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with open(options.mapping_file, "r", encoding="utf-8") as handle:
             mapping_entry = json.load(handle)
-        intent_document, computed_execution_id = load_intent(options.intent_file)
+        with open(options.intent_file, "r", encoding="utf-8") as handle:
+            raw_intent = json.load(handle)
+        # Decode the intent file HERE (symmetric with the mapping file);
+        # load_intent receives the decoded JSON document, never the path
+        # string. A path string would be schema-rejected as
+        # intent-schema-mismatch by validate_intent.
+        intent_document, computed_execution_id = load_intent(document=raw_intent)
     except json.JSONDecodeError:
         print("error: a required input file is not valid JSON", file=sys.stderr)
         return 2

@@ -836,6 +836,155 @@ class CliTests(unittest.TestCase):
         # about the path words.
         self.assertNotIn("unsupported option", err)
 
+    def test_5f3a4_cli_acceptance_no_arm_subprocess_reaches_arm_missing(self):
+        # Brief's DIRECT CLI ACCEPTANCE: run the CLI as a real subprocess
+        # (`python -m ibkr.paper_execution submit ...`) without --arm-paper
+        # using real temp files. arm-missing occurs BEFORE config/broker
+        # I/O, so no IBKR configuration is required.
+        import subprocess
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-m", "ibkr.paper_execution", "submit",
+             "--intent-file", str(self.intent_path),
+             "--mapping-file", str(self.mapping_path),
+             "--confirm-execution-id", self.execution_id_value],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPOSITORY_ROOT),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("arm-missing", completed.stderr)
+        self.assertNotIn("intent-schema-mismatch", completed.stderr)
+        self.assertNotIn("intent-invalid", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_5f3a4_valid_intent_file_missing_arm_reaches_arm_missing(self):
+        # 5F-3a4 regression 1: a VALID intent file (real temp JSON file,
+        # not mocked) must load and validate, so a missing --arm-paper
+        # surfaces arm-missing — never intent-schema-mismatch/intent-invalid
+        # from a path string reaching validate_intent.
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(self.intent_path),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-missing", stderr.getvalue())
+        self.assertNotIn("intent-schema-mismatch", stderr.getvalue())
+        self.assertNotIn("intent-invalid", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_valid_intent_file_wrong_confirmation(self):
+        # 5F-3a4 regression 2: wrong confirmation is detected BEFORE any
+        # broker I/O (confirmation check precedes executor construction).
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(self.intent_path),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", "0" * 64,
+                "--arm-paper",
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-confirmation-mismatch", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_cli_loaded_id_equals_direct_api_id(self):
+        # 5F-3a4 regression 3: CLI file loading computes the SAME
+        # execution id as the direct document API.
+        direct_intent, direct_id = pe.load_intent(document=base_intent())
+        file_intent, file_id = pe.load_intent(
+            document=json.loads(self.intent_path.read_text(encoding="utf-8"))
+        )
+        self.assertEqual(file_id, direct_id)
+        self.assertEqual(file_intent, direct_intent)
+        # And the CLI's own loading path (as main() now does it) matches.
+        raw = json.loads(self.intent_path.read_text(encoding="utf-8"))
+        _, cli_id = pe.load_intent(document=raw)
+        self.assertEqual(cli_id, self.execution_id_value)
+
+    def test_5f3a4_malformed_intent_json_bounded(self):
+        # 5F-3a4 regression 4: malformed intent JSON -> bounded message,
+        # no traceback.
+        broken = pathlib.Path(self.tmp.name) / "broken-intent.json"
+        broken.write_text('{"intent_id": "x", NOPE', encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(broken),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("a required input file is not valid JSON", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_missing_intent_file_bounded(self):
+        # 5F-3a4 regression 5: missing intent file -> bounded message,
+        # no traceback.
+        absent = pathlib.Path(self.tmp.name) / "absent-intent.json"
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(absent),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("a required input file could not be read", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_valid_json_invalid_intent_document_bounded(self):
+        # 5F-3a4 regression 6: valid JSON that fails the intent schema ->
+        # bounded ExecutionError code, no traceback.
+        invalid = pathlib.Path(self.tmp.name) / "invalid-schema.json"
+        invalid.write_text(json.dumps({"unrelated": "document"}), encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(invalid),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("error: ", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        # The bounded schema code surfaces (not the file-level message).
+        self.assertNotIn("a required input file", stderr.getvalue())
+
+    def test_5f3a4_intent_path_values_remain_opaque(self):
+        # 5F-3a4 regression 7: operational words in the intent PATH are
+        # treated strictly as a path; no substring scanning of the value.
+        weird_dir = pathlib.Path(self.tmp.name) / "live-real-trade-position-size"
+        weird_dir.mkdir()
+        weird = weird_dir / "intent.json"
+        weird.write_text(json.dumps(base_intent()), encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(weird),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        # The file LOADS (correct schema validation), so the only
+        # rejection is the missing arm — never a path-content complaint.
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-missing", stderr.getvalue())
+        self.assertNotIn("unsupported option", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
     def test_wrong_confirmation_fails_bounded(self):
         self.mapping_path.write_text("{}", encoding="utf-8")
         code, _, err = self.run_cli([
