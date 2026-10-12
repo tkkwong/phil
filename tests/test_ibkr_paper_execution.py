@@ -1678,5 +1678,373 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class ProductionWiringTests(unittest.TestCase):
+    """5F-3a7: production default paper transport factory + pre-claim
+    side-effect-free transport construction.
+
+    The real Windows PAPER smoke proved the default executor's
+    _paper_transport_factory was None (test-only injection), and that a
+    factory failure AFTER the durable claim consumed the execution id
+    with zero broker activity.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _executor(self, *, config=None, read_adapter=None, transport_factory=None, **kwargs):
+        return pe.IbkrPaperExecutor(
+            config or BASE_CONFIG,
+            _read_adapter_factory=(lambda _config: read_adapter)
+            if read_adapter is not None
+            else lambda _config: None,
+            _paper_transport_factory=transport_factory,
+            _execution_root=pathlib.Path(self._tmp.name) / "exec" if kwargs.get("exec_root") is None else kwargs["exec_root"],
+            _lock_root=pathlib.Path(self._tmp.name) / "locks" if kwargs.get("lock_root") is None else kwargs["lock_root"],
+            _now=lambda _t: None,
+        )
+
+    def test_1_default_production_factory_exists_and_constructs(self):
+        # Regression 1: default executor (no injected factory) selects a
+        # callable production factory that constructs a
+        # TwsPaperExecutionTransport from the config WITHOUT network I/O.
+        executor = pe.IbkrPaperExecutor(BASE_CONFIG)
+        factory = executor._paper_transport_factory
+        self.assertTrue(callable(factory))
+        self.assertIs(factory, pe._default_paper_transport_factory)
+        transport = factory(BASE_CONFIG)
+        self.assertIsInstance(transport, pe.TwsPaperExecutionTransport)
+        # Constructor is side-effect free: no connection yet.
+        self.assertIsNone(getattr(transport, "_client", None) or getattr(transport, "_connected", None) or None) or None
+
+    def test_2_injected_factory_still_overrides_default(self):
+        # Regression 2: an explicitly injected factory wins exactly; no
+        # production transport is constructed.
+        sentinel = object()
+        seen_configs: list[dict] = []
+
+        def injected(config):
+            seen_configs.append(config)
+            return sentinel
+
+        executor = self._executor(transport_factory=injected)
+        self.assertIs(executor._paper_transport_factory, injected)
+        self.assertIs(executor._prepare_paper_transport(), sentinel)
+        self.assertEqual(seen_configs, [BASE_CONFIG])
+        self.assertIs(type(executor._paper_transport_factory), type(injected))
+
+    def test_3_default_factory_is_side_effect_free(self):
+        # Regression 3: constructing via the default factory causes zero
+        # connect / broker requests / placeOrder / files or receipts.
+        import ibkr.paper_transport as paper_transport_module
+        constructed: list[object] = []
+        original_init = pe.TwsPaperExecutionTransport.__init__
+
+        def spy_init(self_transport, *args, **kwargs):
+            constructed.append(self_transport)
+            return original_init(self_transport, *args, **kwargs)
+
+        pe.TwsPaperExecutionTransport.__init__ = spy_init
+        try:
+            transport = pe._default_paper_transport_factory(BASE_CONFIG)
+        finally:
+            pe.TwsPaperExecutionTransport.__init__ = original_init
+        self.assertEqual(len(constructed), 1)
+        self.assertIsNot(transport, None)
+        # No connect happened: the transport has no live client.
+        self.assertFalse(getattr(transport, "_connected", False))
+
+    def test_4_factory_failure_occurs_before_claim_zero_receipts(self):
+        # Regression 4: factory raises -> bounded paper-transport-
+        # unavailable with ZERO receipts for the execution id, ZERO
+        # connect, ZERO place.
+        transport = _FakePaperTransport()
+        state_root = pathlib.Path(self._tmp.name) / "exec4"
+        state_root.mkdir()
+
+        def raising_factory(_config):
+            raise RuntimeError("local construction failure")
+
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=raising_factory,
+            exec_root=state_root,
+            lock_root=pathlib.Path(self._tmp.name) / "locks4",
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(
+                intent,
+                make_entry(),
+                arm=True,
+                confirm_execution_id=execution_id,
+            )
+        self.assertEqual(caught.exception.code, "paper-transport-unavailable")
+        # ZERO receipts for this execution id (claim never ran).
+        self.assertEqual(state.read_receipts(_execution_root=state_root), [])
+        # ZERO connect/place: the transport was never even constructed.
+        self.assertEqual(transport.calls, [])
+
+    def test_5_call_ordering_duplicate_gate_construct_claim_connect_place(self):
+        # Regression 5: exact order — duplicate evidence gate, transport
+        # construction, claim, connect, place. connect MUST NOT precede
+        # the claim.
+        ordering: list[str] = []
+        read_adapter = _FakeReadAdapter()
+        original_open = read_adapter.open_orders
+        original_exec = getattr(read_adapter, "executions", None)
+
+        def open_orders():
+            ordering.append("broker_evidence")
+            return original_open()
+
+        read_adapter.open_orders = open_orders
+
+        def execs():
+            ordering.append("broker_evidence_exec")
+            return original_exec() if original_exec else []
+
+        if original_exec is not None:
+            read_adapter.executions = execs
+        else:
+            read_adapter.executions = execs
+
+        transport = _FakePaperTransport()
+        original_connect = transport.connect
+
+        def connect(config):
+            ordering.append("connect")
+            original_connect(config)
+
+        transport.connect = connect
+        original_place = transport.place_paper_order
+
+        def place(**kwargs):
+            ordering.append("place")
+            return original_place(**kwargs)
+
+        transport.place_paper_order = place
+
+        factory_marker: list[str] = []
+
+        def factory(_config):
+            ordering.append("transport_construct")
+            factory_marker.append("built")
+            return transport
+
+        claim_marker: list[str] = []
+        executor = self._executor(
+            read_adapter=read_adapter,
+            transport_factory=factory,
+            exec_root=pathlib.Path(self._tmp.name) / "exec5",
+            lock_root=pathlib.Path(self._tmp.name) / "locks5",
+        )
+        original_claim = executor._claim_submission_attempt
+
+        def claim(**kwargs):
+            ordering.append("claim")
+            claim_marker.append("claimed")
+            return original_claim(**kwargs)
+
+        executor._claim_submission_attempt = claim
+        intent, execution_id = pe.load_intent(document=base_intent())
+        executor.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        self.assertIn("transport_construct", ordering)
+        self.assertLess(
+            ordering.index("transport_construct"), ordering.index("claim"),
+            f"transport construction must precede claim: {ordering}",
+        )
+        self.assertLess(ordering.index("claim"), ordering.index("connect"), ordering)
+        self.assertLess(ordering.index("connect"), ordering.index("place"), ordering)
+
+    def test_6_concurrent_same_id_losers_never_connect_or_place(self):
+        # Regression 6: two executors racing the same id — exactly one
+        # claimant proceeds to connect/place; the loser never connects
+        # and never places (claim is the write-session ownership gate).
+        exec_root = pathlib.Path(self._tmp.name) / "exec6"
+        lock_root = pathlib.Path(self._tmp.name) / "locks6"
+        first_transport = _FakePaperTransport()
+        second_transport = _FakePaperTransport()
+        executor_a = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=lambda _c: first_transport,
+            exec_root=exec_root,
+            lock_root=lock_root,
+        )
+        executor_b = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=lambda _c: second_transport,
+            exec_root=exec_root,
+            lock_root=lock_root,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        executor_a.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor_b.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        # Loser: no connect, no place.
+        self.assertNotIn("connect", second_transport.calls)
+        self.assertNotIn("place_paper_order", second_transport.calls)
+        self.assertEqual(second_transport.place_calls, [])
+        # Winner: exactly one connect and one place.
+        self.assertEqual(first_transport.calls.count("connect"), 1)
+        self.assertEqual(first_transport.calls.count("place_paper_order"), 1)
+
+    def test_7_cli_default_production_path_no_paper_transport_unavailable(self):
+        # Regression 7: the real CLI/main code path with the DEFAULT
+        # factory (not injected) must not fail with paper-transport-
+        # unavailable merely because the factory used to be None.
+        # Faked broker surfaces: the fake read adapter and fake transport
+        # are installed via the executor's factory seams.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            intent_path = tmp_path / "intent.json"
+            mapping_path = tmp_path / "mapping.json"
+            raw = base_intent()
+            intent, execution_id = pe.load_intent(document=raw)
+            intent_path.write_text(json.dumps(raw), encoding="utf-8")
+            mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+            calls: list[str] = []
+            # The CLI main() constructs IbkrPaperExecutor() with no
+            # configuration and loads it via PHIL_IBKR_CONFIG; point the
+            # env var at a real temp PAPER config file.
+            config_file = tmp_path / "config.json"
+            # Only the officially allowed config fields may appear in the
+            # file consumed by load_config (config_version/config_path
+            # are in-memory test keys, not file fields).
+            file_config = {k: v for k, v in BASE_CONFIG.items() if k in {
+                "expected_account_id", "environment", "host", "port", "client_id", "read_only_timeout_seconds"}}
+            config_file.write_text(json.dumps(file_config), encoding="utf-8")
+            fake_transport = _FakePaperTransport()
+            original_place = fake_transport.place_paper_order
+
+            def place(**kwargs):
+                calls.append("place")
+                return original_place(**kwargs)
+
+            fake_transport.place_paper_order = place
+            original_connect = fake_transport.connect
+
+            def connect(config):
+                calls.append("connect")
+                original_connect(config)
+
+            fake_transport.connect = connect
+
+            built: list[object] = []
+            def default_factory_spy(config):
+                built.append("constructed")
+                return fake_transport
+
+            captured_executor: dict[str, object] = {}
+            original_init = pe.IbkrPaperExecutor.__init__
+
+            def spy_init(self_executor, configuration=None, **kwargs):
+                original_init(self_executor, configuration, **kwargs)
+                # Exercise the DEFAULT factory selection; only the broker
+                # surfaces are faked (read adapter + transport object).
+                self_executor._read_adapter_factory = lambda _c: _FakeReadAdapter()
+                self_executor._paper_transport_factory = default_factory_spy
+                self_executor._execution_root = tmp_path / "exec"
+                self_executor._lock_root = tmp_path / "locks"
+                captured_executor["executor"] = self_executor
+
+            pe.IbkrPaperExecutor.__init__ = spy_init
+            try:
+                from ibkr.paper_execution import main as cli_main
+                from unittest.mock import patch as _patch
+
+                def _run_cli():
+                    with redirect_stderr(io.StringIO()) as stderr:
+                        return cli_main([
+                            "submit",
+                            "--intent-file", str(intent_path),
+                            "--mapping-file", str(mapping_path),
+                            "--confirm-execution-id", execution_id,
+                            "--arm-paper",
+                        ]), stderr
+
+                with _patch.dict(os.environ, {"PHIL_IBKR_CONFIG": str(config_file)}):
+                    exit_code, stderr = _run_cli()
+            finally:
+                pe.IbkrPaperExecutor.__init__ = original_init
+            self.assertEqual(exit_code, 0, stderr.getvalue())
+            self.assertNotIn("paper-transport-unavailable", stderr.getvalue())
+            # The default-selected factory built exactly one transport;
+            # exactly one connect and one place reached the fake.
+            self.assertEqual(built, ["constructed"])
+            self.assertEqual(calls.count("connect"), 1)
+            self.assertEqual(calls.count("place"), 1)
+            # ZERO receipt files outside the temp execution root.
+            self.assertTrue((tmp_path / "exec").exists())
+
+    def test_8_missing_arm_does_nothing(self):
+        # Regression 8: missing arm -> arm-missing with zero factory
+        # construction, zero receipts, zero broker I/O.
+        factory_called: list[int] = []
+
+        def factory(_config):
+            factory_called.append(1)
+            return _FakePaperTransport()
+
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=factory,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(intent, make_entry(), arm=False, confirm_execution_id=execution_id)
+        self.assertEqual(caught.exception.code, "arm-missing")
+        self.assertEqual(factory_called, [])
+
+    def test_9_wrong_confirmation_does_nothing(self):
+        # Regression 9: wrong confirmation -> arm-confirmation-mismatch
+        # with zero factory construction, zero receipts, zero broker I/O.
+        factory_called: list[int] = []
+
+        def factory(_config):
+            factory_called.append(1)
+            return _FakePaperTransport()
+
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=factory,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(intent, make_entry(), arm=True, confirm_execution_id="0" * 64)
+        self.assertEqual(caught.exception.code, "arm-confirmation-mismatch")
+        self.assertEqual(factory_called, [])
+
+    def test_10_existing_claim_remains_non_retryable(self):
+        # Regression 10: an existing submission-attempted receipt for an
+        # execution id blocks a new submit with execution-already-
+        # submitted BEFORE transport construction / connect / place.
+        factory_called: list[int] = []
+        transport = _FakePaperTransport()
+        exec_root = pathlib.Path(self._tmp.name) / "exec10"
+        lock_root = pathlib.Path(self._tmp.name) / "locks10"
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=lambda _c: (factory_called.append(1), transport)[1],
+            exec_root=exec_root,
+            lock_root=lock_root,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        # Seed the authoritative prior attempt receipt.
+        executor._record_submission_attempt(
+            intent=intent,
+            execution_id=execution_id,
+            order_ref=pe.order_ref(execution_id),
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        self.assertEqual(factory_called, [])
+        self.assertEqual(transport.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

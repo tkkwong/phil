@@ -326,6 +326,22 @@ def _paper_environment_gate(config: dict[str, Any]) -> None:
         raise ExecutionError("environment-not-paper", "execution requires an explicitly PAPER configuration")
 
 
+def _default_paper_transport_factory(config: dict[str, Any]) -> Any:
+    """Production default paper transport factory (5F-3a7).
+
+    CONSTRUCTION ONLY: TwsPaperExecutionTransport.__init__ is
+    side-effect-free (no network, no TWS connect, no broker request, no
+    order-id allocation, no placeOrder). Official IBAPI networking
+    occurs exclusively inside connect(), which remains AFTER the atomic
+    durable submission-attempted claim. Deferred import keeps module
+    import connection-free; no global singleton is kept — each
+    execution attempt constructs a fresh transport object.
+    """
+    from ibkr.paper_transport import TwsPaperExecutionTransport
+
+    return TwsPaperExecutionTransport(config)
+
+
 class IbkrPaperExecutor:
     """Manually armed PAPER-only submission boundary (never automated).
 
@@ -346,7 +362,16 @@ class IbkrPaperExecutor:
     ) -> None:
         self._configuration = configuration
         self._read_adapter_factory = _read_adapter_factory
-        self._paper_transport_factory = _paper_transport_factory
+        # 5F-3a7: the PRODUCTION/default executor previously had
+        # _paper_transport_factory is None (only tests inject one), so the
+        # real CLI smoke crashed with paper-transport-unavailable.
+        # Provide a real production default factory; an injected factory
+        # still overrides it exactly.
+        self._paper_transport_factory = (
+            _paper_transport_factory
+            if _paper_transport_factory is not None
+            else _default_paper_transport_factory
+        )
         self._execution_root = _execution_root
         self._lock_root = _lock_root
         self._now = _now
@@ -385,6 +410,12 @@ class IbkrPaperExecutor:
         self._reject_known_execution_state(computed_execution_id)
         verification = self._reverify_contract(mapping_entry)
         self._reject_broker_evidence_duplicate(order_ref(computed_execution_id))
+        # 5F-3a7: transport OBJECT CONSTRUCTION is side-effect-free and
+        # happens BEFORE the durable claim, so a purely local factory
+        # failure cannot consume (poison) an execution id. connect()
+        # deliberately remains AFTER the atomic claim — the claim is the
+        # final ownership gate before any write-capable session starts.
+        transport = self._prepare_paper_transport()
         receipt_seed = self._claim_submission_attempt(
             intent=intent,
             execution_id=computed_execution_id,
@@ -396,6 +427,7 @@ class IbkrPaperExecutor:
             order_ref=order_ref(computed_execution_id),
             verification=verification,
             receipt_seed=receipt_seed,
+            transport=transport,
         )
 
     # -- gates ---------------------------------------------------------------
@@ -460,6 +492,22 @@ class IbkrPaperExecutor:
                 raise ExecutionError("duplicate-broker-evidence", "an execution with this order_ref already exists")
 
     # -- receipts ------------------------------------------------------------
+
+    def _prepare_paper_transport(self) -> Any:
+        """Side-effect-free transport CONSTRUCTION (5F-3a7).
+
+        Runs before the durable submission-attempted claim: a factory
+        failure here costs ZERO receipts, ZERO connect calls, ZERO
+        place calls, ZERO broker I/O — the execution id stays unused.
+        The returned object must not be connected here.
+        """
+        try:
+            return self._paper_transport_factory(self._config())
+        except Exception:
+            raise ExecutionError(
+                "paper-transport-unavailable",
+                "paper execution transport is unavailable",
+            ) from None
 
     def _record_submission_attempt(
         self,
@@ -623,13 +671,10 @@ class IbkrPaperExecutor:
         order_ref: str,
         verification: dict[str, Any],
         receipt_seed: dict[str, Any],
+        transport: Any,
     ) -> dict[str, Any]:
         target = verification["ibkr"]
         order = intent["order"]
-        try:
-            transport = self._paper_transport_factory(self._config())
-        except Exception:
-            raise ExecutionError("paper-transport-unavailable", "paper execution transport is unavailable") from None
         disconnect_attempted = False
         try:
             transport.connect(self._config())
