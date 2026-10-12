@@ -292,7 +292,15 @@ def validate_intent(document: Any) -> dict[str, Any]:
     if created_at is not None:
         if not isinstance(created_at, str) or len(created_at) > 32:
             raise ExecutionError("intent-invalid", "created_at must be informational text")
-        validated["created_at"] = created_at
+    # created_at is a REQUIRED top-level field (None or a bounded
+    # informational string). The normalized result must always satisfy
+    # the SAME closed schema it was validated against, so the key is
+    # preserved even when the value is None; otherwise the normalized
+    # document fails its own revalidation inside executor.submit
+    # (normalization-idempotency defect found by real Windows CLI
+    # acceptance). created_at remains informational and is excluded
+    # from execution_id identity (see intent_identity).
+    validated["created_at"] = created_at
     return validated
 
 

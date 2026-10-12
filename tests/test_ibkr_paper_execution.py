@@ -346,6 +346,57 @@ class IntentValidationTests(unittest.TestCase):
             callable_()
         self.assertEqual(caught.exception.code, code, caught.exception)
 
+    def test_5f3a5_normalization_is_schema_idempotent_created_at_none(self):
+        # 5F-3a5: the normalized result of validate_intent must itself
+        # satisfy the same closed schema. created_at=None previously
+        # DROPPED the key, so executor.submit's revalidation of the
+        # normalized document failed with intent-schema-mismatch.
+        raw = base_intent()
+        raw["created_at"] = None
+        normalized1, id1 = pe.load_intent(document=raw)
+        normalized2, id2 = pe.load_intent(document=normalized1)
+        self.assertEqual(normalized1, normalized2)
+        self.assertEqual(id1, id2)
+        self.assertIn("created_at", normalized1)
+        self.assertIsNone(normalized1["created_at"])
+
+    def test_5f3a5_closed_field_set_preserved_when_created_at_none(self):
+        raw = base_intent()
+        raw["created_at"] = None
+        normalized, _ = pe.load_intent(document=raw)
+        self.assertEqual(set(normalized.keys()), set(pe._CLOSED_INTENT_FIELDS))
+
+    def test_5f3a5_created_at_string_preserved_exactly(self):
+        raw = base_intent()
+        raw["created_at"] = "2026-10-12T12:00:00Z"
+        normalized, _ = pe.load_intent(document=raw)
+        self.assertEqual(normalized["created_at"], "2026-10-12T12:00:00Z")
+        again, _ = pe.load_intent(document=normalized)
+        self.assertEqual(again["created_at"], "2026-10-12T12:00:00Z")
+        self.assertEqual(normalized, again)
+
+    def test_5f3a5_execution_id_independent_of_created_at(self):
+        without = base_intent()
+        without["created_at"] = None
+        with_value = base_intent()
+        with_value["created_at"] = "2026-10-12T12:00:00Z"
+        _, id_without = pe.load_intent(document=without)
+        _, id_with = pe.load_intent(document=with_value)
+        self.assertEqual(id_without, id_with)
+        self.assertEqual(pe.order_ref(id_without), pe.order_ref(id_with))
+
+    def test_5f3a5_invalid_created_at_still_fails_closed(self):
+        as_int = base_intent()
+        as_int["created_at"] = 123
+        self.expect_code(lambda: pe.validate_intent(as_int), "intent-invalid")
+        too_long = base_intent()
+        too_long["created_at"] = "x" * 33
+        self.expect_code(lambda: pe.validate_intent(too_long), "intent-invalid")
+        # Wrong type variants
+        as_list = base_intent()
+        as_list["created_at"] = []
+        self.expect_code(lambda: pe.validate_intent(as_list), "intent-invalid")
+
     def test_float_monetary_input_rejected(self):
         self.expect_code(lambda: pe.parse_limit_price(99.5), "intent-invalid")
 
@@ -835,6 +886,51 @@ class CliTests(unittest.TestCase):
         # The rejection (if any) is about the confirmation mismatch, not
         # about the path words.
         self.assertNotIn("unsupported option", err)
+
+    def test_5f3a5_cli_created_at_null_missing_arm_subprocess(self):
+        # 5F-3a5 regression 3: real temp intent file with created_at=null,
+        # correct execution id, NO --arm-paper -> arm-missing (never
+        # intent-schema-mismatch/intent-invalid); the executor's
+        # revalidation of the CLI-loaded intent must succeed.
+        import subprocess
+        raw = base_intent()
+        raw["created_at"] = None
+        self.intent_path.write_text(json.dumps(raw), encoding="utf-8")
+        _, expected_id = pe.load_intent(document=raw)
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-m", "ibkr.paper_execution", "submit",
+             "--intent-file", str(self.intent_path),
+             "--mapping-file", str(self.mapping_path),
+             "--confirm-execution-id", expected_id],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPOSITORY_ROOT),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("arm-missing", completed.stderr)
+        self.assertNotIn("intent-schema-mismatch", completed.stderr)
+        self.assertNotIn("intent-invalid", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_5f3a5_cli_created_at_null_wrong_confirmation(self):
+        # 5F-3a5 regression 4: created_at=null + wrong confirmation ->
+        # arm-confirmation-mismatch before executor/broker I/O.
+        import subprocess
+        raw = base_intent()
+        raw["created_at"] = None
+        self.intent_path.write_text(json.dumps(raw), encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-m", "ibkr.paper_execution", "submit",
+             "--intent-file", str(self.intent_path),
+             "--mapping-file", str(self.mapping_path),
+             "--confirm-execution-id", "0" * 64],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPOSITORY_ROOT),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("arm-confirmation-mismatch", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
 
     def test_5f3a4_cli_acceptance_no_arm_subprocess_reaches_arm_missing(self):
         # Brief's DIRECT CLI ACCEPTANCE: run the CLI as a real subprocess
