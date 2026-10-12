@@ -631,7 +631,20 @@ class TwsTransport(ReadonlyTransport):
         with self._request_lock:
             request_id = wrapper.next_id()
             wrapper.begin_executions(request_id)
-            client.reqExecutions(request_id, _ExecutionFilter())
+            # Official IBAPI ExecutionFilter (deferred import, matching the
+            # accepted 5F-1 deferred-official-import architecture). Phil's
+            # former hand-written partial clone supplied clientId="" and
+            # lacked lastNDays/specificDates, so the installed official
+            # EClient.reqExecutions() crashed reading them
+            # (TypeError: 'str' object cannot be interpreted as an integer).
+            # The official defaults ARE the desired "no additional
+            # filtering" semantics; no field is overwritten and no extra
+            # filtering (lastNDays/specificDates/account/symbol/side) is
+            # introduced.
+            from ibapi.execution import ExecutionFilter  # type: ignore
+
+            execution_filter = ExecutionFilter()
+            client.reqExecutions(request_id, execution_filter)
             operation = wrapper.executions_operation(request_id)
             self._complete_or_fail(
                 operation.event, lambda: operation.end_observed, "executions"
@@ -696,16 +709,3 @@ class TwsTransport(ReadonlyTransport):
             rows = wrapper.contract_matches_snapshot(request_id)
             wrapper.finish_contract_details(request_id)
             return rows
-
-
-class _ExecutionFilter:  # pragma: no cover - trivial data holder
-    """Bounded execution filter (all recent executions, no side effects)."""
-
-    def __init__(self) -> None:
-        self.clientId = ""
-        self.acctCode = ""
-        self.time = ""
-        self.symbol = ""
-        self.secType = ""
-        self.exchange = ""
-        self.side = ""

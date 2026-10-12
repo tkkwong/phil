@@ -1065,6 +1065,7 @@ def _python_transport(config=None, **script):
             "ibapi.client": fake_client_module,
             "ibapi.wrapper": fake_wrapper_module,
             "ibapi.contract": types.ModuleType("ibapi.contract"),
+            "ibapi.execution": types.ModuleType("ibapi.execution"),
         }):
             transport.connect(config)
     finally:
@@ -1345,6 +1346,8 @@ class PythonLifecycleTests(AdapterTestBase):
                 "ibapi.client": fake_client_module,
                 "ibapi.wrapper": fake_wrapper_module,
                 "ibapi.contract": types.ModuleType("ibapi.contract"),
+            "ibapi.execution": types.ModuleType("ibapi.execution"),
+                "ibapi.execution": types.ModuleType("ibapi.execution"),
             }):
                 document = adapter.status()
             self.assertTrue(document["connected"])
@@ -1587,11 +1590,14 @@ class CompletionIsolationTests(AdapterTestBase):
     # -- helpers --------------------------------------------------------------
 
     def _fake_ibapi(self):
-        """Arm a fake ibapi contract module for the REST OF THE TEST.
+        """Arm fake ibapi contract + execution modules for the REST OF
+        THE TEST.
 
         The connect-time patch context has expired by test time and the
-        transport imports ``ibapi.contract`` inside contract_details();
-        a with-block around only the thread start is not sufficient.
+        transport imports ``ibapi.contract`` inside contract_details()
+        and (5F-3a6) the official ``ibapi.execution.ExecutionFilter``
+        inside executions(); a with-block around only the thread start
+        is not sufficient.
         """
         fake_contract = types.ModuleType("ibapi.contract")
 
@@ -1599,13 +1605,32 @@ class CompletionIsolationTests(AdapterTestBase):
             symbol = secType = currency = exchange = ""
 
         fake_contract.Contract = _Contract
-        # Arm BOTH the parent package and the submodule: ``from ibapi
+        # Official-shaped ExecutionFilter (mirrors ibapi 10.x defaults;
+        # the transport must not overwrite any of them).
+        fake_execution = types.ModuleType("ibapi.execution")
+
+        class _PythonShapedExecutionFilter:
+            def __init__(self):
+                self.clientId = 0
+                self.acctCode = ""
+                self.time = ""
+                self.symbol = ""
+                self.secType = ""
+                self.exchange = ""
+                self.side = ""
+                self.lastNDays = 2147483647  # official UNSET_INTEGER sentinel
+                self.specificDates = None
+
+        fake_execution.ExecutionFilter = _PythonShapedExecutionFilter
+        # Arm BOTH the parent package and the submodules: ``from ibapi
         # import contract`` imports the parent first.
         fake_ibapi = types.ModuleType("ibapi")
         fake_ibapi.contract = fake_contract
+        fake_ibapi.execution = fake_execution
         patcher = patch.dict(sys.modules, {
             "ibapi": fake_ibapi,
             "ibapi.contract": fake_contract,
+            "ibapi.execution": fake_execution,
         })
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1746,6 +1771,7 @@ class CompletionIsolationTests(AdapterTestBase):
         self._hold_open("reqExecutions")
         captured: list[tuple] = []
         self._gated_client_method("reqExecutions", captured)
+        self._fake_ibapi()  # 5F-3a6: official ExecutionFilter import seam
         box: dict[str, object] = {}
         worker = self._start_worker(box, self.transport.executions)
         self.assertTrue(self._await_capture(captured))
@@ -1796,6 +1822,7 @@ class CompletionIsolationTests(AdapterTestBase):
         self._hold_open("reqExecutions")
         captured: list[tuple] = []
         self._gated_client_method("reqExecutions", captured)
+        self._fake_ibapi()  # 5F-3a6: official ExecutionFilter import seam
         box: dict[str, object] = {}
         worker = self._start_worker(box, self.transport.executions)
         self.assertTrue(self._await_capture(captured))
@@ -1860,6 +1887,7 @@ class CompletionIsolationTests(AdapterTestBase):
 
     def test_executions_empty_requires_matching_exec_details_end(self):
         self._hold_open("reqExecutions")
+        self._fake_ibapi()  # 5F-3a6: official ExecutionFilter import seam
         box: dict[str, object] = {}
         worker = self._start_worker(box, self.transport.executions)
         worker.join(3.0)
@@ -1994,6 +2022,172 @@ class CompletionIsolationTests(AdapterTestBase):
         self.assertLess(served[0], served[1])
 
 
+class OfficialExecutionFilterTests(CompletionIsolationTests):
+    """5F-3a6: executions() uses the OFFICIAL (deferred)
+    ibapi.execution.ExecutionFilter, not Phil's former private partial
+    clone; official defaults are preserved untouched; request-id scoping,
+    normalized rows, and read-only purity are unchanged.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.transport, self.client = _python_transport(
+            base_config(read_only_timeout_seconds=0.60)
+        )
+        self.wrapper = self.transport._wrapper
+        self.assertTrue(self.client.run_entered.wait(2))
+        self.assertTrue(self.wrapper.ready.wait(2))
+        self.assertTrue(self.wrapper.managed_accounts_ready.wait(2))
+        self.addCleanup(self.transport.disconnect)
+
+    def _filter_capture(self):
+        captured: list[tuple] = []
+        self._gated_client_method("reqExecutions", captured)
+        return captured
+
+    def test_1_official_execution_filter_constructed_and_passed(self):
+        self._fake_ibapi()
+        official_cls = sys.modules["ibapi.execution"].ExecutionFilter
+        captured = self._filter_capture()
+        self.client.script["reqExecutions"] = (
+            lambda wrapper, req_id: wrapper.execDetailsEnd(req_id)
+        )
+        rows = self.transport.executions()
+        self.assertEqual(rows, [])
+        # _gated_client_method captures (req_id, execution_filter).
+        self.assertEqual(len(captured), 1)
+        execution_filter = captured[0][1]
+        self.assertIsInstance(execution_filter, official_cls)
+        # Integer-compatible clientId (the old clone supplied "").
+        self.assertIsInstance(execution_filter.clientId, int)
+        for name in ("acctCode", "time", "symbol", "secType", "exchange", "side", "lastNDays", "specificDates"):
+            self.assertTrue(hasattr(execution_filter, name), name)
+
+    def test_2_official_defaults_untouched(self):
+        # Phil must not overwrite any official default: the filter handed
+        # to reqExecutions must equal a freshly constructed official
+        # filter (compared to the official object's defaults, never
+        # hard-coded sentinel values).
+        self._fake_ibapi()
+        official_cls = sys.modules["ibapi.execution"].ExecutionFilter
+        reference = official_cls().__dict__
+        captured = self._filter_capture()
+        self.client.script["reqExecutions"] = (
+            lambda wrapper, req_id: wrapper.execDetailsEnd(req_id)
+        )
+        self.transport.executions()
+        # The filter handed to reqExecutions preserves EVERY official
+        # default exactly (compared to the official object's defaults).
+        self.assertEqual(captured[0][1].__dict__, reference)
+
+    def test_3_deferred_import_no_module_time_ibapi(self):
+        # Importing ibkr.transport_tws alone must not require ibapi (the
+        # accepted 5F-1 deferred-official-import architecture); the
+        # ExecutionFilter import is deferred inside executions().
+        import ast as _ast
+        import subprocess
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "import ibkr.transport_tws\n"
+            "assert 'ibapi' not in sys.modules, 'ibapi imported at module import'\n"
+            "print('deferred-ok')\n"
+        ) % (str(REPOSITORY_ROOT),)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=60,
+            env={**dict(__import__("os").environ), "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("deferred-ok", result.stdout)
+        # And no TOP-LEVEL ibapi import statement exists in source
+        # (function-body deferred imports are the accepted architecture).
+        import ibkr.transport_tws as transport_tws_module
+        source = pathlib.Path(transport_tws_module.__file__).read_text(encoding="utf-8")
+        tree = _ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    self.assertFalse(alias.name == "ibapi" or alias.name.startswith("ibapi."), alias.name)
+            elif isinstance(node, _ast.ImportFrom):
+                module = getattr(node, "module", "") or ""
+                self.assertFalse(module.startswith("ibapi"), module)
+
+    def test_4_request_id_scoping_exact_id_passed(self):
+        # reqExecutions receives exactly the wrapper-generated request id
+        # captured at the client boundary.
+        self._fake_ibapi()
+        captured = self._filter_capture()
+        self.client.script["reqExecutions"] = (
+            lambda wrapper, req_id: wrapper.execDetailsEnd(req_id)
+        )
+        self.transport.executions()
+        request_id = captured[0][0]
+        self.assertIsInstance(request_id, int)
+        self.assertGreater(request_id, 0)
+        # The second captured arg is the official filter instance.
+        self.assertIsInstance(captured[0][1], sys.modules["ibapi.execution"].ExecutionFilter)
+
+    def test_5_zero_rows_complete_normally(self):
+        self._fake_ibapi()
+
+        def _end_only(wrapper, req_id):
+            wrapper.execDetailsEnd(req_id)
+
+        self.client.script["reqExecutions"] = _end_only
+        rows = self.transport.executions()
+        self.assertEqual(rows, [])
+
+    def test_6_one_execution_normalizes_correctly(self):
+        self._fake_ibapi()
+
+        def _one_row(wrapper, req_id):
+            # Official signature: execDetails(reqId, contract, execution)
+            # with camelCase ibapi attributes (mirrors the real wrapper
+            # projection in transport_tws.execDetails).
+            contract = types.SimpleNamespace(
+                conId=9599491, symbol="F", secType="STK"
+            )
+            execution = types.SimpleNamespace(
+                execId="E1", orderId=44, orderRef="phil5f3-x",
+                exchange="SMART", side="BOT", shares=1.0,
+                price=20.0, time="20261012 12:00:00",
+            )
+            wrapper.execDetails(req_id, contract, execution)
+            wrapper.execDetailsEnd(req_id)
+
+        self.client.script["reqExecutions"] = _one_row
+        rows = self.transport.executions()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        for name in ("exec_id", "order_id", "order_ref", "conid", "symbol", "sec_type", "exchange", "side", "quantity", "price", "time"):
+            self.assertIn(name, row, name)
+        self.assertEqual(row["exec_id"], "E1")
+        self.assertEqual(row["conid"], 9599491)
+        self.assertEqual(row["symbol"], "F")
+
+    def test_7_unrelated_exec_details_end_cannot_complete(self):
+        self._hold_open("reqExecutions")
+        self._fake_ibapi()
+        captured = self._filter_capture()
+        box: dict[str, object] = {}
+        worker = self._start_worker(box, self.transport.executions)
+        self.assertTrue(self._await_capture(captured))
+        self.wrapper.execDetailsEnd(captured[0][0] + 7)  # unrelated id
+        self._assert_still_waiting(
+            worker, "unrelated execDetailsEnd completed the request")
+        self.wrapper.execDetailsEnd(captured[0][0])  # exact id
+        worker.join(2)
+        self.assertNotIn("error", box)
+
+    def test_8_read_only_surface_unchanged(self):
+        from ibkr.adapter import ReadonlyIbkrAdapter
+        from ibkr.transport import ReadonlyTransport
+        from ibkr.transport_tws import TwsTransport
+        for surface in (ReadonlyIbkrAdapter, ReadonlyTransport, TwsTransport):
+            for forbidden in ("placeOrder", "cancelOrder", "reqGlobalCancel", "exerciseOptions", "place_paper_order"):
+                self.assertFalse(hasattr(surface, forbidden), (surface, forbidden))
+
+
 class StatusSequenceIntegrationTests(AdapterTestBase):
     """5F-1c integration: the full status sequence with injected noise."""
 
@@ -2065,6 +2259,8 @@ class StatusSequenceIntegrationTests(AdapterTestBase):
                 "ibapi.client": fake_client_module,
                 "ibapi.wrapper": fake_wrapper_module,
                 "ibapi.contract": types.ModuleType("ibapi.contract"),
+            "ibapi.execution": types.ModuleType("ibapi.execution"),
+                "ibapi.execution": types.ModuleType("ibapi.execution"),
             }):
                 document = adapter.status()
             self.assertTrue(document["connected"])
@@ -2267,6 +2463,8 @@ class PaperExecutionWrapperTests(AdapterTestBase):
                 "ibapi.client": fake_client_module,
                 "ibapi.wrapper": fake_wrapper_module,
                 "ibapi.contract": types.ModuleType("ibapi.contract"),
+            "ibapi.execution": types.ModuleType("ibapi.execution"),
+                "ibapi.execution": types.ModuleType("ibapi.execution"),
             }):
                 paper.connect(config)
             # The write session is connected but holding a WRONG account.
@@ -2303,8 +2501,10 @@ class PaperExecutionWrapperTests(AdapterTestBase):
             )
 
 
+
 if __name__ == "__main__":
     unittest.main()
+
 
 if __name__ == "__main__":
     unittest.main()
