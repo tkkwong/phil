@@ -1204,6 +1204,45 @@ class StaticArchitectureTests(unittest.TestCase):
 
         self.assertTrue(hasattr(TwsPaperExecutionTransport, "place_paper_order"))
 
+    def test_paper_wrapper_binds_official_ewrapper_surface(self):
+        # 5F-3a8: real TWS PAPER handshake failed with
+        # AttributeError: '_PaperExecutionWrapper' object has no
+        # attribute 'connectAck' because the PAPER override of
+        # _build_wrapper bypassed the deferred official-EWrapper mixin
+        # binding proven in TwsTransport. The PAPER wrapper must expose
+        # the official EWrapper callback surface (connectAck at
+        # minimum) AND retain the PAPER-specific order-observation
+        # surface. The official ibapi module is faked via sys.modules;
+        # no real ibapi import and no TWS connection occurs.
+        import types
+        from unittest.mock import patch
+        from ibkr.paper_transport import (
+            TwsPaperExecutionTransport,
+            _PaperExecutionWrapper,
+        )
+
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_wrapper_module = types.ModuleType("ibapi.wrapper")
+
+        class _FakeEWrapper:
+            def connectAck(self):
+                pass
+
+        fake_wrapper_module.EWrapper = _FakeEWrapper
+        fake_ibapi.wrapper = fake_wrapper_module
+
+        transport = TwsPaperExecutionTransport(BASE_CONFIG)
+        with patch.dict(sys.modules, {"ibapi": fake_ibapi, "ibapi.wrapper": fake_wrapper_module}):
+            wrapper = transport._build_wrapper(10.0)
+        # 1. The official EWrapper surface is bound (as a real base
+        # class, exactly like _ModuleBoundWrapper in TwsTransport).
+        self.assertIsInstance(wrapper, _FakeEWrapper)
+        self.assertTrue(callable(getattr(wrapper, "connectAck", None)))
+        # 2. The PAPER-specific order-observation surface remains.
+        self.assertIsInstance(wrapper, _PaperExecutionWrapper)
+        self.assertTrue(callable(getattr(wrapper, "begin_order_watch", None)))
+        self.assertTrue(callable(getattr(wrapper, "order_outcome", None)))
+
     def _ast_attribute_files(self, attr_name):
         import ast
 

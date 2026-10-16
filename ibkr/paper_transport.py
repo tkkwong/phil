@@ -204,7 +204,22 @@ class TwsPaperExecutionTransport(TwsTransport):
     """
 
     def _build_wrapper(self, timeout: float) -> _CollectingWrapper:
-        return _PaperExecutionWrapper(timeout)
+        # 5F-3a8: bind the OFFICIAL ibapi EWrapper mixin exactly like the
+        # proven base TwsTransport._build_wrapper (deferred import; no
+        # import-time ibapi dependency). Without this mixin the official
+        # IBAPI handshake fails early — e.g.
+        # AttributeError: '_PaperExecutionWrapper' object has no
+        # attribute 'connectAck' inside official EClient.connect. The
+        # PAPER-specific order-evidence surface is preserved unchanged.
+        from ibapi import wrapper as ibapi_wrapper  # type: ignore
+
+        class _ModuleBoundPaperExecutionWrapper(
+            _PaperExecutionWrapper,
+            ibapi_wrapper.EWrapper,
+        ):
+            pass
+
+        return _ModuleBoundPaperExecutionWrapper(timeout)
 
     # -- the single permitted mutation primitive ----------------------------
 
