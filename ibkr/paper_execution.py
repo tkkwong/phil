@@ -698,6 +698,7 @@ class IbkrPaperExecutor:
                             "order_id": None,
                             "perm_id": None,
                             "status": "Rejected",
+                            "broker_code": exc.broker_code,
                         },
                     )
                     raise ExecutionError("paper-order-rejected", "paper order was rejected by the broker") from None
@@ -712,7 +713,13 @@ class IbkrPaperExecutor:
                     attempt_record=receipt_seed,
                     event_type="submission-uncertain",
                     reason_code=exc.code,
-                    broker={"client_id": self._config()["client_id"], "order_id": None, "perm_id": None, "status": None},
+                    broker={
+                        "client_id": self._config()["client_id"],
+                        "order_id": None,
+                        "perm_id": None,
+                        "status": None,
+                        "broker_code": exc.broker_code,
+                    },
                 )
                 raise ExecutionError(exc.code, "paper submission outcome is uncertain") from None
             except Exception:
@@ -732,12 +739,30 @@ class IbkrPaperExecutor:
                 "perm_id": None,
                 "status": outcome.get("broker_status"),
             }
+            if outcome.get("code") == "paper-order-rejected":
+                # 5F-3a11: a transport-returned known rejection is a
+                # TERMINAL rejection, not uncertainty. Record exactly one
+                # submission-rejected receipt with the bounded numeric
+                # broker code and raise the rejection identity.
+                self._record_outcome(
+                    attempt_record=receipt_seed,
+                    event_type="submission-rejected",
+                    reason_code="paper-order-rejected",
+                    broker={
+                        "client_id": self._config()["client_id"],
+                        "order_id": order_id,
+                        "perm_id": None,
+                        "status": "Rejected",
+                        "broker_code": outcome.get("broker_code"),
+                    },
+                )
+                raise ExecutionError("paper-order-rejected", "paper order was rejected by the broker") from None
             if status in ("acknowledged", "done"):
                 self._record_outcome(
                     attempt_record=receipt_seed,
                     event_type="acknowledged",
                     reason_code=None,
-                    broker=broker_evidence,
+                    broker={**broker_evidence, "broker_code": None},
                 )
                 result_status = "acknowledged"
             else:
@@ -750,6 +775,9 @@ class IbkrPaperExecutor:
                         "order_id": order_id,
                         "perm_id": None,
                         "status": None,
+                        # 5F-3a11: the already-bounded numeric diagnostic
+                        # survives into durable evidence; None stays None.
+                        "broker_code": outcome.get("broker_code"),
                     },
                 )
                 raise ExecutionError(

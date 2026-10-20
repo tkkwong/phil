@@ -225,8 +225,25 @@ def build_receipt(
         "action", "quantity", "order_type", "limit_price", "tif", "outside_rth"
     }:
         raise ExecutionStateError("intent-invalid", "execution receipt order field set is closed")
-    if not isinstance(broker, dict) or set(broker) != {"client_id", "order_id", "perm_id", "status"}:
+    # 5F-3a11: the broker evidence object accepts an optional bounded
+    # numeric ``broker_code`` (int or None). Historical receipts without
+    # the field remain valid: a missing key is read as None. Only an
+    # integer or null is permitted — never broker text, never
+    # errorString/advancedOrderRejectJson, never an account expansion,
+    # never an arbitrary diagnostic dictionary.
+    if not isinstance(broker, dict) or not {
+        "client_id", "order_id", "perm_id", "status"
+    } <= set(broker) <= {
+        "client_id", "order_id", "perm_id", "status", "broker_code"
+    }:
         raise ExecutionStateError("intent-invalid", "execution receipt broker field set is closed")
+    if "broker_code" in broker and not (
+        broker["broker_code"] is None
+        or (isinstance(broker["broker_code"], int) and not isinstance(broker["broker_code"], bool))
+    ):
+        raise ExecutionStateError("intent-invalid", "execution receipt broker_code must be an integer or null")
+    if "broker_code" not in broker:
+        broker = {**broker, "broker_code": None}
     resolved_event_id = event_id or _sha256(canonical_json(
         {
             "event_type": event_type,

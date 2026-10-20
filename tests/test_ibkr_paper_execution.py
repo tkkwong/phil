@@ -1349,6 +1349,145 @@ class StaticArchitectureTests(unittest.TestCase):
             self.assertEqual(self._ast_attribute_files(attr), [], attr)
 
 
+class BrokerDiagnosticsRetentionTests(unittest.TestCase):
+    """5F-3a11: preserve the already-bounded numeric broker diagnostic
+    from the transport outcome through the executor into the durable
+    terminal receipt, and correctly classify a RETURNED known rejection
+    (outcome code ``paper-order-rejected``) as ``submission-rejected``
+    instead of ``submission-uncertain``. No broker text is ever
+    retained; no retry occurs; one-shot semantics unchanged.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, transport):
+        return make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def _returned_outcome_transport(self, outcome, order_id):
+        class _ReturnedOutcomeTransport(_FakePaperTransport):
+            def place_paper_order(self, **kwargs):
+                self.calls.append("place_paper_order")
+                expected = kwargs.get("expected_account_id")
+                self.calls.append("managed_accounts")
+                if not expected or self.managed_account_list != [expected]:
+                    raise pe.PaperSubmissionError("paper-account-mismatch")
+                self.place_calls.append(kwargs)
+                return {
+                    "order_id": order_id,
+                    "order_ref": kwargs["order_ref"],
+                    "outcome": outcome,
+                }
+        return _ReturnedOutcomeTransport()
+
+    def test_a_returned_uncertain_outcome_preserves_broker_code(self):
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-submission-uncertain",
+            "broker_code": 2103,
+            "order_ref": "phil5f3-returned-uncertain-regression",
+        }
+        transport = self._returned_outcome_transport(outcome, order_id=101)
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-uncertain")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        terminal = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(terminal), 1)
+        broker = terminal[0]["broker"]
+        self.assertEqual(broker["order_id"], 101)
+        self.assertEqual(broker["broker_code"], 2103)
+        self.assertIsNone(broker["status"])
+        # No broker error text anywhere in the durable evidence.
+        self.assertNotIn("errorString", json.dumps(records))
+        self.assertNotIn("advancedOrderRejectJson", json.dumps(records))
+        # One-shot: a second submit must fail closed with zero broker I/O.
+        transport2 = _FakePaperTransport()
+        executor2 = self.executor(transport2)
+        with self.assertRaises(pe.ExecutionError) as caught2:
+            executor2.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught2.exception.code, "execution-uncertain")
+        self.assertEqual(transport2.calls, [])
+
+    def test_b_exception_bounded_broker_code_is_retained(self):
+        class _RaisingUncertainTransport(_FakePaperTransport):
+            def place_paper_order(self, **kwargs):
+                self.calls.append("place_paper_order")
+                expected = kwargs.get("expected_account_id")
+                self.calls.append("managed_accounts")
+                if not expected or self.managed_account_list != [expected]:
+                    raise pe.PaperSubmissionError("paper-account-mismatch")
+                self.place_calls.append(kwargs)
+                raise pe.PaperSubmissionError("paper-submission-timeout", broker_code=2103)
+        transport = _RaisingUncertainTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        terminal = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(terminal), 1)
+        broker = terminal[0]["broker"]
+        # No order id is invented when none is known.
+        self.assertIsNone(broker["order_id"])
+        self.assertEqual(broker["broker_code"], 2103)
+        self.assertIsNone(broker["status"])
+
+    def test_c_returned_known_rejection_is_recorded_as_rejected(self):
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-order-rejected",
+            "broker_code": 110,
+        }
+        transport = self._returned_outcome_transport(outcome, order_id=102)
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        rejected = [r for r in records if r["event_type"] == "submission-rejected"]
+        uncertain = [r for r in records if r["event_type"] == "submission-uncertain"]
+        # Exactly one terminal submission-rejected receipt and NO
+        # submission-uncertain terminal receipt for this outcome.
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(uncertain, [])
+        broker = rejected[0]["broker"]
+        self.assertEqual(broker["order_id"], 102)
+        self.assertEqual(broker["status"], "Rejected")
+        self.assertEqual(broker["broker_code"], 110)
+        self.assertEqual(rejected[0]["reason_code"], "paper-order-rejected")
+        # No retry: the transport saw exactly one placement.
+        self.assertEqual(transport.calls.count("place_paper_order"), 1)
+
+    def test_d_no_broker_code_remains_valid_and_fails_closed(self):
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-submission-timeout",
+        }
+        transport = self._returned_outcome_transport(outcome, order_id=103)
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        terminal = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(terminal), 1)
+        broker = terminal[0]["broker"]
+        self.assertEqual(broker["order_id"], 103)
+        self.assertIsNone(broker["broker_code"])
+
+
 class OrderOutcomeStateMachineTests(unittest.TestCase):
     """5F-3a10: PAPER order-outcome callbacks must wait for classifiable
     broker evidence. Real Windows/TWS PAPER acceptance showed

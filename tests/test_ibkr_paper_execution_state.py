@@ -82,6 +82,41 @@ class ReceiptBuildTests(unittest.TestCase):
         with self.assertRaises(state.ExecutionStateError):
             state.build_receipt(**base_receipt(reason_code="nonsense-code"))
 
+    def test_broker_code_optional_integer_or_none_is_valid(self):
+        # 5F-3a11: the broker evidence object may carry an optional
+        # bounded numeric broker_code (int or None).
+        record = state.build_receipt(
+            **base_receipt(
+                event_type="submission-uncertain",
+                reason_code="paper-submission-uncertain",
+                broker={"client_id": 19, "order_id": 11, "perm_id": None, "status": None, "broker_code": 2103},
+            )
+        )
+        self.assertEqual(record["broker"]["broker_code"], 2103)
+        record_none = state.build_receipt(
+            **base_receipt(broker={"client_id": 19, "order_id": 11, "perm_id": None, "status": None, "broker_code": None})
+        )
+        self.assertIsNone(record_none["broker"]["broker_code"])
+
+    def test_broker_code_must_be_integer_or_null(self):
+        for bad in ("2103", 21.03, True, {"code": 2103}, [2103]):
+            with self.assertRaises(state.ExecutionStateError):
+                state.build_receipt(
+                    **base_receipt(
+                        broker={"client_id": 19, "order_id": 11, "perm_id": None, "status": None, "broker_code": bad}
+                    )
+                )
+
+    def test_receipt_without_broker_code_field_still_valid(self):
+        # Historical receipts lacking the field remain valid: the key is
+        # normalized to None at build time and read-side integrity is
+        # purely hash-based.
+        record = state.build_receipt(
+            **base_receipt(broker={"client_id": 19, "order_id": 11, "perm_id": None, "status": None})
+        )
+        self.assertIsNone(record["broker"]["broker_code"])
+        self.assertTrue(state.verify_record_sha256(record))
+
     def test_closed_field_sets(self):
         with self.assertRaises(state.ExecutionStateError):
             state.build_receipt(**base_receipt(target={"conid": 1}))
