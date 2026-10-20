@@ -1349,6 +1349,221 @@ class StaticArchitectureTests(unittest.TestCase):
             self.assertEqual(self._ast_attribute_files(attr), [], attr)
 
 
+class OrderOutcomeStateMachineTests(unittest.TestCase):
+    """5F-3a10: PAPER order-outcome callbacks must wait for classifiable
+    broker evidence. Real Windows/TWS PAPER acceptance showed
+    paper-submission-uncertain for an order TWS displayed a precaution
+    dialog for: a non-rejection order-scoped error() callback was treated
+    as terminal, and openOrder without classifiable status signalled the
+    completion event. The wrapper must signal completion ONLY on known
+    rejection or classifiable non-empty broker status; non-rejection
+    order-scoped errors record their bounded numeric code but must not
+    terminate the wait by themselves; broker evidence that is observed
+    but not classifiable must yield paper-submission-uncertain with the
+    optional numeric code retained (timeout with NO evidence remains
+    paper-submission-timeout). No retry under any circumstance.
+    """
+
+    def _wrapper(self):
+        import types
+        from unittest.mock import patch
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_wrapper_module = types.ModuleType("ibapi.wrapper")
+
+        class _FakeEWrapper:
+            def connectAck(self):
+                pass
+
+        fake_wrapper_module.EWrapper = _FakeEWrapper
+        fake_ibapi.wrapper = fake_wrapper_module
+
+        transport = TwsPaperExecutionTransport(BASE_CONFIG)
+        with patch.dict(sys.modules, {"ibapi": fake_ibapi, "ibapi.wrapper": fake_wrapper_module}):
+            return transport._build_wrapper(10.0)
+
+    def test_a_nonrejection_order_error_does_not_prematurely_complete(self):
+        wrapper = self._wrapper()
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        watched_id = 301
+        other_id = 302
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+        # A numeric order-scoped code deliberately outside the rejection
+        # set (e.g. 2100-series-style informational code, chosen so it is
+        # neither in _ORDER_REJECTION_CODES nor a fatal session code).
+        non_rejection_code = 2103
+        self.assertNotIn(non_rejection_code, _ORDER_REJECTION_CODES)
+        wrapper.error(watched_id, 0, non_rejection_code, "")
+        # Numeric code retained; status still unset; event NOT signalled.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["broker_code"], non_rejection_code)
+        self.assertIsNone(row["status"])
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        # The unwatched/other order id is untouched by this error.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertIsNone(other_row["broker_code"])
+        self.assertFalse(wrapper.order_events[other_id]["event"].is_set())
+        # Now deliver classifiable broker evidence: orderStatus Submitted.
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper.orderStatus(watched_id, "Submitted", 0.0, 1.0, 0.0, 0, 0, 0.0, 0, "")
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["status"], "acknowledged")
+        self.assertEqual(outcome["broker_status"], "Submitted")
+
+    def test_b_known_rejection_remains_immediate(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        watched_id = 303
+        other_id = 304
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+        rejection_code = sorted(_ORDER_REJECTION_CODES)[0]
+        wrapper.error(watched_id, 0, rejection_code, "")
+        # Event is signalled immediately by the known rejection.
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["code"], "paper-order-rejected")
+        self.assertEqual(outcome["broker_code"], rejection_code)
+        # Another watched order ID is unaffected.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertFalse(wrapper.order_events[other_id]["event"].is_set())
+
+    def test_c_nonclassifiable_broker_evidence_times_out_as_uncertain(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        watched_id = 305
+        wrapper.begin_order_watch(watched_id)
+        non_rejection_code = 2103
+        self.assertNotIn(non_rejection_code, _ORDER_REJECTION_CODES)
+        wrapper.error(watched_id, 0, non_rejection_code, "")
+        # No openOrder/orderStatus arrives; the bounded wait expires.
+        # Patch the notional timeout small for the test only.
+        from unittest.mock import patch as mock_patch
+        import ibkr.paper_transport as pt
+        with mock_patch.object(pt, "ACKNOWLEDGEMENT_TIMEOUT_SECONDS", 0.05):
+            outcome = TwsPaperExecutionTransport._await_order_outcome(
+                wrapper, watched_id, wrapper.order_events[watched_id]
+            )
+        # Broker evidence observed but not classifiable: uncertain with
+        # the optional numeric code retained; no fabricated success.
+        self.assertEqual(outcome["status"], "uncertain")
+        self.assertEqual(outcome["code"], "paper-submission-uncertain")
+        self.assertEqual(outcome.get("broker_code"), non_rejection_code)
+        self.assertNotIn("broker_status", outcome)
+        # A watch with absolutely no broker evidence still reports the
+        # plain timeout distinction.
+        no_evidence_id = 306
+        wrapper.begin_order_watch(no_evidence_id)
+        with mock_patch.object(pt, "ACKNOWLEDGEMENT_TIMEOUT_SECONDS", 0.05):
+            timeout_outcome = TwsPaperExecutionTransport._await_order_outcome(
+                wrapper, no_evidence_id, wrapper.order_events[no_evidence_id]
+            )
+        self.assertEqual(timeout_outcome["code"], "paper-submission-timeout")
+        self.assertIsNone(timeout_outcome.get("broker_code"))
+        # No retry occurred: the event registration remains untouched and
+        # no callback re-arming happened (single bounded wait per watch).
+
+    def test_d_blank_status_openorder_does_not_prematurely_finish(self):
+        wrapper = self._wrapper()
+        watched_id = 307
+        wrapper.begin_order_watch(watched_id)
+
+        class _FakeOrder:
+            orderRef = "phil5f3-blank-status-regression"
+
+        class _FakeOrderState:
+            status = None  # blank/None status: partial evidence only
+
+        wrapper.openOrder(watched_id, object(), _FakeOrder(), _FakeOrderState())
+        # orderRef retained, event NOT signalled, no premature completion.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["order_ref"], "phil5f3-blank-status-regression")
+        self.assertIsNone(row["status"])
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        # Then deliver classifiable status: acknowledged with both.
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper.orderStatus(watched_id, "Submitted", 0.0, 1.0, 0.0, 0, 0, 0.0, 0, "")
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["status"], "acknowledged")
+        self.assertEqual(outcome["broker_status"], "Submitted")
+        self.assertEqual(outcome["order_ref"], "phil5f3-blank-status-regression")
+
+    def test_e_orderref_only_evidence_times_out_as_uncertain(self):
+        # 5F-3a10 amendment: openOrder may deliver a valid deterministic
+        # orderRef while orderState.status is blank/None (Test D). That
+        # orderRef IS broker callback evidence: if no later classifiable
+        # orderStatus arrives and the bounded wait expires, the result
+        # must be paper-submission-uncertain (evidence observed but not
+        # classifiable), NOT paper-submission-timeout (no evidence).
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        watched_id = 309
+        wrapper.begin_order_watch(watched_id)
+
+        class _FakeOrder:
+            orderRef = "phil5f3-orderref-only-regression"
+
+        class _FakeOrderState:
+            status = None  # blank/None status
+
+        wrapper.openOrder(watched_id, object(), _FakeOrder(), _FakeOrderState())
+        # Partial evidence retained, completion NOT signalled.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["order_ref"], "phil5f3-orderref-only-regression")
+        self.assertIsNone(row["status"])
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        # Shorten the acknowledgement timeout for the test only.
+        from unittest.mock import patch as mock_patch
+        import ibkr.paper_transport as pt
+        with mock_patch.object(pt, "ACKNOWLEDGEMENT_TIMEOUT_SECONDS", 0.05):
+            outcome = TwsPaperExecutionTransport._await_order_outcome(
+                wrapper, watched_id, wrapper.order_events[watched_id]
+            )
+        # Broker callback evidence WAS observed (the openOrder orderRef):
+        # fail closed as uncertain, never a fabricated success, never a
+        # plain no-evidence timeout, and no retry occurs.
+        self.assertEqual(outcome["status"], "uncertain")
+        self.assertEqual(outcome["code"], "paper-submission-uncertain")
+        self.assertNotEqual(outcome["code"], "paper-submission-timeout")
+        self.assertNotIn("broker_status", outcome)
+        # The retained orderRef is bounded evidence and may be surfaced
+        # on the uncertain result consistently with the existing
+        # bounded-result contract.
+        self.assertEqual(outcome.get("order_ref"), "phil5f3-orderref-only-regression")
+
+    def test_race_nonterminal_error_then_order_status_is_not_lost(self):
+
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        # Fresh-eyes race requirement: a non-terminal error() followed
+        # shortly by orderStatus must not be lost because the error woke
+        # the waiter. The error must not signal the event at all.
+        wrapper = self._wrapper()
+        watched_id = 308
+        wrapper.begin_order_watch(watched_id)
+        wrapper.error(watched_id, 0, 2103, "")
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        wrapper.orderStatus(watched_id, "Submitted", 0.0, 1.0, 0.0, 0, 0, 0.0, 0, "")
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["status"], "acknowledged")
+        # Bounded numeric code from the non-terminal error is retained.
+        self.assertEqual(wrapper.order_outcome(watched_id)["broker_code"], 2103)
+
+
 class WriteSessionCleanupTests(unittest.TestCase):
     """5F-3a2: the write-capable TWS session is disconnected on EVERY
     outcome path, exactly once, and a disconnect failure never masks the

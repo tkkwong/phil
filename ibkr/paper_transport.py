@@ -145,7 +145,11 @@ class _PaperExecutionWrapper(_CollectingWrapper):
                 ref = getattr(order, "orderRef", None)
                 if ref and event_row["order_ref"] is None:
                     event_row["order_ref"] = ref
-            event_row["event"].set()
+            # 5F-3a10: an openOrder carrying only partial evidence (e.g.
+            # a blank/None status) must NOT terminate the bounded wait.
+            # Only a classifiable non-empty broker status completes it.
+            if event_row["status"]:
+                event_row["event"].set()
 
     def begin_order_watch(self, order_id: int) -> None:
         """Register the per-order completion event BEFORE placeOrder."""
@@ -193,7 +197,14 @@ class _PaperExecutionWrapper(_CollectingWrapper):
                     if errorCode in _ORDER_REJECTION_CODES:
                         row["status"] = "Rejected"
                     row["broker_code"] = errorCode
-                    row["event"].set()
+                    # 5F-3a10: IBKR uses error() for errors, warnings,
+                    # AND informational messages; a non-rejection
+                    # order-scoped code is NOT terminal by itself. Record
+                    # the bounded numeric code and wake the waiter ONLY
+                    # for a known rejection, so classifiable evidence
+                    # (openOrder/orderStatus) can still arrive.
+                    if errorCode in _ORDER_REJECTION_CODES:
+                        row["event"].set()
                     return
         # Inherited read-only classification. The broker text and time are
         # deliberately discarded here, so bounded empties are forwarded.
@@ -315,7 +326,22 @@ class TwsPaperExecutionTransport(TwsTransport):
         """Bounded wait for exact order evidence; no retry, no fabrication."""
         outcome: dict[str, Any] = {"status": "uncertain", "order_ref": None}
         if not event_row["event"].wait(ACKNOWLEDGEMENT_TIMEOUT_SECONDS):
+            # 5F-3a10: distinguish a bounded wait that expired with NO
+            # broker evidence at all from one that observed broker
+            # evidence that never became classifiable. Both fail closed;
+            # no success is fabricated and no retry is performed.
             outcome["code"] = "paper-submission-timeout"
+            # 5F-3a10 amendment: a retained orderRef from openOrder IS
+            # broker callback evidence even when the status stayed
+            # blank/None, so orderRef-only evidence is also uncertain.
+            if (
+                event_row.get("broker_code") is not None
+                or event_row.get("status")
+                or event_row.get("order_ref")
+            ):
+                outcome["code"] = "paper-submission-uncertain"
+                outcome["broker_code"] = event_row.get("broker_code")
+                outcome["order_ref"] = event_row.get("order_ref")
             return outcome
         status = event_row.get("status")
         if status == "Rejected":
