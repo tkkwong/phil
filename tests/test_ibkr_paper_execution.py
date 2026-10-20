@@ -1243,6 +1243,63 @@ class StaticArchitectureTests(unittest.TestCase):
         self.assertTrue(callable(getattr(wrapper, "begin_order_watch", None)))
         self.assertTrue(callable(getattr(wrapper, "order_outcome", None)))
 
+    def test_paper_openorder_callback_updates_exact_watched_row(self):
+        # 5F-3a9: the real TWS PAPER smoke showed paper-submission-timeout
+        # even though TWS displayed the precaution dialog. Root cause: the
+        # PAPER openOrder override referenced the UNDEFINED local name
+        # `orderId` (the official callback argument is `_orderId`), so the
+        # real IBAPI callback path raised NameError before the watched
+        # order event was populated/signalled. The callback must update
+        # the EXACT watched order row, signal its event, retain the
+        # broker status and order_ref, and leave other order ids
+        # untouched. The official ibapi module is faked via sys.modules;
+        # no real ibapi import and no TWS connection occurs.
+        import types
+        from unittest.mock import patch
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_wrapper_module = types.ModuleType("ibapi.wrapper")
+
+        class _FakeEWrapper:
+            def connectAck(self):
+                pass
+
+        fake_wrapper_module.EWrapper = _FakeEWrapper
+        fake_ibapi.wrapper = fake_wrapper_module
+
+        transport = TwsPaperExecutionTransport(BASE_CONFIG)
+        with patch.dict(sys.modules, {"ibapi": fake_ibapi, "ibapi.wrapper": fake_wrapper_module}):
+            wrapper = transport._build_wrapper(10.0)
+        watched_id = 101
+        other_id = 202
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+
+        class _FakeContract:
+            pass
+
+        class _FakeOrder:
+            orderRef = "phil5f3-openorder-regression"
+
+        class _FakeOrderState:
+            status = "Submitted"
+
+        # Must not raise (pre-fix this raised NameError: name 'orderId'
+        # is not defined inside the official IBAPI callback path).
+        wrapper.openOrder(watched_id, _FakeContract(), _FakeOrder(), _FakeOrderState())
+
+        # The exact watched row is updated and its event is signalled.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["status"], "Submitted")
+        self.assertEqual(row["order_ref"], "phil5f3-openorder-regression")
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        # Another order id is not accidentally affected.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertIsNone(other_row["order_ref"])
+        self.assertFalse(wrapper.order_events[other_id]["event"].is_set())
+
     def _ast_attribute_files(self, attr_name):
         import ast
 

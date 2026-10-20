@@ -99,7 +99,10 @@ class _PaperExecutionWrapper(_CollectingWrapper):
         self.ready.set()
 
     def openOrder(self, _orderId: int, contract: Any, order: Any, orderState: Any) -> None:  # noqa: N802
-        self._observe_order_row(orderId, order, orderState)
+        # 5F-3a9: the official IBAPI callback argument is `_orderId`; the
+        # observation call must route that exact broker order id so the
+        # watched order event is populated/signalled.
+        self._observe_order_row(_orderId, order, orderState)
         super().openOrder(_orderId, contract, order, orderState)
 
     def orderStatus(
@@ -134,11 +137,14 @@ class _PaperExecutionWrapper(_CollectingWrapper):
                 event_row["status"] = status
             else:
                 row_status = getattr(order_state, "status", None)
-                if row_status:
-                    event_row.setdefault("status", row_status)
+                # 5F-3a9: begin_order_watch pre-initializes these keys to
+                # None, so setdefault() never populated them (the key
+                # already exists). First-write-wins, explicitly:
+                if row_status and event_row["status"] is None:
+                    event_row["status"] = row_status
                 ref = getattr(order, "orderRef", None)
-                if ref:
-                    event_row.setdefault("order_ref", ref)
+                if ref and event_row["order_ref"] is None:
+                    event_row["order_ref"] = ref
             event_row["event"].set()
 
     def begin_order_watch(self, order_id: int) -> None:
