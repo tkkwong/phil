@@ -39,11 +39,11 @@ _POSITION_FIELDS = (
 )
 _ORDER_FIELDS = (
     "order_id", "conid", "symbol", "sec_type", "exchange", "currency",
-    "action", "total_quantity", "limit_price", "order_type", "status",
+    "action", "total_quantity", "limit_price", "order_type", "order_ref", "status",
 )
 _EXECUTION_FIELDS = (
     "exec_id", "order_id", "conid", "symbol", "sec_type", "exchange",
-    "side", "quantity", "price", "time",
+    "side", "quantity", "price", "time", "order_ref",
 )
 _CONTRACT_FIELDS = (
     "conid", "symbol", "local_symbol", "sec_type", "exchange", "primary_exchange",
