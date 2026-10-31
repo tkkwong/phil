@@ -52,6 +52,16 @@ _ORDER_REJECTION_CODES = frozenset(
     {
         101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,
         115, 116, 117, 118, 119, 120,
+        163,
+        # 5F-3a12: TWS API error 163 ("The price specified would violate
+        # the percentage constraint specified in the default order
+        # settings") is terminal for Phil: the executor never sets
+        # overridePercentageConstraints, never bypasses TWS precautionary
+        # settings, and never modifies or retries an order, so a
+        # watched-order 163 can only mean a terminal order rejection.
+        # Proven by real PAPER acceptance evidence (durable broker_code
+        # 163 with zero matching open orders and executions afterwards).
+        # Informational 210x messages are deliberately NOT added here.
     }
 )
 

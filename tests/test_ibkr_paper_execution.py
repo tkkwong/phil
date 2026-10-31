@@ -1682,7 +1682,79 @@ class OrderOutcomeStateMachineTests(unittest.TestCase):
         # bounded-result contract.
         self.assertEqual(outcome.get("order_ref"), "phil5f3-orderref-only-regression")
 
+    def test_precaution_163_is_terminal_rejection(self):
+        # 5F-3a12: IBKR TWS API error 163 ("The price specified would
+        # violate the percentage constraint specified in the default
+        # order settings") is a terminal order precaution rejection for
+        # Phil: overridePercentageConstraints is never set, precautions
+        # are never bypassed, and no order is ever modified or retried.
+        # A watched-order error 163 must become terminal Rejected and
+        # signal the wait immediately, exactly like the other members of
+        # _ORDER_REJECTION_CODES. The broker text is discarded; only the
+        # numeric code is retained.
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        watched_id = 310
+        other_id = 311
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+        wrapper.error(watched_id, 0, 163, "arbitrary broker text that must be discarded")
+        # The wait is released immediately (no acknowledgement timeout).
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        # Canonical post-5F-3a10 rejection structure.
+        self.assertEqual(outcome["status"], "uncertain")
+        self.assertEqual(outcome["code"], "paper-order-rejected")
+        self.assertEqual(outcome["broker_code"], 163)
+        # Another watched order ID is unaffected; no broker text stored.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertIsNone(other_row["broker_code"])
+        self.assertNotIn("arbitrary broker text", repr(outcome))
+
+    def test_precaution_163_through_executor_records_rejected(self):
+        # 5F-3a12 executor path: a transport-returned rejection outcome
+        # carrying broker_code 163 produces exactly one terminal
+        # submission-rejected receipt with the numeric code, the known
+        # broker order id, status Rejected, and NO submission-uncertain
+        # receipt. No retry occurs.
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        self.assertIn(163, _ORDER_REJECTION_CODES)
+        # This class has no executor fixture roots; create isolated ones.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.execution_root = pathlib.Path(tmp.name) / "exec"
+        self.lock_root = pathlib.Path(tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-order-rejected",
+            "broker_code": 163,
+            "order_ref": "phil5f3-precaution-163-regression",
+        }
+        transport = BrokerDiagnosticsRetentionTests._returned_outcome_transport(self, outcome, order_id=4)
+        executor = BrokerDiagnosticsRetentionTests.executor(self, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        rejected = [r for r in records if r["event_type"] == "submission-rejected"]
+        uncertain = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(uncertain, [])
+        broker = rejected[0]["broker"]
+        self.assertEqual(broker["order_id"], 4)
+        self.assertEqual(broker["status"], "Rejected")
+        self.assertEqual(broker["broker_code"], 163)
+        self.assertEqual(rejected[0]["reason_code"], "paper-order-rejected")
+        self.assertEqual(transport.calls.count("place_paper_order"), 1)
+        self.assertNotIn("arbitrary broker text", json.dumps(records))
+
     def test_race_nonterminal_error_then_order_status_is_not_lost(self):
+
 
         from ibkr.paper_transport import TwsPaperExecutionTransport
         # Fresh-eyes race requirement: a non-terminal error() followed
