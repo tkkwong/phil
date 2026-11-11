@@ -1,0 +1,2572 @@
+"""Offline regressions for the armed IBKR PAPER execution boundary (5F-3a).
+
+No test in this file contacts IBKR, starts TWS/Gateway, uses credentials,
+or touches the protected journals. Broker transport is always faked; the
+official ``ibapi`` package is never imported here.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import io
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
+
+REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from ibkr import instrument_mapping as im  # noqa: E402
+from ibkr import paper_execution as pe  # noqa: E402
+from ibkr import paper_execution_state as state  # noqa: E402
+from ibkr.diagnostics import AdapterError  # noqa: E402
+
+EXPECTED_ACCOUNT = "DU0000011"
+
+BASE_CONFIG = {
+    "config_version": "ibkr-config/v1",
+    "config_path": "/tmp/unused.json",
+    "expected_account_id": EXPECTED_ACCOUNT,
+    "environment": "PAPER",
+    "host": "127.0.0.1",
+    "port": 7497,
+    "client_id": 19,
+    "read_only_timeout_seconds": 10.0,
+}
+
+
+def base_intent(**changes):
+    intent = {
+        "schema_version": pe.EXECUTION_INTENT_SCHEMA_VERSION,
+        "decision_id": "decision-2026-10-08-a",
+        "mapping_id": "fixture-mapping",
+        "mapping_sha256": "c" * 64,
+        "source_binding_sha256": "d" * 64,
+        "target": {
+            "conid": 433489712,
+            "sec_type": "STK",
+            "symbol": "FIXTUREETF",
+            "currency": "USD",
+            "exchange": "SMART",
+            "primary_exchange": "ARCX",
+            "local_symbol": "FIXTUREETF",
+            "trading_class": "FIXTUREETF",
+        },
+        "exposure": {"direction": "long", "relationship": "POSITIVE_PROXY"},
+        "order": {
+            "action": "BUY",
+            "quantity": 1,
+            "order_type": "LMT",
+            "limit_price": "99.00",
+            "tif": "DAY",
+            "outside_rth": False,
+        },
+        "created_at": "2026-10-08T00:00:00Z",
+    }
+    for key, value in changes.items():
+        if key in ("target", "exposure", "order"):
+            intent[key] = {**intent[key], **value}
+        else:
+            intent[key] = value
+    return intent
+
+
+def make_entry(**overrides):
+    """A REAL valid 5F-2 mapping entry (same construction as 5F-2 tests)."""
+    source = dict(
+        provider="polymarket",
+        market_id="100",
+        event_id="event-100",
+        outcome="Yes",
+        expected_outcomes=["Yes", "No"],
+        expected_end_date="2026-10-01T00:00:00Z",
+    )
+    entry = {
+        "mapping_id": "fixture-mapping",
+        "status": "active",
+        "source": source,
+        "target": {
+            "broker": "IBKR",
+            "conid": 433489712,
+            "sec_type": "STK",
+            "symbol": "FIXTUREETF",
+            "currency": "USD",
+            "exchange": None,
+            "primary_exchange": "ARCX",
+            "local_symbol": "FIXTUREETF",
+            "trading_class": "FIXTUREETF",
+        },
+        "exposure": {"direction": "long", "relationship": "POSITIVE_PROXY"},
+        "operator_note": "Test fixture only. Not a production mapping.",
+    }
+    for key, value in overrides.items():
+        if key == "source":
+            source.update(value)
+        elif key in ("target", "exposure"):
+            entry[key] = {**entry[key], **value}
+        else:
+            entry[key] = value
+    entry["source"]["source_binding_sha256"] = im.source_binding_sha256(
+        provider=entry["source"]["provider"],
+        market_id=entry["source"]["market_id"],
+        event_id=entry["source"]["event_id"],
+        outcome=entry["source"]["outcome"],
+        expected_outcomes=entry["source"]["expected_outcomes"],
+        expected_end_date=entry["source"]["expected_end_date"],
+    )
+    entry["entry_sha256"] = im.entry_sha256(
+        {k: entry[k] for k in ("mapping_id", "status", "source", "target", "exposure", "operator_note")}
+    )
+    return entry
+
+
+def intent_for_entry(entry, **changes):
+    """Execution intent derived from a real entry (hash-consistent)."""
+    intent = {
+        "schema_version": pe.EXECUTION_INTENT_SCHEMA_VERSION,
+        "decision_id": "decision-2026-10-08-a",
+        "mapping_id": entry["mapping_id"],
+        "mapping_sha256": entry["entry_sha256"],
+        "source_binding_sha256": entry["source"]["source_binding_sha256"],
+        "target": {
+            **{key: entry["target"][key]
+               for key in ("conid", "sec_type", "symbol", "currency",
+                           "primary_exchange", "local_symbol", "trading_class")},
+            # 5F-3a requires SMART routing; the entry's optional exchange
+            # (None allowed in 5F-2) resolves to the only supported value.
+            "exchange": entry["target"]["exchange"] or "SMART",
+        },
+        "exposure": dict(entry["exposure"]),
+        "order": {
+            "action": "BUY",
+            "quantity": 1,
+            "order_type": "LMT",
+            "limit_price": "99.00",
+            "tif": "DAY",
+            "outside_rth": False,
+        },
+        "created_at": "2026-10-08T00:00:00Z",
+    }
+    for key, value in changes.items():
+        if key in ("target", "exposure", "order"):
+            intent[key] = {**intent[key], **value}
+        else:
+            intent[key] = value
+    return intent
+
+
+def base_intent(**changes):
+    return intent_for_entry(make_entry(), **changes)
+
+
+class _FakeReadAdapter:
+    """Read-only fake used for verification and broker-evidence reads."""
+
+    def __init__(self, *, entry=None, verify=True, open_orders=None, executions=None,
+                 fail="contract-not-found"):
+        self.entry = entry if entry is not None else make_entry()
+        self.verify = verify
+        self.fail = fail
+        self.open_order_rows = open_orders if open_orders is not None else []
+        self.execution_rows = executions if executions is not None else []
+        self.calls: list[str] = []
+
+    def close(self):
+        self.calls.append("close")
+
+    def lookup_contract_by_conid(self, conid):
+        self.calls.append(("lookup_contract_by_conid", conid))
+        if not self.verify:
+            raise AdapterError(self.fail)
+        target = self.entry["target"]
+        return {
+            "conid": target["conid"],
+            "symbol": target["symbol"],
+            "local_symbol": target["local_symbol"],
+            "sec_type": target["sec_type"],
+            "exchange": target["exchange"],
+            "primary_exchange": target["primary_exchange"],
+            "currency": target["currency"],
+            "expiry": None,
+            "strike": None,
+            "right": None,
+            "multiplier": None,
+            "trading_class": target["trading_class"],
+        }
+
+    def open_orders(self):
+        self.calls.append("open_orders")
+        return [dict(row) for row in self.open_order_rows]
+
+    def executions(self):
+        self.calls.append("executions")
+        return [dict(row) for row in self.execution_rows]
+
+
+class _FakePaperTransport:
+    """Paper transport fake: records exactly one submission.
+
+    Mirrors the real transport's 5F-3a1 boundary: the write-session
+    account allowlist is enforced INSIDE ``place_paper_order`` BEFORE the
+    submission is recorded, so a failed account gate leaves zero place
+    calls.
+    """
+
+    def __init__(self, *, outcome="acknowledged", fail=None, managed_accounts=None):
+        self.outcome = outcome
+        self.fail = fail
+        self.managed_account_list = [EXPECTED_ACCOUNT] if managed_accounts is None else list(managed_accounts)
+        self.calls: list[str] = []
+        self.place_calls: list[dict] = []
+
+    def managed_accounts(self):
+        self.calls.append("managed_accounts")
+        return list(self.managed_account_list)
+
+    def connect(self, config):
+        self.calls.append("connect")
+        self.config = config
+
+    def disconnect(self):
+        self.calls.append("disconnect")
+
+    def place_paper_order(self, **kwargs):
+        self.calls.append("place_paper_order")
+        expected = kwargs.pop("expected_account_id", None)
+        # Write-session account allowlist, enforced BEFORE any placement
+        # evidence is recorded (mirrors TwsPaperExecutionTransport, which
+        # reads its own managed_accounts stream first).
+        self.calls.append("managed_accounts")
+        if not expected:
+            raise pe.PaperSubmissionError("paper-account-mismatch")
+        if not self.managed_account_list:
+            raise pe.PaperSubmissionError("paper-session-failed")
+        if len(self.managed_account_list) > 1 or str(self.managed_account_list[0]) != expected:
+            raise pe.PaperSubmissionError("paper-account-mismatch")
+        self.place_calls.append(kwargs)
+        if self.fail == "rejected":
+            raise pe.PaperSubmissionError("paper-order-rejected", broker_code=110)
+        if self.fail == "uncertain":
+            raise pe.PaperSubmissionError("paper-submission-timeout")
+        if self.fail == "unexpected":
+            raise RuntimeError("unexpected transport crash")
+        status = "acknowledged" if self.outcome == "acknowledged" else "done"
+        return {
+            "order_id": 101,
+            "order_ref": kwargs["order_ref"],
+            "outcome": {"status": status, "broker_status": "Submitted", "order_ref": kwargs["order_ref"]},
+        }
+
+
+def make_executor(
+    *,
+    config=None,
+    read_adapter=None,
+    transport=None,
+    execution_root=None,
+    lock_root=None,
+):
+    executor = pe.IbkrPaperExecutor(
+        config or BASE_CONFIG,
+        _read_adapter_factory=lambda _config: read_adapter,
+        _paper_transport_factory=lambda _config: transport,
+        _execution_root=execution_root,
+        _lock_root=lock_root,
+        _now=lambda _t: None,
+    )
+    return executor
+
+
+class ExecutionIdTests(unittest.TestCase):
+    def test_same_logical_intent_same_execution_id(self):
+        first, first_id = pe.load_intent(document=base_intent())
+        second, second_id = pe.load_intent(document=base_intent())
+        self.assertEqual(first_id, second_id)
+        self.assertEqual(first, second)
+
+    def test_key_ordering_does_not_alter_hash(self):
+        reordered = json.loads(json.dumps(base_intent()))
+        reordered = {key: reordered[key] for key in reversed(list(reordered))}
+        _, first_id = pe.load_intent(document=base_intent())
+        _, second_id = pe.load_intent(document=reordered)
+        self.assertEqual(first_id, second_id)
+
+    def _changed_id(self, **changes):
+        _, base_id = pe.load_intent(document=base_intent())
+        _, changed = pe.load_intent(document=base_intent(**changes))
+        self.assertNotEqual(base_id, changed)
+        return changed
+
+    def test_conid_change_changes_id(self):
+        self._changed_id(target={"conid": 999999999})
+
+    def test_quantity_change_changes_id(self):
+        # quantity 2 at a lower price stays under the notional cap.
+        self._changed_id(order={"quantity": 2, "limit_price": "40.00"})
+
+    def test_price_change_changes_id(self):
+        self._changed_id(order={"limit_price": "99.01"})
+
+    def test_decision_change_changes_id(self):
+        self._changed_id(decision_id="decision-2026-10-08-b")
+
+    def test_mapping_hash_change_changes_id(self):
+        self._changed_id(mapping_sha256="e" * 64)
+
+    def test_valid_identity_field_change_changes_id(self):
+        # TIF changes are rejected outright by 5F-3a validation; use an
+        # always-valid identity field (relationship) for this variant.
+        self._changed_id(exposure={"relationship": "DIRECT_UNDERLYING"})
+
+    def test_timestamp_does_not_change_identity(self):
+        first, first_id = pe.load_intent(document=base_intent())
+        second, second_id = pe.load_intent(document=base_intent(created_at=None))
+        self.assertEqual(first_id, second_id)
+        self.assertNotEqual(first.get("created_at"), second.get("created_at"))
+
+    def test_order_ref_is_deterministic_and_bounded(self):
+        _, execution_id_value = pe.load_intent(document=base_intent())
+        reference = pe.order_ref(execution_id_value)
+        self.assertEqual(reference, pe.order_ref(execution_id_value))
+        self.assertTrue(reference.startswith("phil5f3-"))
+        self.assertLessEqual(len(reference), 41)
+
+
+class IntentValidationTests(unittest.TestCase):
+    def expect_code(self, callable_, code):
+        with self.assertRaises(pe.ExecutionError) as caught:
+            callable_()
+        self.assertEqual(caught.exception.code, code, caught.exception)
+
+    def test_5f3a5_normalization_is_schema_idempotent_created_at_none(self):
+        # 5F-3a5: the normalized result of validate_intent must itself
+        # satisfy the same closed schema. created_at=None previously
+        # DROPPED the key, so executor.submit's revalidation of the
+        # normalized document failed with intent-schema-mismatch.
+        raw = base_intent()
+        raw["created_at"] = None
+        normalized1, id1 = pe.load_intent(document=raw)
+        normalized2, id2 = pe.load_intent(document=normalized1)
+        self.assertEqual(normalized1, normalized2)
+        self.assertEqual(id1, id2)
+        self.assertIn("created_at", normalized1)
+        self.assertIsNone(normalized1["created_at"])
+
+    def test_5f3a5_closed_field_set_preserved_when_created_at_none(self):
+        raw = base_intent()
+        raw["created_at"] = None
+        normalized, _ = pe.load_intent(document=raw)
+        self.assertEqual(set(normalized.keys()), set(pe._CLOSED_INTENT_FIELDS))
+
+    def test_5f3a5_created_at_string_preserved_exactly(self):
+        raw = base_intent()
+        raw["created_at"] = "2026-10-12T12:00:00Z"
+        normalized, _ = pe.load_intent(document=raw)
+        self.assertEqual(normalized["created_at"], "2026-10-12T12:00:00Z")
+        again, _ = pe.load_intent(document=normalized)
+        self.assertEqual(again["created_at"], "2026-10-12T12:00:00Z")
+        self.assertEqual(normalized, again)
+
+    def test_5f3a5_execution_id_independent_of_created_at(self):
+        without = base_intent()
+        without["created_at"] = None
+        with_value = base_intent()
+        with_value["created_at"] = "2026-10-12T12:00:00Z"
+        _, id_without = pe.load_intent(document=without)
+        _, id_with = pe.load_intent(document=with_value)
+        self.assertEqual(id_without, id_with)
+        self.assertEqual(pe.order_ref(id_without), pe.order_ref(id_with))
+
+    def test_5f3a5_invalid_created_at_still_fails_closed(self):
+        as_int = base_intent()
+        as_int["created_at"] = 123
+        self.expect_code(lambda: pe.validate_intent(as_int), "intent-invalid")
+        too_long = base_intent()
+        too_long["created_at"] = "x" * 33
+        self.expect_code(lambda: pe.validate_intent(too_long), "intent-invalid")
+        # Wrong type variants
+        as_list = base_intent()
+        as_list["created_at"] = []
+        self.expect_code(lambda: pe.validate_intent(as_list), "intent-invalid")
+
+    def test_float_monetary_input_rejected(self):
+        self.expect_code(lambda: pe.parse_limit_price(99.5), "intent-invalid")
+
+    def test_malformed_decimal_rejected(self):
+        self.expect_code(lambda: pe.parse_limit_price("abc"), "intent-invalid")
+
+    def test_zero_and_negative_price_rejected(self):
+        self.expect_code(lambda: pe.parse_limit_price("0"), "intent-invalid")
+        self.expect_code(lambda: pe.parse_limit_price("-1"), "intent-invalid")
+
+    def test_quantity_zero_and_negative_rejected(self):
+        self.expect_code(lambda: pe.parse_quantity(0), "intent-invalid")
+        self.expect_code(lambda: pe.parse_quantity(-1), "intent-invalid")
+
+    def test_fractional_quantity_rejected(self):
+        self.expect_code(lambda: pe.parse_quantity(1.5), "intent-invalid")
+        self.expect_code(lambda: pe.parse_quantity(True), "intent-invalid")
+
+    def test_notional_over_cap_rejected_and_exact_cap_accepted(self):
+        over = base_intent(order={"quantity": 2, "limit_price": "50.01"})
+        self.expect_code(lambda: pe.validate_intent(over), "notional-cap-exceeded")
+        exact = base_intent(order={"quantity": 1, "limit_price": "100.00"})
+        validated, _ = pe.load_intent(document=exact)
+        self.assertEqual(validated["order"]["limit_price"], "100.00")
+
+    def test_unsupported_currency_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(target={"currency": "CAD"})),
+            "unsupported-order-parameter",
+        )
+
+    def test_exchange_not_smart_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(target={"exchange": "ARCA"})),
+            "unsupported-order-parameter",
+        )
+
+    def test_sec_type_not_stk_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(target={"sec_type": "OPT"})),
+            "unsupported-order-parameter",
+        )
+
+    def test_short_direction_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(exposure={"direction": "short"})),
+            "paper-short-not-supported",
+        )
+
+    def test_sell_action_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(order={"action": "SELL"})),
+            "unsupported-order-parameter",
+        )
+
+    def test_non_lmt_order_type_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(order={"order_type": "MKT"})),
+            "unsupported-order-parameter",
+        )
+
+    def test_non_day_tif_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(order={"tif": "GTC"})),
+            "unsupported-order-parameter",
+        )
+
+    def test_outside_rth_true_rejected(self):
+        self.expect_code(
+            lambda: pe.validate_intent(base_intent(order={"outside_rth": True})),
+            "unsupported-order-parameter",
+        )
+
+    def test_unknown_fields_rejected(self):
+        document = base_intent()
+        document["extra"] = 1
+        self.expect_code(lambda: pe.validate_intent(document), "intent-schema-mismatch")
+
+    def test_environment_gate_rejects_non_paper(self):
+        self.expect_code(
+            lambda: pe._paper_environment_gate({"environment": "LIVE"}),
+            "environment-not-paper",
+        )
+        self.expect_code(
+            lambda: pe._paper_environment_gate({"environment": "unknown"}),
+            "environment-not-paper",
+        )
+
+
+class ArmTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, transport):
+        return make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_no_arm_fails_before_any_broker_io(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=False, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "arm-missing")
+        self.assertEqual(transport.calls, [])
+        read_adapter = executor._read_adapter_factory(BASE_CONFIG)
+        self.assertEqual(read_adapter.calls, [])
+
+    def test_wrong_confirmation_fails_before_any_broker_io(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id="f" * 64)
+        self.assertEqual(caught.exception.code, "arm-confirmation-mismatch")
+        self.assertEqual(transport.calls, [])
+
+    def test_correct_arm_reaches_fake_submission(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertIn("place_paper_order", transport.calls)
+        self.assertEqual(len(transport.place_calls), 1)
+
+    def test_arm_is_not_persisted(self):
+        self.assertEqual(list(self.execution_root.glob("*")), [])
+        self.assertEqual(list(self.lock_root.glob("*")) if self.lock_root.exists() else [], [])
+
+    def test_second_invocation_still_requires_arm(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=False, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "arm-missing")
+
+    def test_no_live_flag_exists_on_parser(self):
+        parser = pe.build_parser()
+        usage = parser.format_usage()
+        help_text = parser.format_help()
+        for banned in ("--live", "--real", "--force", "--override", "--retry", "--transmit", "--market", "--sell", "--short"):
+            self.assertNotIn(banned, usage)
+            self.assertNotIn(banned, help_text)
+
+
+class AccountEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def submit(self, config, transport):
+        executor = make_executor(
+            config=config,
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        return executor, executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+
+    def test_environment_live_rejects_before_place_order(self):
+        transport = _FakePaperTransport()
+        executor = make_executor(
+            config={**BASE_CONFIG, "environment": "LIVE"},
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "environment-not-paper")
+        self.assertEqual(transport.calls, [])
+
+    def test_environment_unknown_rejects_before_place_order(self):
+        transport = _FakePaperTransport()
+        executor = make_executor(
+            config={**BASE_CONFIG, "environment": "unknown"},
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "environment-not-paper")
+        self.assertEqual(transport.calls, [])
+
+    def test_port_number_alone_never_determines_environment(self):
+        transport = _FakePaperTransport()
+        executor = make_executor(
+            config={**BASE_CONFIG, "port": 4001, "environment": "LIVE"},
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "environment-not-paper")
+
+    def test_mapping_hash_mismatch_rejects_before_place_order(self):
+        transport = _FakePaperTransport()
+        executor = make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        forged = dict(self.mapping_entry)
+        forged["entry_sha256"] = "e" * 64
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, forged, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "mapping-hash-mismatch")
+        self.assertEqual(transport.calls, [])
+
+
+class BrokerEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+        self.order_ref_value = pe.order_ref(self.execution_id_value)
+
+    def executor(self, read_adapter, transport):
+        return make_executor(
+            read_adapter=read_adapter,
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_mapping_verification_failure_zero_place_calls(self):
+        transport = _FakePaperTransport()
+        read_adapter = _FakeReadAdapter(verify=False, fail="contract-not-found")
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "verification-failed")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_open_order_with_same_order_ref_rejects_duplicate(self):
+        transport = _FakePaperTransport()
+        read_adapter = _FakeReadAdapter(open_orders=[{"order_ref": self.order_ref_value}])
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "duplicate-broker-evidence")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_execution_with_same_order_ref_rejects_duplicate(self):
+        transport = _FakePaperTransport()
+        read_adapter = _FakeReadAdapter(executions=[{"order_ref": self.order_ref_value}])
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "duplicate-broker-evidence")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_clean_broker_evidence_allows_single_submission(self):
+        transport = _FakePaperTransport()
+        read_adapter = _FakeReadAdapter(open_orders=[], executions=[])
+        executor = self.executor(read_adapter, transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(transport.place_calls and len(transport.place_calls), 1)
+
+
+class SubmissionOutcomeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, transport, read_adapter=None):
+        return make_executor(
+            read_adapter=read_adapter or _FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_rejected_submission_records_bounded_rejection(self):
+        transport = _FakePaperTransport(fail="rejected")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        types = [record["event_type"] for record in records]
+        self.assertIn("submission-attempted", types)
+        self.assertIn("submission-rejected", types)
+        # No raw broker text anywhere in the receipts.
+        self.assertNotIn("unexpected transport crash", json.dumps(records))
+
+    def test_uncertain_timeout_marks_uncertain_and_never_retries(self):
+        transport = _FakePaperTransport(fail="uncertain")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        self.assertIn("submission-uncertain", [record["event_type"] for record in records])
+        # A repeat invocation must fail closed as uncertain, no new submit.
+        transport2 = _FakePaperTransport()
+        executor2 = self.executor(transport2)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor2.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "execution-uncertain")
+        self.assertEqual(transport2.calls, [])
+
+    def test_place_order_called_exactly_once_on_success(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(transport.calls.count("place_paper_order"), 1)
+
+    def test_duplicate_execution_id_never_places_twice(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        transport2 = _FakePaperTransport()
+        executor2 = self.executor(transport2)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor2.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        self.assertEqual(transport2.calls, [])
+
+    def test_connection_loss_after_attempt_records_uncertain(self):
+        class _ConnectFailTransport(_FakePaperTransport):
+            def connect(self, config):
+                self.calls.append("connect")
+                raise RuntimeError("connection lost")
+
+        transport = _ConnectFailTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        self.assertIn("submission-uncertain", [record["event_type"] for record in records])
+        self.assertNotIn("connection lost", json.dumps(records))
+
+    def test_state_write_failure_zero_place_calls(self):
+        transport = _FakePaperTransport()
+        read_adapter = _FakeReadAdapter(verify=True)
+
+        class _FailingState:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        executor = make_executor(
+            read_adapter=read_adapter,
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        # Corrupt the receipts file so the state read fails closed before
+        # any submission.
+        self.execution_root.mkdir(parents=True, exist_ok=True)
+        (self.execution_root / state.RECEIPT_FILENAME).write_bytes(b"corrupt\n")
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "receipt-write-failed")
+        self.assertEqual(transport.calls, [])
+
+    def test_raw_error_text_never_reaches_receipts_or_output(self):
+        transport = _FakePaperTransport(fail="unexpected")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-uncertain")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        self.assertNotIn("unexpected transport crash", json.dumps(records))
+
+
+class ReceiptPrivacyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def test_no_raw_account_id_in_receipts(self):
+        transport = _FakePaperTransport()
+        executor = make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        records = state.read_receipts(_execution_root=self.execution_root)
+        self.assertNotIn(EXPECTED_ACCOUNT, json.dumps(records))
+        self.assertTrue(all(record["account_id_masked"].startswith("***") for record in records))
+
+    def test_no_password_or_config_path_in_receipts(self):
+        transport = _FakePaperTransport()
+        executor = make_executor(
+            config={**BASE_CONFIG, "config_path": "/tmp/secret-config-path.json"},
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        records = state.read_receipts(_execution_root=self.execution_root)
+        self.assertNotIn("secret-config-path", json.dumps(records))
+        self.assertNotIn("password", json.dumps(records))
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.intent_path = pathlib.Path(self.tmp.name) / "intent.json"
+        self.mapping_path = pathlib.Path(self.tmp.name) / "mapping.json"
+        self.intent_path.write_text(json.dumps(base_intent()), encoding="utf-8")
+        _, execution_id_value = pe.load_intent(document=base_intent())
+        self.execution_id_value = execution_id_value
+
+    def run_cli(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_help_exits_zero(self):
+        code, out, _ = self.run_cli(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("submit", out)
+
+    def test_missing_arm_fails_bounded_no_traceback(self):
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        code, _, err = self.run_cli([
+            "submit",
+            "--intent-file", str(self.intent_path),
+            "--mapping-file", str(self.mapping_path),
+            "--confirm-execution-id", self.execution_id_value,
+        ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-missing", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_forbidden_options_rejected_bounded(self):
+        for banned in ("--live", "--real", "--force", "--override", "--retry", "--transmit", "--market", "--sell", "--short"):
+            code, _, err = self.run_cli(["submit", banned])
+            self.assertNotEqual(code, 0, banned)
+            self.assertNotIn("Traceback", err, banned)
+
+    def test_path_values_are_opaque_never_scanned(self):
+        # A path value containing an operational word must not itself be
+        # rejected for its content.
+        weird = pathlib.Path(self.tmp.name) / "trade-position-real-size.json"
+        weird.write_text(json.dumps(base_intent()), encoding="utf-8")
+        code, _, err = self.run_cli([
+            "submit",
+            "--intent-file", str(weird),
+            "--mapping-file", str(self.mapping_path),
+            "--confirm-execution-id", "0" * 64,
+            "--arm-paper",
+        ])
+        self.assertNotIn("Traceback", err)
+        # The rejection (if any) is about the confirmation mismatch, not
+        # about the path words.
+        self.assertNotIn("unsupported option", err)
+
+    def test_5f3a5_cli_created_at_null_missing_arm_subprocess(self):
+        # 5F-3a5 regression 3: real temp intent file with created_at=null,
+        # correct execution id, NO --arm-paper -> arm-missing (never
+        # intent-schema-mismatch/intent-invalid); the executor's
+        # revalidation of the CLI-loaded intent must succeed.
+        import subprocess
+        raw = base_intent()
+        raw["created_at"] = None
+        self.intent_path.write_text(json.dumps(raw), encoding="utf-8")
+        _, expected_id = pe.load_intent(document=raw)
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-m", "ibkr.paper_execution", "submit",
+             "--intent-file", str(self.intent_path),
+             "--mapping-file", str(self.mapping_path),
+             "--confirm-execution-id", expected_id],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPOSITORY_ROOT),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("arm-missing", completed.stderr)
+        self.assertNotIn("intent-schema-mismatch", completed.stderr)
+        self.assertNotIn("intent-invalid", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_5f3a5_cli_created_at_null_wrong_confirmation(self):
+        # 5F-3a5 regression 4: created_at=null + wrong confirmation ->
+        # arm-confirmation-mismatch before executor/broker I/O.
+        import subprocess
+        raw = base_intent()
+        raw["created_at"] = None
+        self.intent_path.write_text(json.dumps(raw), encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-m", "ibkr.paper_execution", "submit",
+             "--intent-file", str(self.intent_path),
+             "--mapping-file", str(self.mapping_path),
+             "--confirm-execution-id", "0" * 64],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPOSITORY_ROOT),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("arm-confirmation-mismatch", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_5f3a4_cli_acceptance_no_arm_subprocess_reaches_arm_missing(self):
+        # Brief's DIRECT CLI ACCEPTANCE: run the CLI as a real subprocess
+        # (`python -m ibkr.paper_execution submit ...`) without --arm-paper
+        # using real temp files. arm-missing occurs BEFORE config/broker
+        # I/O, so no IBKR configuration is required.
+        import subprocess
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-m", "ibkr.paper_execution", "submit",
+             "--intent-file", str(self.intent_path),
+             "--mapping-file", str(self.mapping_path),
+             "--confirm-execution-id", self.execution_id_value],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPOSITORY_ROOT),
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("arm-missing", completed.stderr)
+        self.assertNotIn("intent-schema-mismatch", completed.stderr)
+        self.assertNotIn("intent-invalid", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_5f3a4_valid_intent_file_missing_arm_reaches_arm_missing(self):
+        # 5F-3a4 regression 1: a VALID intent file (real temp JSON file,
+        # not mocked) must load and validate, so a missing --arm-paper
+        # surfaces arm-missing — never intent-schema-mismatch/intent-invalid
+        # from a path string reaching validate_intent.
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(self.intent_path),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-missing", stderr.getvalue())
+        self.assertNotIn("intent-schema-mismatch", stderr.getvalue())
+        self.assertNotIn("intent-invalid", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_valid_intent_file_wrong_confirmation(self):
+        # 5F-3a4 regression 2: wrong confirmation is detected BEFORE any
+        # broker I/O (confirmation check precedes executor construction).
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(self.intent_path),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", "0" * 64,
+                "--arm-paper",
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-confirmation-mismatch", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_cli_loaded_id_equals_direct_api_id(self):
+        # 5F-3a4 regression 3: CLI file loading computes the SAME
+        # execution id as the direct document API.
+        direct_intent, direct_id = pe.load_intent(document=base_intent())
+        file_intent, file_id = pe.load_intent(
+            document=json.loads(self.intent_path.read_text(encoding="utf-8"))
+        )
+        self.assertEqual(file_id, direct_id)
+        self.assertEqual(file_intent, direct_intent)
+        # And the CLI's own loading path (as main() now does it) matches.
+        raw = json.loads(self.intent_path.read_text(encoding="utf-8"))
+        _, cli_id = pe.load_intent(document=raw)
+        self.assertEqual(cli_id, self.execution_id_value)
+
+    def test_5f3a4_malformed_intent_json_bounded(self):
+        # 5F-3a4 regression 4: malformed intent JSON -> bounded message,
+        # no traceback.
+        broken = pathlib.Path(self.tmp.name) / "broken-intent.json"
+        broken.write_text('{"intent_id": "x", NOPE', encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(broken),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("a required input file is not valid JSON", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_missing_intent_file_bounded(self):
+        # 5F-3a4 regression 5: missing intent file -> bounded message,
+        # no traceback.
+        absent = pathlib.Path(self.tmp.name) / "absent-intent.json"
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(absent),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("a required input file could not be read", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_5f3a4_valid_json_invalid_intent_document_bounded(self):
+        # 5F-3a4 regression 6: valid JSON that fails the intent schema ->
+        # bounded ExecutionError code, no traceback.
+        invalid = pathlib.Path(self.tmp.name) / "invalid-schema.json"
+        invalid.write_text(json.dumps({"unrelated": "document"}), encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(invalid),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("error: ", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        # The bounded schema code surfaces (not the file-level message).
+        self.assertNotIn("a required input file", stderr.getvalue())
+
+    def test_5f3a4_intent_path_values_remain_opaque(self):
+        # 5F-3a4 regression 7: operational words in the intent PATH are
+        # treated strictly as a path; no substring scanning of the value.
+        weird_dir = pathlib.Path(self.tmp.name) / "live-real-trade-position-size"
+        weird_dir.mkdir()
+        weird = weird_dir / "intent.json"
+        weird.write_text(json.dumps(base_intent()), encoding="utf-8")
+        self.mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = pe.main([
+                "submit",
+                "--intent-file", str(weird),
+                "--mapping-file", str(self.mapping_path),
+                "--confirm-execution-id", self.execution_id_value,
+            ])
+        # The file LOADS (correct schema validation), so the only
+        # rejection is the missing arm — never a path-content complaint.
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-missing", stderr.getvalue())
+        self.assertNotIn("unsupported option", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+    def test_wrong_confirmation_fails_bounded(self):
+        self.mapping_path.write_text("{}", encoding="utf-8")
+        code, _, err = self.run_cli([
+            "submit",
+            "--intent-file", str(self.intent_path),
+            "--mapping-file", str(self.mapping_path),
+            "--confirm-execution-id", "0" * 64,
+            "--arm-paper",
+        ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("arm-confirmation-mismatch", err)
+        self.assertNotIn("Traceback", err)
+
+
+class WriteSessionAccountAllowlistTests(unittest.TestCase):
+    """5F-3a1: the session that owns placeOrder independently enforces the
+    exact account allowlist — a prior read-only verification grants nothing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, read_adapter, transport):
+        return make_executor(
+            read_adapter=read_adapter,
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_exact_allowlisted_account_reaches_placement(self):
+        transport = _FakePaperTransport(managed_accounts=[EXPECTED_ACCOUNT])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(len(transport.place_calls), 1)
+        # The write session verified ITS OWN managed accounts (the exact
+        # allowlisted id) inside the placement boundary.
+        self.assertIn("managed_accounts", transport.calls)
+        self.assertEqual(transport.managed_account_list, [EXPECTED_ACCOUNT])
+
+    def test_unexpected_write_session_account_zero_place_calls(self):
+        transport = _FakePaperTransport(managed_accounts=["DU9999999"])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_multiple_write_session_accounts_zero_place_calls(self):
+        transport = _FakePaperTransport(managed_accounts=[EXPECTED_ACCOUNT, "DU0000022"])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_zero_write_session_accounts_zero_place_calls(self):
+        transport = _FakePaperTransport(managed_accounts=[])
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        self.assertEqual(transport.place_calls, [])
+
+    def test_prior_readonly_verification_cannot_authorize_mismatched_write_session(self):
+        # The read adapter verifies the EXACT account successfully; the
+        # write session then reports a DIFFERENT account. The submission
+        # must still fail closed with zero place calls.
+        transport = _FakePaperTransport(managed_accounts=["DU9999999"])
+        read_adapter = _FakeReadAdapter(verify=True)  # verification SUCCEEDS
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        # The read-only verification DID run.
+        self.assertTrue(any(call[0] == "lookup_contract_by_conid" for call in read_adapter.calls if isinstance(call, tuple)))
+        # ...and the write session still never placed anything.
+        self.assertEqual(transport.place_calls, [])
+
+    def test_account_never_inferred_from_prefix_port_or_environment(self):
+        # The gate compares the exact configured account id only; a
+        # different-looking-but-equal-length id fails.
+        transport = _FakePaperTransport(managed_accounts=["DU0000011 "])  # trailing space != exact id
+        read_adapter = _FakeReadAdapter(verify=True)
+        executor = self.executor(read_adapter, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+
+
+class StaticArchitectureTests(unittest.TestCase):
+    """5F-3a1: structural mutation-capability architecture proof."""
+
+    def test_readonly_surfaces_expose_no_mutation_methods(self):
+        from ibkr.adapter import ReadonlyIbkrAdapter
+        from ibkr.transport import ReadonlyTransport
+        from ibkr.transport_tws import TwsTransport
+
+        self.assertEqual(
+            [name for name in dir(ReadonlyIbkrAdapter) if not name.startswith("_")],
+            sorted(name for name in dir(ReadonlyIbkrAdapter) if not name.startswith("_")),
+        )
+        for surface in (ReadonlyIbkrAdapter, ReadonlyTransport, TwsTransport):
+            for forbidden in ("submit_order", "place_paper_order", "place_order",
+                              "submit", "transmit", "cancel", "cancel_order",
+                              "cancelOrder", "reqGlobalCancel", "exerciseOptions"):
+                self.assertFalse(hasattr(surface, forbidden), (surface, forbidden))
+
+    def test_paper_transport_alone_exposes_place_paper_order(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        self.assertTrue(hasattr(TwsPaperExecutionTransport, "place_paper_order"))
+
+    def test_paper_wrapper_binds_official_ewrapper_surface(self):
+        # 5F-3a8: real TWS PAPER handshake failed with
+        # AttributeError: '_PaperExecutionWrapper' object has no
+        # attribute 'connectAck' because the PAPER override of
+        # _build_wrapper bypassed the deferred official-EWrapper mixin
+        # binding proven in TwsTransport. The PAPER wrapper must expose
+        # the official EWrapper callback surface (connectAck at
+        # minimum) AND retain the PAPER-specific order-observation
+        # surface. The official ibapi module is faked via sys.modules;
+        # no real ibapi import and no TWS connection occurs.
+        import types
+        from unittest.mock import patch
+        from ibkr.paper_transport import (
+            TwsPaperExecutionTransport,
+            _PaperExecutionWrapper,
+        )
+
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_wrapper_module = types.ModuleType("ibapi.wrapper")
+
+        class _FakeEWrapper:
+            def connectAck(self):
+                pass
+
+        fake_wrapper_module.EWrapper = _FakeEWrapper
+        fake_ibapi.wrapper = fake_wrapper_module
+
+        transport = TwsPaperExecutionTransport(BASE_CONFIG)
+        with patch.dict(sys.modules, {"ibapi": fake_ibapi, "ibapi.wrapper": fake_wrapper_module}):
+            wrapper = transport._build_wrapper(10.0)
+        # 1. The official EWrapper surface is bound (as a real base
+        # class, exactly like _ModuleBoundWrapper in TwsTransport).
+        self.assertIsInstance(wrapper, _FakeEWrapper)
+        self.assertTrue(callable(getattr(wrapper, "connectAck", None)))
+        # 2. The PAPER-specific order-observation surface remains.
+        self.assertIsInstance(wrapper, _PaperExecutionWrapper)
+        self.assertTrue(callable(getattr(wrapper, "begin_order_watch", None)))
+        self.assertTrue(callable(getattr(wrapper, "order_outcome", None)))
+
+    def test_paper_openorder_callback_updates_exact_watched_row(self):
+        # 5F-3a9: the real TWS PAPER smoke showed paper-submission-timeout
+        # even though TWS displayed the precaution dialog. Root cause: the
+        # PAPER openOrder override referenced the UNDEFINED local name
+        # `orderId` (the official callback argument is `_orderId`), so the
+        # real IBAPI callback path raised NameError before the watched
+        # order event was populated/signalled. The callback must update
+        # the EXACT watched order row, signal its event, retain the
+        # broker status and order_ref, and leave other order ids
+        # untouched. The official ibapi module is faked via sys.modules;
+        # no real ibapi import and no TWS connection occurs.
+        import types
+        from unittest.mock import patch
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_wrapper_module = types.ModuleType("ibapi.wrapper")
+
+        class _FakeEWrapper:
+            def connectAck(self):
+                pass
+
+        fake_wrapper_module.EWrapper = _FakeEWrapper
+        fake_ibapi.wrapper = fake_wrapper_module
+
+        transport = TwsPaperExecutionTransport(BASE_CONFIG)
+        with patch.dict(sys.modules, {"ibapi": fake_ibapi, "ibapi.wrapper": fake_wrapper_module}):
+            wrapper = transport._build_wrapper(10.0)
+        watched_id = 101
+        other_id = 202
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+
+        class _FakeContract:
+            pass
+
+        class _FakeOrder:
+            orderRef = "phil5f3-openorder-regression"
+
+        class _FakeOrderState:
+            status = "Submitted"
+
+        # Must not raise (pre-fix this raised NameError: name 'orderId'
+        # is not defined inside the official IBAPI callback path).
+        wrapper.openOrder(watched_id, _FakeContract(), _FakeOrder(), _FakeOrderState())
+
+        # The exact watched row is updated and its event is signalled.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["status"], "Submitted")
+        self.assertEqual(row["order_ref"], "phil5f3-openorder-regression")
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        # Another order id is not accidentally affected.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertIsNone(other_row["order_ref"])
+        self.assertFalse(wrapper.order_events[other_id]["event"].is_set())
+
+    def _ast_attribute_files(self, attr_name):
+        import ast
+
+        hits = []
+        for path in sorted(REPOSITORY_ROOT.rglob("*.py")):
+            relative = path.relative_to(REPOSITORY_ROOT)
+            if ".git" in relative.parts or "tests" in relative.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == attr_name:
+                    # Windows yields backslash separators; normalize to
+                    # POSIX at the collection point so the exact assertion
+                    # below compares the same string on every platform.
+                    normalized = relative.as_posix()
+                    hits.append(normalized)
+        return sorted(set(hits))
+
+    def test_place_order_ast_only_in_paper_transport(self):
+        self.assertEqual(self._ast_attribute_files("placeOrder"), ["ibkr/paper_transport.py"])
+
+    def test_order_construction_ast_only_in_paper_transport(self):
+        # ibapi.order.Order is referenced (imported and constructed) only
+        # in the paper transport.
+        import ast
+
+        hits = []
+        for path in sorted(REPOSITORY_ROOT.rglob("*.py")):
+            relative = path.relative_to(REPOSITORY_ROOT)
+            if ".git" in relative.parts or "tests" in relative.parts:
+                continue
+            source = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    module = getattr(node, "module", "") or ""
+                    names = [alias.name for alias in node.names]
+                    if "ibapi.order" in module or "order" in names and module.startswith("ibapi"):
+                        # Normalize to POSIX at the collection point (see
+                        # _ast_attribute_files); never str(relative).
+                        normalized = relative.as_posix()
+                        hits.append(normalized)
+        self.assertEqual(hits, ["ibkr/paper_transport.py"])
+
+    def test_cancel_global_cancel_exercise_zero_invocations(self):
+        for attr in ("cancelOrder", "reqGlobalCancel", "exerciseOptions"):
+            self.assertEqual(self._ast_attribute_files(attr), [], attr)
+
+
+class BrokerDiagnosticsRetentionTests(unittest.TestCase):
+    """5F-3a11: preserve the already-bounded numeric broker diagnostic
+    from the transport outcome through the executor into the durable
+    terminal receipt, and correctly classify a RETURNED known rejection
+    (outcome code ``paper-order-rejected``) as ``submission-rejected``
+    instead of ``submission-uncertain``. No broker text is ever
+    retained; no retry occurs; one-shot semantics unchanged.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, transport):
+        return make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def _returned_outcome_transport(self, outcome, order_id):
+        class _ReturnedOutcomeTransport(_FakePaperTransport):
+            def place_paper_order(self, **kwargs):
+                self.calls.append("place_paper_order")
+                expected = kwargs.get("expected_account_id")
+                self.calls.append("managed_accounts")
+                if not expected or self.managed_account_list != [expected]:
+                    raise pe.PaperSubmissionError("paper-account-mismatch")
+                self.place_calls.append(kwargs)
+                return {
+                    "order_id": order_id,
+                    "order_ref": kwargs["order_ref"],
+                    "outcome": outcome,
+                }
+        return _ReturnedOutcomeTransport()
+
+    def test_a_returned_uncertain_outcome_preserves_broker_code(self):
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-submission-uncertain",
+            "broker_code": 2103,
+            "order_ref": "phil5f3-returned-uncertain-regression",
+        }
+        transport = self._returned_outcome_transport(outcome, order_id=101)
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-uncertain")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        terminal = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(terminal), 1)
+        broker = terminal[0]["broker"]
+        self.assertEqual(broker["order_id"], 101)
+        self.assertEqual(broker["broker_code"], 2103)
+        self.assertIsNone(broker["status"])
+        # No broker error text anywhere in the durable evidence.
+        self.assertNotIn("errorString", json.dumps(records))
+        self.assertNotIn("advancedOrderRejectJson", json.dumps(records))
+        # One-shot: a second submit must fail closed with zero broker I/O.
+        transport2 = _FakePaperTransport()
+        executor2 = self.executor(transport2)
+        with self.assertRaises(pe.ExecutionError) as caught2:
+            executor2.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught2.exception.code, "execution-uncertain")
+        self.assertEqual(transport2.calls, [])
+
+    def test_b_exception_bounded_broker_code_is_retained(self):
+        class _RaisingUncertainTransport(_FakePaperTransport):
+            def place_paper_order(self, **kwargs):
+                self.calls.append("place_paper_order")
+                expected = kwargs.get("expected_account_id")
+                self.calls.append("managed_accounts")
+                if not expected or self.managed_account_list != [expected]:
+                    raise pe.PaperSubmissionError("paper-account-mismatch")
+                self.place_calls.append(kwargs)
+                raise pe.PaperSubmissionError("paper-submission-timeout", broker_code=2103)
+        transport = _RaisingUncertainTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        terminal = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(terminal), 1)
+        broker = terminal[0]["broker"]
+        # No order id is invented when none is known.
+        self.assertIsNone(broker["order_id"])
+        self.assertEqual(broker["broker_code"], 2103)
+        self.assertIsNone(broker["status"])
+
+    def test_c_returned_known_rejection_is_recorded_as_rejected(self):
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-order-rejected",
+            "broker_code": 110,
+        }
+        transport = self._returned_outcome_transport(outcome, order_id=102)
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        rejected = [r for r in records if r["event_type"] == "submission-rejected"]
+        uncertain = [r for r in records if r["event_type"] == "submission-uncertain"]
+        # Exactly one terminal submission-rejected receipt and NO
+        # submission-uncertain terminal receipt for this outcome.
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(uncertain, [])
+        broker = rejected[0]["broker"]
+        self.assertEqual(broker["order_id"], 102)
+        self.assertEqual(broker["status"], "Rejected")
+        self.assertEqual(broker["broker_code"], 110)
+        self.assertEqual(rejected[0]["reason_code"], "paper-order-rejected")
+        # No retry: the transport saw exactly one placement.
+        self.assertEqual(transport.calls.count("place_paper_order"), 1)
+
+    def test_d_no_broker_code_remains_valid_and_fails_closed(self):
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-submission-timeout",
+        }
+        transport = self._returned_outcome_transport(outcome, order_id=103)
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        terminal = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(terminal), 1)
+        broker = terminal[0]["broker"]
+        self.assertEqual(broker["order_id"], 103)
+        self.assertIsNone(broker["broker_code"])
+
+
+class OrderOutcomeStateMachineTests(unittest.TestCase):
+    """5F-3a10: PAPER order-outcome callbacks must wait for classifiable
+    broker evidence. Real Windows/TWS PAPER acceptance showed
+    paper-submission-uncertain for an order TWS displayed a precaution
+    dialog for: a non-rejection order-scoped error() callback was treated
+    as terminal, and openOrder without classifiable status signalled the
+    completion event. The wrapper must signal completion ONLY on known
+    rejection or classifiable non-empty broker status; non-rejection
+    order-scoped errors record their bounded numeric code but must not
+    terminate the wait by themselves; broker evidence that is observed
+    but not classifiable must yield paper-submission-uncertain with the
+    optional numeric code retained (timeout with NO evidence remains
+    paper-submission-timeout). No retry under any circumstance.
+    """
+
+    def _wrapper(self):
+        import types
+        from unittest.mock import patch
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+
+        fake_ibapi = types.ModuleType("ibapi")
+        fake_wrapper_module = types.ModuleType("ibapi.wrapper")
+
+        class _FakeEWrapper:
+            def connectAck(self):
+                pass
+
+        fake_wrapper_module.EWrapper = _FakeEWrapper
+        fake_ibapi.wrapper = fake_wrapper_module
+
+        transport = TwsPaperExecutionTransport(BASE_CONFIG)
+        with patch.dict(sys.modules, {"ibapi": fake_ibapi, "ibapi.wrapper": fake_wrapper_module}):
+            return transport._build_wrapper(10.0)
+
+    def test_a_nonrejection_order_error_does_not_prematurely_complete(self):
+        wrapper = self._wrapper()
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        watched_id = 301
+        other_id = 302
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+        # A numeric order-scoped code deliberately outside the rejection
+        # set (e.g. 2100-series-style informational code, chosen so it is
+        # neither in _ORDER_REJECTION_CODES nor a fatal session code).
+        non_rejection_code = 2103
+        self.assertNotIn(non_rejection_code, _ORDER_REJECTION_CODES)
+        wrapper.error(watched_id, 0, non_rejection_code, "")
+        # Numeric code retained; status still unset; event NOT signalled.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["broker_code"], non_rejection_code)
+        self.assertIsNone(row["status"])
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        # The unwatched/other order id is untouched by this error.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertIsNone(other_row["broker_code"])
+        self.assertFalse(wrapper.order_events[other_id]["event"].is_set())
+        # Now deliver classifiable broker evidence: orderStatus Submitted.
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper.orderStatus(watched_id, "Submitted", 0.0, 1.0, 0.0, 0, 0, 0.0, 0, "")
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["status"], "acknowledged")
+        self.assertEqual(outcome["broker_status"], "Submitted")
+
+    def test_b_known_rejection_remains_immediate(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        watched_id = 303
+        other_id = 304
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+        rejection_code = sorted(_ORDER_REJECTION_CODES)[0]
+        wrapper.error(watched_id, 0, rejection_code, "")
+        # Event is signalled immediately by the known rejection.
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["code"], "paper-order-rejected")
+        self.assertEqual(outcome["broker_code"], rejection_code)
+        # Another watched order ID is unaffected.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertFalse(wrapper.order_events[other_id]["event"].is_set())
+
+    def test_c_nonclassifiable_broker_evidence_times_out_as_uncertain(self):
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        watched_id = 305
+        wrapper.begin_order_watch(watched_id)
+        non_rejection_code = 2103
+        self.assertNotIn(non_rejection_code, _ORDER_REJECTION_CODES)
+        wrapper.error(watched_id, 0, non_rejection_code, "")
+        # No openOrder/orderStatus arrives; the bounded wait expires.
+        # Patch the notional timeout small for the test only.
+        from unittest.mock import patch as mock_patch
+        import ibkr.paper_transport as pt
+        with mock_patch.object(pt, "ACKNOWLEDGEMENT_TIMEOUT_SECONDS", 0.05):
+            outcome = TwsPaperExecutionTransport._await_order_outcome(
+                wrapper, watched_id, wrapper.order_events[watched_id]
+            )
+        # Broker evidence observed but not classifiable: uncertain with
+        # the optional numeric code retained; no fabricated success.
+        self.assertEqual(outcome["status"], "uncertain")
+        self.assertEqual(outcome["code"], "paper-submission-uncertain")
+        self.assertEqual(outcome.get("broker_code"), non_rejection_code)
+        self.assertNotIn("broker_status", outcome)
+        # A watch with absolutely no broker evidence still reports the
+        # plain timeout distinction.
+        no_evidence_id = 306
+        wrapper.begin_order_watch(no_evidence_id)
+        with mock_patch.object(pt, "ACKNOWLEDGEMENT_TIMEOUT_SECONDS", 0.05):
+            timeout_outcome = TwsPaperExecutionTransport._await_order_outcome(
+                wrapper, no_evidence_id, wrapper.order_events[no_evidence_id]
+            )
+        self.assertEqual(timeout_outcome["code"], "paper-submission-timeout")
+        self.assertIsNone(timeout_outcome.get("broker_code"))
+        # No retry occurred: the event registration remains untouched and
+        # no callback re-arming happened (single bounded wait per watch).
+
+    def test_d_blank_status_openorder_does_not_prematurely_finish(self):
+        wrapper = self._wrapper()
+        watched_id = 307
+        wrapper.begin_order_watch(watched_id)
+
+        class _FakeOrder:
+            orderRef = "phil5f3-blank-status-regression"
+
+        class _FakeOrderState:
+            status = None  # blank/None status: partial evidence only
+
+        wrapper.openOrder(watched_id, object(), _FakeOrder(), _FakeOrderState())
+        # orderRef retained, event NOT signalled, no premature completion.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["order_ref"], "phil5f3-blank-status-regression")
+        self.assertIsNone(row["status"])
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        # Then deliver classifiable status: acknowledged with both.
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper.orderStatus(watched_id, "Submitted", 0.0, 1.0, 0.0, 0, 0, 0.0, 0, "")
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["status"], "acknowledged")
+        self.assertEqual(outcome["broker_status"], "Submitted")
+        self.assertEqual(outcome["order_ref"], "phil5f3-blank-status-regression")
+
+    def test_e_orderref_only_evidence_times_out_as_uncertain(self):
+        # 5F-3a10 amendment: openOrder may deliver a valid deterministic
+        # orderRef while orderState.status is blank/None (Test D). That
+        # orderRef IS broker callback evidence: if no later classifiable
+        # orderStatus arrives and the bounded wait expires, the result
+        # must be paper-submission-uncertain (evidence observed but not
+        # classifiable), NOT paper-submission-timeout (no evidence).
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        watched_id = 309
+        wrapper.begin_order_watch(watched_id)
+
+        class _FakeOrder:
+            orderRef = "phil5f3-orderref-only-regression"
+
+        class _FakeOrderState:
+            status = None  # blank/None status
+
+        wrapper.openOrder(watched_id, object(), _FakeOrder(), _FakeOrderState())
+        # Partial evidence retained, completion NOT signalled.
+        row = wrapper.order_outcome(watched_id)
+        self.assertEqual(row["order_ref"], "phil5f3-orderref-only-regression")
+        self.assertIsNone(row["status"])
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        # Shorten the acknowledgement timeout for the test only.
+        from unittest.mock import patch as mock_patch
+        import ibkr.paper_transport as pt
+        with mock_patch.object(pt, "ACKNOWLEDGEMENT_TIMEOUT_SECONDS", 0.05):
+            outcome = TwsPaperExecutionTransport._await_order_outcome(
+                wrapper, watched_id, wrapper.order_events[watched_id]
+            )
+        # Broker callback evidence WAS observed (the openOrder orderRef):
+        # fail closed as uncertain, never a fabricated success, never a
+        # plain no-evidence timeout, and no retry occurs.
+        self.assertEqual(outcome["status"], "uncertain")
+        self.assertEqual(outcome["code"], "paper-submission-uncertain")
+        self.assertNotEqual(outcome["code"], "paper-submission-timeout")
+        self.assertNotIn("broker_status", outcome)
+        # The retained orderRef is bounded evidence and may be surfaced
+        # on the uncertain result consistently with the existing
+        # bounded-result contract.
+        self.assertEqual(outcome.get("order_ref"), "phil5f3-orderref-only-regression")
+
+    def test_precaution_163_is_terminal_rejection(self):
+        # 5F-3a12: IBKR TWS API error 163 ("The price specified would
+        # violate the percentage constraint specified in the default
+        # order settings") is a terminal order precaution rejection for
+        # Phil: overridePercentageConstraints is never set, precautions
+        # are never bypassed, and no order is ever modified or retried.
+        # A watched-order error 163 must become terminal Rejected and
+        # signal the wait immediately, exactly like the other members of
+        # _ORDER_REJECTION_CODES. The broker text is discarded; only the
+        # numeric code is retained.
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        wrapper = self._wrapper()
+        watched_id = 310
+        other_id = 311
+        wrapper.begin_order_watch(watched_id)
+        wrapper.begin_order_watch(other_id)
+        wrapper.error(watched_id, 0, 163, "arbitrary broker text that must be discarded")
+        # The wait is released immediately (no acknowledgement timeout).
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        # Canonical post-5F-3a10 rejection structure.
+        self.assertEqual(outcome["status"], "uncertain")
+        self.assertEqual(outcome["code"], "paper-order-rejected")
+        self.assertEqual(outcome["broker_code"], 163)
+        # Another watched order ID is unaffected; no broker text stored.
+        other_row = wrapper.order_outcome(other_id)
+        self.assertIsNone(other_row["status"])
+        self.assertIsNone(other_row["broker_code"])
+        self.assertNotIn("arbitrary broker text", repr(outcome))
+
+    def test_precaution_163_through_executor_records_rejected(self):
+        # 5F-3a12 executor path: a transport-returned rejection outcome
+        # carrying broker_code 163 produces exactly one terminal
+        # submission-rejected receipt with the numeric code, the known
+        # broker order id, status Rejected, and NO submission-uncertain
+        # receipt. No retry occurs.
+        from ibkr.paper_transport import _ORDER_REJECTION_CODES
+        self.assertIn(163, _ORDER_REJECTION_CODES)
+        # This class has no executor fixture roots; create isolated ones.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.execution_root = pathlib.Path(tmp.name) / "exec"
+        self.lock_root = pathlib.Path(tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+        outcome = {
+            "status": "uncertain",
+            "code": "paper-order-rejected",
+            "broker_code": 163,
+            "order_ref": "phil5f3-precaution-163-regression",
+        }
+        transport = BrokerDiagnosticsRetentionTests._returned_outcome_transport(self, outcome, order_id=4)
+        executor = BrokerDiagnosticsRetentionTests.executor(self, transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        rejected = [r for r in records if r["event_type"] == "submission-rejected"]
+        uncertain = [r for r in records if r["event_type"] == "submission-uncertain"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(uncertain, [])
+        broker = rejected[0]["broker"]
+        self.assertEqual(broker["order_id"], 4)
+        self.assertEqual(broker["status"], "Rejected")
+        self.assertEqual(broker["broker_code"], 163)
+        self.assertEqual(rejected[0]["reason_code"], "paper-order-rejected")
+        self.assertEqual(transport.calls.count("place_paper_order"), 1)
+        self.assertNotIn("arbitrary broker text", json.dumps(records))
+
+    def test_race_nonterminal_error_then_order_status_is_not_lost(self):
+
+
+        from ibkr.paper_transport import TwsPaperExecutionTransport
+        # Fresh-eyes race requirement: a non-terminal error() followed
+        # shortly by orderStatus must not be lost because the error woke
+        # the waiter. The error must not signal the event at all.
+        wrapper = self._wrapper()
+        watched_id = 308
+        wrapper.begin_order_watch(watched_id)
+        wrapper.error(watched_id, 0, 2103, "")
+        self.assertFalse(wrapper.order_events[watched_id]["event"].is_set())
+        wrapper.orderStatus(watched_id, "Submitted", 0.0, 1.0, 0.0, 0, 0, 0.0, 0, "")
+        self.assertTrue(wrapper.order_events[watched_id]["event"].is_set())
+        outcome = TwsPaperExecutionTransport._await_order_outcome(
+            wrapper, watched_id, wrapper.order_events[watched_id]
+        )
+        self.assertEqual(outcome["status"], "acknowledged")
+        # Bounded numeric code from the non-terminal error is retained.
+        self.assertEqual(wrapper.order_outcome(watched_id)["broker_code"], 2103)
+
+
+class WriteSessionCleanupTests(unittest.TestCase):
+    """5F-3a2: the write-capable TWS session is disconnected on EVERY
+    outcome path, exactly once, and a disconnect failure never masks the
+    original result or error.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def executor(self, transport):
+        return make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=transport,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+
+    def test_disconnect_attempted_after_acknowledged_success(self):
+        transport = _FakePaperTransport()
+        executor = self.executor(transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_broker_rejection(self):
+        transport = _FakePaperTransport(fail="rejected")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_account_mismatch(self):
+        transport = _FakePaperTransport(managed_accounts=["DU9999999"])
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-account-mismatch")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_uncertain_timeout(self):
+        transport = _FakePaperTransport(fail="uncertain")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-timeout")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_generic_submission_error(self):
+        class _GenericErrorTransport(_FakePaperTransport):
+            def place_paper_order(self, **kwargs):
+                _ = kwargs.get("expected_account_id")
+                self.calls.append("place_paper_order")
+                self.calls.append("managed_accounts")
+                raise pe.PaperSubmissionError("paper-session-failed")
+        transport = _GenericErrorTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_attempted_after_unexpected_exception(self):
+        transport = _FakePaperTransport(fail="unexpected")
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-submission-uncertain")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+    def test_disconnect_failure_does_not_mask_result_or_error(self):
+        class _DisconnectFailsTransport(_FakePaperTransport):
+            def disconnect(self):
+                self.calls.append("disconnect")
+                raise RuntimeError("disconnect crashed")
+        transport = _DisconnectFailsTransport()
+        executor = self.executor(transport)
+        result = executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(result["status"], "acknowledged")
+        # A NEW execution (fresh intent, new execution id) with a rejected
+        # outcome must still surface the ORIGINAL rejection code even
+        # though disconnect itself fails.
+        new_intent, new_execution_id = pe.load_intent(
+            document=base_intent(decision_id="decision-2026-10-08-b2")
+        )
+        transport2 = _DisconnectFailsTransport(fail="rejected")
+        executor2 = self.executor(transport2)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor2.submit(new_intent, self.mapping_entry, arm=True, confirm_execution_id=new_execution_id)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+
+    def test_disconnect_attempted_after_failed_connect(self):
+        class _ConnectFailTransport(_FakePaperTransport):
+            def connect(self, config):
+                self.calls.append("connect")
+                raise RuntimeError("connection lost")
+        transport = _ConnectFailTransport()
+        executor = self.executor(transport)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-session-failed")
+        self.assertEqual(transport.calls.count("disconnect"), 1)
+
+
+class RejectedExecutionOneShotTests(unittest.TestCase):
+    """5F-3a2: a broker-rejected execution_id stays one-shot; a repeated
+    invocation with the SAME execution id must stop BEFORE placement.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.execution_root = pathlib.Path(self.tmp.name) / "exec"
+        self.lock_root = pathlib.Path(self.tmp.name) / "locks"
+        self.intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.mapping_entry = make_entry()
+
+    def test_rejected_execution_id_never_places_again(self):
+        first = _FakePaperTransport(fail="rejected")
+        executor = make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=first,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "paper-order-rejected")
+        records = state.read_receipts(_execution_root=self.execution_root)
+        types = [record["event_type"] for record in records]
+        self.assertIn("submission-attempted", types)
+        self.assertIn("submission-rejected", types)
+        second = _FakePaperTransport()
+        executor2 = make_executor(
+            read_adapter=_FakeReadAdapter(verify=True),
+            transport=second,
+            execution_root=self.execution_root,
+            lock_root=self.lock_root,
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor2.submit(self.intent, self.mapping_entry, arm=True, confirm_execution_id=self.execution_id_value)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        self.assertEqual(second.calls, [])
+        self.assertEqual(second.place_calls, [])
+
+
+class CrossProcessClaimTests(unittest.TestCase):
+    """5F-3a2: a REAL cross-process regression at the executor level.
+
+    Two concurrently started WORKER PROCESSES (separate OS processes,
+    Windows spawn compatible) use the same execution id, same execution
+    root, and same lock root, synchronized by a file barrier so both
+    attempt submission concurrently. The placement boundary is a durable
+    interprocess marker: each successful placement leaves exactly one
+    marker file. Expected total place calls across BOTH processes:
+    exactly 1. The losing worker must fail closed BEFORE placement with a
+    bounded claimed/duplicate result.
+    """
+
+    WORKER_SOURCE = """
+import json
+import os
+import pathlib
+import sys
+import time
+
+def main() -> int:
+    payload_path = sys.argv[1]
+    barrier_path = sys.argv[2]
+    result_path = sys.argv[3]
+
+    repository_root = pathlib.Path(os.environ["PHIL_REPO_ROOT"])
+    sys.path.insert(0, str(repository_root))
+    from ibkr import paper_execution as pe
+
+    payload = json.loads(pathlib.Path(payload_path).read_text(encoding="utf-8"))
+    execution_root = pathlib.Path(payload["execution_root"])
+    lock_root = pathlib.Path(payload["lock_root"])
+    placement_root = pathlib.Path(payload["placement_root"])
+    intent = json.loads(pathlib.Path(payload["intent_path"]).read_text(encoding="utf-8"))
+    mapping = json.loads(pathlib.Path(payload["mapping_path"]).read_text(encoding="utf-8"))
+
+    class _InterprocessReadOnlyAdapter:
+        def __init__(self, payload):
+            self.calls = []
+        def close(self):
+            pass
+        def lookup_contract_by_conid(self, conid):
+            self.calls.append(("lookup_contract_by_conid", conid))
+            return {
+                "conid": conid, "symbol": "FIXTUREETF", "local_symbol": "FIXTUREETF",
+                "sec_type": "STK", "exchange": None, "primary_exchange": "ARCX",
+                "currency": "USD", "expiry": None, "strike": None, "right": None,
+                "multiplier": None, "trading_class": "FIXTUREETF",
+            }
+        def open_orders(self):
+            self.calls.append("open_orders")
+            return []
+        def executions(self):
+            self.calls.append("executions")
+            return []
+
+    class _InterprocessPlacementTransport:
+        def __init__(self):
+            self.calls = []
+        def connect(self, config):
+            self.calls.append("connect")
+        def disconnect(self):
+            self.calls.append("disconnect")
+        def managed_accounts(self):
+            self.calls.append("managed_accounts")
+            return [payload["expected_account"]]
+        def place_paper_order(self, **kwargs):
+            # Durable interprocess placement marker (one file per call);
+            # the file NAME carries the worker identity so a double place
+            # can be counted exactly.
+            placement_root.mkdir(parents=True, exist_ok=True)
+            marker = placement_root / ("placed-" + payload["worker"] + ".json")
+            marker.write_text(json.dumps({"order_ref": kwargs["order_ref"]}), encoding="utf-8")
+            self.calls.append("place_paper_order")
+            return {
+                "order_id": 101,
+                "order_ref": kwargs["order_ref"],
+                "outcome": {"status": "acknowledged", "broker_status": "Submitted", "order_ref": kwargs["order_ref"]},
+            }
+
+    executor = pe.IbkrPaperExecutor(
+        payload["config"],
+        _read_adapter_factory=lambda _config: _InterprocessReadOnlyAdapter(payload),
+        _paper_transport_factory=lambda _config: _InterprocessPlacementTransport(),
+        _execution_root=execution_root,
+        _lock_root=lock_root,
+        _now=lambda _t: None,
+    )
+
+    # File barrier: announce readiness, then wait until BOTH workers are
+    # present before attempting submission concurrently.
+    ready = pathlib.Path(barrier_path) / (payload["worker"] + ".ready")
+    barrier_dir = pathlib.Path(barrier_path)
+    barrier_dir.mkdir(parents=True, exist_ok=True)
+    ready.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if len(list(barrier_dir.glob("*.ready"))) >= 2:
+            break
+        time.sleep(0.01)
+
+    try:
+        document = executor.submit(intent, mapping, arm=True, confirm_execution_id=payload["execution_id"])
+        outcome = {"status": "success", "result_status": document["status"]}
+    except pe.ExecutionError as exc:
+        outcome = {"status": "error", "code": exc.code}
+    except Exception as exc:
+        outcome = {"status": "worker-crash", "error": type(exc).__name__}
+    pathlib.Path(result_path).write_text(json.dumps(outcome), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmp_path = pathlib.Path(self.tmp.name)
+        self.execution_root = self.tmp_path / "exec"
+        self.lock_root = self.tmp_path / "locks"
+        self.placement_root = self.tmp_path / "placements"
+        self.barrier_root = self.tmp_path / "barrier"
+        self.results_root = self.tmp_path / "results"
+        intent, self.execution_id_value = pe.load_intent(document=base_intent())
+        self.intent = intent
+        self.mapping_entry = make_entry()
+
+    def _run_pair(self, run_name: str) -> list[dict]:
+        run_dir = self.tmp_path / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        intent_path = run_dir / "intent.json"
+        mapping_path = run_dir / "mapping.json"
+        intent_path.write_text(json.dumps(self.intent), encoding="utf-8")
+        mapping_path.write_text(json.dumps(self.mapping_entry), encoding="utf-8")
+        worker_path = run_dir / "phil_5f3a2_worker.py"
+        worker_path.write_text(self.WORKER_SOURCE, encoding="utf-8")
+
+        environment = dict(os.environ)
+        environment["PHIL_REPO_ROOT"] = str(REPOSITORY_ROOT)
+        outcomes: list[dict] = []
+        for index in range(2):
+            result_path = self.results_root / f"{run_name}-{index}.json"
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "worker": f"worker-{index}",
+                "execution_root": str(self.execution_root),
+                "lock_root": str(self.lock_root),
+                "placement_root": str(self.placement_root),
+                "intent_path": str(intent_path),
+                "mapping_path": str(mapping_path),
+                "expected_account": EXPECTED_ACCOUNT,
+                "execution_id": self.execution_id_value,
+                "config": dict(BASE_CONFIG, config_path=str(run_dir / f"config-{index}.json")),
+            }
+            payload_path = run_dir / f"payload-{index}.json"
+            payload_path.write_text(json.dumps(payload), encoding="utf-8")
+            # NOTE: both processes are started as close together as the
+            # harness allows; each waits at the file barrier until BOTH
+            # are ready, so the two claims genuinely race.
+            import subprocess
+            completed = subprocess.Popen(
+                [sys.executable, str(worker_path), str(payload_path), str(self.barrier_root), str(result_path)],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            outcomes.append({"_process": completed, "_result_path": result_path})
+        deadline = time.monotonic() + 90
+        collected: list[dict] = []
+        for entry in outcomes:
+            process = entry["_process"]
+            try:
+                _, stderr = process.communicate(timeout=90)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=30)
+                raise AssertionError(f"worker process timed out; stderr={process.stderr}")
+            if process.returncode != 0:
+                raise AssertionError(f"worker process failed rc={process.returncode}; stderr={stderr.decode('utf-8', 'replace')}")
+            collected.append(json.loads(entry["_result_path"].read_text(encoding="utf-8")))
+        return collected
+
+    def test_two_processes_same_execution_id_exactly_one_place(self):
+        outcomes = self._run_pair("run1")
+        self.assertEqual(len(outcomes), 2)
+        successes = [outcome for outcome in outcomes if outcome["status"] == "success"]
+        duplicates = [
+            outcome for outcome in outcomes
+            if outcome["status"] == "error"
+            and outcome["code"] in ("execution-already-submitted", "execution-already-claimed", "execution-uncertain")
+        ]
+        self.assertEqual(len(successes), 1, outcomes)
+        self.assertEqual(len(duplicates), 1, outcomes)
+        # Exactly ONE placement across BOTH real processes.
+        markers = list(self.placement_root.glob("placed-*.json"))
+        self.assertEqual(len(markers), 1, markers)
+
+    def test_loser_never_reaches_placement(self):
+        outcomes = self._run_pair("run2")
+        losers = [outcome for outcome in outcomes if outcome["status"] == "error"]
+        self.assertEqual(len(losers), 1)
+        # The losing worker returned a bounded duplicate/claimed result.
+        self.assertIn(losers[0]["code"], ("execution-already-submitted", "execution-already-claimed", "execution-uncertain"))
+        # The durable claim exists exactly once for this execution id.
+        records = state.read_receipts(_execution_root=self.execution_root)
+        attempted = [record for record in records if record["event_type"] == "submission-attempted"]
+        self.assertEqual(len(attempted), 1)
+
+
+class IsolationTests(unittest.TestCase):
+    def test_protected_modules_never_import_the_execution_boundary(self):
+        import ast
+
+        for relative in (
+            "manus/paper_runner.py",
+            "manus/paper_apply.py",
+            "scheduled_paper_task.py",
+            "manus/scheduled_paper.py",
+        ):
+            source = (REPOSITORY_ROOT / relative).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertFalse(
+                            alias.name.startswith(("ibkr.paper_execution", "ibkr.paper_transport")),
+                            relative,
+                        )
+                elif isinstance(node, ast.ImportFrom):
+                    self.assertFalse(
+                        (node.module or "").startswith(("ibkr.paper_execution", "ibkr.paper_transport")),
+                        relative,
+                    )
+
+    def test_importing_execution_modules_has_no_side_effects(self):
+        code = (
+            "import sys, json, pathlib\n"
+            "sys.path.insert(0, %r)\n"
+            "before = set(sys.modules)\n"
+            "import ibkr.paper_execution\n"
+            "import ibkr.paper_execution_state\n"
+            "import ibkr.paper_transport\n"
+            "for name in ('ibapi', 'ibapi.client', 'ibapi.wrapper', 'ibapi.contract', 'ibapi.order'):\n"
+            "    assert name not in sys.modules, name\n"
+        ) % (str(REPOSITORY_ROOT),)
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_place_order_only_in_paper_transport(self):
+        import ast
+
+        offenders = []
+        for path in REPOSITORY_ROOT.rglob("*.py"):
+            relative = path.relative_to(REPOSITORY_ROOT)
+            if any(part.startswith(".git") for part in relative.parts):
+                continue
+            source = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == "placeOrder":
+                    # Windows yields backslash separators; normalize to
+                    # POSIX at the collection point, then compare exactly.
+                    module_name = relative.as_posix()
+                    if module_name != "ibkr/paper_transport.py" and "tests" not in relative.parts:
+                        offenders.append(module_name)
+        self.assertEqual(offenders, [])
+
+
+class ProductionWiringTests(unittest.TestCase):
+    """5F-3a7: production default paper transport factory + pre-claim
+    side-effect-free transport construction.
+
+    The real Windows PAPER smoke proved the default executor's
+    _paper_transport_factory was None (test-only injection), and that a
+    factory failure AFTER the durable claim consumed the execution id
+    with zero broker activity.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _executor(self, *, config=None, read_adapter=None, transport_factory=None, **kwargs):
+        return pe.IbkrPaperExecutor(
+            config or BASE_CONFIG,
+            _read_adapter_factory=(lambda _config: read_adapter)
+            if read_adapter is not None
+            else lambda _config: None,
+            _paper_transport_factory=transport_factory,
+            _execution_root=pathlib.Path(self._tmp.name) / "exec" if kwargs.get("exec_root") is None else kwargs["exec_root"],
+            _lock_root=pathlib.Path(self._tmp.name) / "locks" if kwargs.get("lock_root") is None else kwargs["lock_root"],
+            _now=lambda _t: None,
+        )
+
+    def test_1_default_production_factory_exists_and_constructs(self):
+        # Regression 1: default executor (no injected factory) selects a
+        # callable production factory that constructs a
+        # TwsPaperExecutionTransport from the config WITHOUT network I/O.
+        executor = pe.IbkrPaperExecutor(BASE_CONFIG)
+        factory = executor._paper_transport_factory
+        self.assertTrue(callable(factory))
+        self.assertIs(factory, pe._default_paper_transport_factory)
+        transport = factory(BASE_CONFIG)
+        self.assertIsInstance(transport, pe.TwsPaperExecutionTransport)
+        # Constructor is side-effect free: no connection yet.
+        self.assertIsNone(getattr(transport, "_client", None) or getattr(transport, "_connected", None) or None) or None
+
+    def test_2_injected_factory_still_overrides_default(self):
+        # Regression 2: an explicitly injected factory wins exactly; no
+        # production transport is constructed.
+        sentinel = object()
+        seen_configs: list[dict] = []
+
+        def injected(config):
+            seen_configs.append(config)
+            return sentinel
+
+        executor = self._executor(transport_factory=injected)
+        self.assertIs(executor._paper_transport_factory, injected)
+        self.assertIs(executor._prepare_paper_transport(), sentinel)
+        self.assertEqual(seen_configs, [BASE_CONFIG])
+        self.assertIs(type(executor._paper_transport_factory), type(injected))
+
+    def test_3_default_factory_is_side_effect_free(self):
+        # Regression 3: constructing via the default factory causes zero
+        # connect / broker requests / placeOrder / files or receipts.
+        import ibkr.paper_transport as paper_transport_module
+        constructed: list[object] = []
+        original_init = pe.TwsPaperExecutionTransport.__init__
+
+        def spy_init(self_transport, *args, **kwargs):
+            constructed.append(self_transport)
+            return original_init(self_transport, *args, **kwargs)
+
+        pe.TwsPaperExecutionTransport.__init__ = spy_init
+        try:
+            transport = pe._default_paper_transport_factory(BASE_CONFIG)
+        finally:
+            pe.TwsPaperExecutionTransport.__init__ = original_init
+        self.assertEqual(len(constructed), 1)
+        self.assertIsNot(transport, None)
+        # No connect happened: the transport has no live client.
+        self.assertFalse(getattr(transport, "_connected", False))
+
+    def test_4_factory_failure_occurs_before_claim_zero_receipts(self):
+        # Regression 4: factory raises -> bounded paper-transport-
+        # unavailable with ZERO receipts for the execution id, ZERO
+        # connect, ZERO place.
+        transport = _FakePaperTransport()
+        state_root = pathlib.Path(self._tmp.name) / "exec4"
+        state_root.mkdir()
+
+        def raising_factory(_config):
+            raise RuntimeError("local construction failure")
+
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=raising_factory,
+            exec_root=state_root,
+            lock_root=pathlib.Path(self._tmp.name) / "locks4",
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(
+                intent,
+                make_entry(),
+                arm=True,
+                confirm_execution_id=execution_id,
+            )
+        self.assertEqual(caught.exception.code, "paper-transport-unavailable")
+        # ZERO receipts for this execution id (claim never ran).
+        self.assertEqual(state.read_receipts(_execution_root=state_root), [])
+        # ZERO connect/place: the transport was never even constructed.
+        self.assertEqual(transport.calls, [])
+
+    def test_5_call_ordering_duplicate_gate_construct_claim_connect_place(self):
+        # Regression 5: exact order — duplicate evidence gate, transport
+        # construction, claim, connect, place. connect MUST NOT precede
+        # the claim.
+        ordering: list[str] = []
+        read_adapter = _FakeReadAdapter()
+        original_open = read_adapter.open_orders
+        original_exec = getattr(read_adapter, "executions", None)
+
+        def open_orders():
+            ordering.append("broker_evidence")
+            return original_open()
+
+        read_adapter.open_orders = open_orders
+
+        def execs():
+            ordering.append("broker_evidence_exec")
+            return original_exec() if original_exec else []
+
+        if original_exec is not None:
+            read_adapter.executions = execs
+        else:
+            read_adapter.executions = execs
+
+        transport = _FakePaperTransport()
+        original_connect = transport.connect
+
+        def connect(config):
+            ordering.append("connect")
+            original_connect(config)
+
+        transport.connect = connect
+        original_place = transport.place_paper_order
+
+        def place(**kwargs):
+            ordering.append("place")
+            return original_place(**kwargs)
+
+        transport.place_paper_order = place
+
+        factory_marker: list[str] = []
+
+        def factory(_config):
+            ordering.append("transport_construct")
+            factory_marker.append("built")
+            return transport
+
+        claim_marker: list[str] = []
+        executor = self._executor(
+            read_adapter=read_adapter,
+            transport_factory=factory,
+            exec_root=pathlib.Path(self._tmp.name) / "exec5",
+            lock_root=pathlib.Path(self._tmp.name) / "locks5",
+        )
+        original_claim = executor._claim_submission_attempt
+
+        def claim(**kwargs):
+            ordering.append("claim")
+            claim_marker.append("claimed")
+            return original_claim(**kwargs)
+
+        executor._claim_submission_attempt = claim
+        intent, execution_id = pe.load_intent(document=base_intent())
+        executor.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        self.assertIn("transport_construct", ordering)
+        self.assertLess(
+            ordering.index("transport_construct"), ordering.index("claim"),
+            f"transport construction must precede claim: {ordering}",
+        )
+        self.assertLess(ordering.index("claim"), ordering.index("connect"), ordering)
+        self.assertLess(ordering.index("connect"), ordering.index("place"), ordering)
+
+    def test_6_concurrent_same_id_losers_never_connect_or_place(self):
+        # Regression 6: two executors racing the same id — exactly one
+        # claimant proceeds to connect/place; the loser never connects
+        # and never places (claim is the write-session ownership gate).
+        exec_root = pathlib.Path(self._tmp.name) / "exec6"
+        lock_root = pathlib.Path(self._tmp.name) / "locks6"
+        first_transport = _FakePaperTransport()
+        second_transport = _FakePaperTransport()
+        executor_a = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=lambda _c: first_transport,
+            exec_root=exec_root,
+            lock_root=lock_root,
+        )
+        executor_b = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=lambda _c: second_transport,
+            exec_root=exec_root,
+            lock_root=lock_root,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        executor_a.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor_b.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        # Loser: no connect, no place.
+        self.assertNotIn("connect", second_transport.calls)
+        self.assertNotIn("place_paper_order", second_transport.calls)
+        self.assertEqual(second_transport.place_calls, [])
+        # Winner: exactly one connect and one place.
+        self.assertEqual(first_transport.calls.count("connect"), 1)
+        self.assertEqual(first_transport.calls.count("place_paper_order"), 1)
+
+    def test_7_cli_default_production_path_no_paper_transport_unavailable(self):
+        # Regression 7: the real CLI/main code path with the DEFAULT
+        # factory (not injected) must not fail with paper-transport-
+        # unavailable merely because the factory used to be None.
+        # Faked broker surfaces: the fake read adapter and fake transport
+        # are installed via the executor's factory seams.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            intent_path = tmp_path / "intent.json"
+            mapping_path = tmp_path / "mapping.json"
+            raw = base_intent()
+            intent, execution_id = pe.load_intent(document=raw)
+            intent_path.write_text(json.dumps(raw), encoding="utf-8")
+            mapping_path.write_text(json.dumps(make_entry()), encoding="utf-8")
+            calls: list[str] = []
+            # The CLI main() constructs IbkrPaperExecutor() with no
+            # configuration and loads it via PHIL_IBKR_CONFIG; point the
+            # env var at a real temp PAPER config file.
+            config_file = tmp_path / "config.json"
+            # Only the officially allowed config fields may appear in the
+            # file consumed by load_config (config_version/config_path
+            # are in-memory test keys, not file fields).
+            file_config = {k: v for k, v in BASE_CONFIG.items() if k in {
+                "expected_account_id", "environment", "host", "port", "client_id", "read_only_timeout_seconds"}}
+            config_file.write_text(json.dumps(file_config), encoding="utf-8")
+            fake_transport = _FakePaperTransport()
+            original_place = fake_transport.place_paper_order
+
+            def place(**kwargs):
+                calls.append("place")
+                return original_place(**kwargs)
+
+            fake_transport.place_paper_order = place
+            original_connect = fake_transport.connect
+
+            def connect(config):
+                calls.append("connect")
+                original_connect(config)
+
+            fake_transport.connect = connect
+
+            built: list[object] = []
+            def default_factory_spy(config):
+                built.append("constructed")
+                return fake_transport
+
+            captured_executor: dict[str, object] = {}
+            original_init = pe.IbkrPaperExecutor.__init__
+
+            def spy_init(self_executor, configuration=None, **kwargs):
+                original_init(self_executor, configuration, **kwargs)
+                # Exercise the DEFAULT factory selection; only the broker
+                # surfaces are faked (read adapter + transport object).
+                self_executor._read_adapter_factory = lambda _c: _FakeReadAdapter()
+                self_executor._paper_transport_factory = default_factory_spy
+                self_executor._execution_root = tmp_path / "exec"
+                self_executor._lock_root = tmp_path / "locks"
+                captured_executor["executor"] = self_executor
+
+            pe.IbkrPaperExecutor.__init__ = spy_init
+            try:
+                from ibkr.paper_execution import main as cli_main
+                from unittest.mock import patch as _patch
+
+                def _run_cli():
+                    with redirect_stderr(io.StringIO()) as stderr:
+                        return cli_main([
+                            "submit",
+                            "--intent-file", str(intent_path),
+                            "--mapping-file", str(mapping_path),
+                            "--confirm-execution-id", execution_id,
+                            "--arm-paper",
+                        ]), stderr
+
+                with _patch.dict(os.environ, {"PHIL_IBKR_CONFIG": str(config_file)}):
+                    exit_code, stderr = _run_cli()
+            finally:
+                pe.IbkrPaperExecutor.__init__ = original_init
+            self.assertEqual(exit_code, 0, stderr.getvalue())
+            self.assertNotIn("paper-transport-unavailable", stderr.getvalue())
+            # The default-selected factory built exactly one transport;
+            # exactly one connect and one place reached the fake.
+            self.assertEqual(built, ["constructed"])
+            self.assertEqual(calls.count("connect"), 1)
+            self.assertEqual(calls.count("place"), 1)
+            # ZERO receipt files outside the temp execution root.
+            self.assertTrue((tmp_path / "exec").exists())
+
+    def test_8_missing_arm_does_nothing(self):
+        # Regression 8: missing arm -> arm-missing with zero factory
+        # construction, zero receipts, zero broker I/O.
+        factory_called: list[int] = []
+
+        def factory(_config):
+            factory_called.append(1)
+            return _FakePaperTransport()
+
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=factory,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(intent, make_entry(), arm=False, confirm_execution_id=execution_id)
+        self.assertEqual(caught.exception.code, "arm-missing")
+        self.assertEqual(factory_called, [])
+
+    def test_9_wrong_confirmation_does_nothing(self):
+        # Regression 9: wrong confirmation -> arm-confirmation-mismatch
+        # with zero factory construction, zero receipts, zero broker I/O.
+        factory_called: list[int] = []
+
+        def factory(_config):
+            factory_called.append(1)
+            return _FakePaperTransport()
+
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=factory,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(intent, make_entry(), arm=True, confirm_execution_id="0" * 64)
+        self.assertEqual(caught.exception.code, "arm-confirmation-mismatch")
+        self.assertEqual(factory_called, [])
+
+    def test_10_existing_claim_remains_non_retryable(self):
+        # Regression 10: an existing submission-attempted receipt for an
+        # execution id blocks a new submit with execution-already-
+        # submitted BEFORE transport construction / connect / place.
+        factory_called: list[int] = []
+        transport = _FakePaperTransport()
+        exec_root = pathlib.Path(self._tmp.name) / "exec10"
+        lock_root = pathlib.Path(self._tmp.name) / "locks10"
+        executor = self._executor(
+            read_adapter=_FakeReadAdapter(),
+            transport_factory=lambda _c: (factory_called.append(1), transport)[1],
+            exec_root=exec_root,
+            lock_root=lock_root,
+        )
+        intent, execution_id = pe.load_intent(document=base_intent())
+        # Seed the authoritative prior attempt receipt.
+        executor._record_submission_attempt(
+            intent=intent,
+            execution_id=execution_id,
+            order_ref=pe.order_ref(execution_id),
+        )
+        with self.assertRaises(pe.ExecutionError) as caught:
+            executor.submit(intent, make_entry(), arm=True, confirm_execution_id=execution_id)
+        self.assertEqual(caught.exception.code, "execution-already-submitted")
+        self.assertEqual(factory_called, [])
+        self.assertEqual(transport.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -32,6 +32,13 @@ import pmapi  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROTECTED = json.loads((ROOT / "config" / "protected.json").read_text())
 
+_MAX_PROVIDER_TAG_RECORDS = 32
+_MAX_PROVIDER_TAG_ID_LENGTH = 64
+_MAX_PROVIDER_TAG_SLUG_LENGTH = 128
+_MAX_PROVIDER_TAG_LABEL_LENGTH = 256
+_PROVIDER_TAG_ID_RE = re.compile(r"^[0-9]+$")
+_PROVIDER_TAG_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
 
 def utcnow():
     return dt.datetime.now(dt.timezone.utc)
@@ -109,21 +116,125 @@ def keep(m, seen, banned, args):
     }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--hours", type=float, default=168)
-    ap.add_argument("--min-volume-24h", type=float, default=0)
-    ap.add_argument("--limit", type=int, default=400,
-                    help="max markets paged per query")
-    ap.add_argument("--min-total-volume", type=float, default=50000,
-                    help="lifetime-volume floor (gamma volume_num_min) for the "
-                         "DEFAULT query. Results page in endDate order and the "
-                         "near-term universe is thousands of sub-daily markets "
-                         "deep, so without a floor the scan never escapes today "
-                         "regardless of --hours. strategy/discovery.py may set "
-                         "its own per-query floors.")
-    args = ap.parse_args()
+def _parse_utc_end(value):
+    """Return a timezone-aware UTC datetime for an ISO-8601 endDate, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
 
+
+def _time_fresh(end_date, closed, min_end, horizon):
+    """Authoritative local freshness gate using the one frozen scan clock.
+
+    Provider query parameters (closed=false, end_date_min) are advisory input
+    filtering, not enforcement. Every returned market must independently pass
+    this local time-bound check before becoming a candidate.
+    """
+    if closed is True:
+        return False
+    end = _parse_utc_end(end_date)
+    if end is None:
+        return False
+    return min_end <= end <= horizon
+
+
+def _validate_scan_controls(include_provider_metadata, max_candidates):
+    """Reject non-default API controls that would make scanner bounds ambiguous."""
+    if type(include_provider_metadata) is not bool:
+        raise TypeError("include_provider_metadata must be a bool")
+    if max_candidates is not None:
+        if type(max_candidates) is not int:
+            raise TypeError("max_candidates must be a positive int or None")
+        if max_candidates <= 0:
+            raise ValueError("max_candidates must be a positive int or None")
+
+
+def _normalize_provider_tag_text(value, maximum, pattern=None, require_printable=False):
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        return None
+    if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+        return None
+    if require_printable and not value.isprintable():
+        return None
+    if pattern is not None and not pattern.fullmatch(value):
+        return None
+    return value
+
+
+def _normalize_provider_tag(value):
+    """Return one bounded provider-owned tag record or ``None`` if invalid."""
+    if not isinstance(value, dict):
+        return None
+    raw_id = value.get("id")
+    if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+        tag_id = str(raw_id)
+    elif isinstance(raw_id, str):
+        tag_id = raw_id
+    else:
+        return None
+    if len(tag_id) > _MAX_PROVIDER_TAG_ID_LENGTH or not _PROVIDER_TAG_ID_RE.fullmatch(tag_id):
+        return None
+    slug = _normalize_provider_tag_text(
+        value.get("slug"), _MAX_PROVIDER_TAG_SLUG_LENGTH, _PROVIDER_TAG_SLUG_RE
+    )
+    label = _normalize_provider_tag_text(
+        value.get("label"), _MAX_PROVIDER_TAG_LABEL_LENGTH, require_printable=True
+    )
+    if slug is None or label is None:
+        return None
+    return {"id": tag_id, "slug": slug, "label": label}
+
+
+def _provider_metadata(market_id):
+    """Return a bounded non-authoritative tag envelope for one kept market."""
+    try:
+        response = pmapi.gamma_market_tags(market_id)
+    except Exception:  # noqa: BLE001 — emit the fixed safe unavailable status
+        return {"market_tags_status": "unavailable", "market_tags": []}
+    if not isinstance(response, list) or len(response) > _MAX_PROVIDER_TAG_RECORDS:
+        return {"market_tags_status": "invalid", "market_tags": []}
+
+    tags_by_id = {}
+    for raw_tag in response:
+        tag = _normalize_provider_tag(raw_tag)
+        if tag is None:
+            return {"market_tags_status": "invalid", "market_tags": []}
+        existing = tags_by_id.get(tag["id"])
+        if existing is not None and existing != tag:
+            return {"market_tags_status": "invalid", "market_tags": []}
+        tags_by_id[tag["id"]] = tag
+    return {
+        "market_tags_status": "ok",
+        "market_tags": sorted(tags_by_id.values(), key=lambda tag: (len(tag["id"]), tag["id"])),
+    }
+
+
+def _iter_candidates(
+    *,
+    hours=168,
+    min_volume_24h=0,
+    limit=400,
+    min_total_volume=50000,
+    include_provider_metadata: bool = False,
+    max_candidates: int | None = None,
+):
+    """Yield normal protected scan candidates in existing deterministic order."""
+    _validate_scan_controls(include_provider_metadata, max_candidates)
+    args = argparse.Namespace(
+        hours=hours,
+        min_volume_24h=min_volume_24h,
+        limit=limit,
+        min_total_volume=min_total_volume,
+    )
     banned = [re.compile(p, re.I) for p in PROTECTED["banned_question_patterns"]]
     now = utcnow()
     horizon = now + dt.timedelta(hours=args.hours)
@@ -144,13 +255,64 @@ def main():
                 break
             offset += len(batch)
             for m in batch:
+                if max_candidates is not None and kept >= max_candidates:
+                    return
                 rec = keep(m, seen, banned, args)
+                if rec and not _time_fresh(rec["end_date"], m.get("closed"), min_end, horizon):
+                    rec = None
                 if rec:
+                    if include_provider_metadata:
+                        rec["provider_metadata"] = _provider_metadata(rec["market_id"])
                     got += 1
                     kept += 1
-                    print(json.dumps(rec))
+                    yield rec
+                    if max_candidates is not None and kept >= max_candidates:
+                        return
         print(f"scan: query {label!r} -> {got} candidates", file=sys.stderr)
     print(f"scan: {kept} candidates total within {args.hours}h", file=sys.stderr)
+
+
+def scan_candidates(
+    *,
+    hours=168,
+    min_volume_24h=0,
+    limit=400,
+    min_total_volume=50000,
+    include_provider_metadata: bool = False,
+    max_candidates: int | None = None,
+):
+    """Return normal protected scan candidates in existing deterministic order."""
+    return list(_iter_candidates(
+        hours=hours,
+        min_volume_24h=min_volume_24h,
+        limit=limit,
+        min_total_volume=min_total_volume,
+        include_provider_metadata=include_provider_metadata,
+        max_candidates=max_candidates,
+    ))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hours", type=float, default=168)
+    ap.add_argument("--min-volume-24h", type=float, default=0)
+    ap.add_argument("--limit", type=int, default=400,
+                    help="max markets paged per query")
+    ap.add_argument("--min-total-volume", type=float, default=50000,
+                    help="lifetime-volume floor (gamma volume_num_min) for the "
+                         "DEFAULT query. Results page in endDate order and the "
+                         "near-term universe is thousands of sub-daily markets "
+                         "deep, so without a floor the scan never escapes today "
+                         "regardless of --hours. strategy/discovery.py may set "
+                         "its own per-query floors.")
+    args = ap.parse_args()
+    for record in _iter_candidates(
+        hours=args.hours,
+        min_volume_24h=args.min_volume_24h,
+        limit=args.limit,
+        min_total_volume=args.min_total_volume,
+    ):
+        print(json.dumps(record))
 
 
 if __name__ == "__main__":

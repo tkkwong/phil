@@ -3,6 +3,7 @@
 PROTECTED CORE — the trading agent must not edit files under core/.
 """
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -10,6 +11,7 @@ import urllib.request
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 UA = {"User-Agent": "pearl-explorations-paper-trader/0.1"}
+_GAMMA_MARKET_ID_RE = re.compile(r"^[0-9]+$")
 
 
 def get_json(url, params=None, retries=3):
@@ -33,6 +35,13 @@ def gamma_markets(**params):
 
 def gamma_market(market_id):
     return get_json(f"{GAMMA}/markets/{market_id}")
+
+
+def gamma_market_tags(market_id):
+    """Return public Gamma taxonomy tags for one market without authentication."""
+    if not isinstance(market_id, str) or not _GAMMA_MARKET_ID_RE.fullmatch(market_id):
+        raise ValueError("Gamma market_id must be a non-empty decimal string")
+    return get_json(f"{GAMMA}/markets/{market_id}/tags", retries=1)
 
 
 def clob_book(token_id):
